@@ -158,7 +158,7 @@ Phase 3: CALM action layer
 
 Phase 4: Measurement
 
-- Keep the deterministic static-vs-objective ablation green as a local proof that scheduler control improves the north-star on a controlled workload, including learned actor-count, cadence, and lag controls together.
+- Keep the deterministic static-vs-objective ablations green as local proof that scheduler control and adaptive action-space control improve the north-star on controlled workloads, including learned actor-count, cadence, lag, and chunk-granularity controls together.
 - Benchmark stock ART, ART plus async runtime, and ART plus async runtime plus semantic actions.
 - Report reward-improving experience per dollar-second, not only throughput.
 - Compare both wall-clock infrastructure cost and accounted rollout/trainer/queue cost, including explicit rollout dollar-seconds for API, token, tool, or GPU spend when available.

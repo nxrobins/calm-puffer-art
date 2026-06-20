@@ -50,7 +50,10 @@ from .runtime import (
 from .objective_ablation import (
     ACCOUNTED_NORTH_STAR,
     NORTH_STAR,
+    run_action_space_ablation,
+    run_adaptive_action_space_ablation,
     run_ablation,
+    run_fixed_action_space_ablation,
     run_objective_ablation,
     run_static_ablation,
 )
@@ -133,7 +136,10 @@ __all__ = [
     "local_groups_to_art",
     "observe_stale_batch_feedback",
     "promotion_checkpoint_metadata",
+    "run_action_space_ablation",
+    "run_adaptive_action_space_ablation",
     "run_ablation",
+    "run_fixed_action_space_ablation",
     "run_objective_ablation",
     "run_static_ablation",
     "scheduler_checkpoint_metadata",

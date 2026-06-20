@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from statistics import fmean
 from typing import Any, Sequence
 
-from .actions import ActionCodec, ChunkActionCodec, TokenActionCodec
+from .actions import (
+    ActionCodec,
+    AdaptiveActionSpace,
+    ChunkActionCodec,
+    TokenActionCodec,
+)
 from .runtime import ControlPlane, ControlPlaneConfig, RolloutContext
 from .scheduler import ObjectiveScheduler
 from .types import (
@@ -78,6 +83,31 @@ async def ablation_rollout(
     )
 
 
+async def action_space_ablation_rollout(
+    policy: AblationPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    messages = [Message(role="user", content="pick useful semantic bandwidth")]
+    actions = context.action_codec.encode(
+        "alpha beta gamma delta epsilon zeta eta theta"
+    )
+    if isinstance(context.action_codec, ChunkActionCodec):
+        codec_key = f"chunk_{context.action_codec.chunk_size}"
+    else:
+        codec_key = context.action_codec.name
+    reward = float(scenario.payload.get(codec_key, 0.0))
+    rollout_cost = float(scenario.payload.get(f"{codec_key}_dollar_seconds", 1.0))
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=messages,
+        actions=actions,
+        reward=reward,
+        metrics={"cost/dollar_seconds": rollout_cost},
+    )
+
+
 async def run_static_ablation() -> RunSummary:
     return await _run(scheduler=None)
 
@@ -95,6 +125,22 @@ async def run_objective_ablation() -> RunSummary:
     return await _run(scheduler=scheduler)
 
 
+async def run_fixed_action_space_ablation() -> RunSummary:
+    return await _run_action_space(
+        scheduler=_objective_scheduler(),
+        action_space=None,
+        action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
+    )
+
+
+async def run_adaptive_action_space_ablation() -> RunSummary:
+    return await _run_action_space(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=None,
+    )
+
+
 async def run_ablation() -> dict[str, Any]:
     static = await run_static_ablation()
     objective = await run_objective_ablation()
@@ -107,6 +153,23 @@ async def run_ablation() -> dict[str, Any]:
             "north_star_absolute": objective_score - static_score,
             "north_star_ratio": (
                 objective_score / static_score if static_score > 0.0 else None
+            ),
+        },
+    }
+
+
+async def run_action_space_ablation() -> dict[str, Any]:
+    fixed = await run_fixed_action_space_ablation()
+    adaptive = await run_adaptive_action_space_ablation()
+    fixed_score = float(fixed.metrics[ACCOUNTED_NORTH_STAR])
+    adaptive_score = float(adaptive.metrics[ACCOUNTED_NORTH_STAR])
+    return {
+        "fixed": summary_metrics(fixed),
+        "adaptive": summary_metrics(adaptive),
+        "lift": {
+            "accounted_north_star_absolute": adaptive_score - fixed_score,
+            "accounted_north_star_ratio": (
+                adaptive_score / fixed_score if fixed_score > 0.0 else None
             ),
         },
     }
@@ -145,6 +208,59 @@ async def _run(scheduler: ObjectiveScheduler | None) -> RunSummary:
     )
 
 
+async def _run_action_space(
+    *,
+    scheduler: ObjectiveScheduler,
+    action_space: AdaptiveActionSpace | None,
+    action_codecs: Sequence[ActionCodec] | None,
+) -> RunSummary:
+    runtime = ControlPlane(
+        ControlPlaneConfig(
+            num_actors=1,
+            group_size=1,
+            train_batch_groups=1,
+            max_train_steps=8,
+            queue_max_trajectories=4,
+            train_queue_capacity=2,
+            max_policy_lag=2,
+            cost_per_second_usd=1.0,
+        )
+    )
+    return await runtime.run(
+        scenarios=[
+            Scenario(
+                id="semantic",
+                payload={
+                    "token": 0.1,
+                    "chunk_2": 1.0,
+                    "chunk_4": 4.0,
+                    "token_dollar_seconds": 1.0,
+                    "chunk_2_dollar_seconds": 1.0,
+                    "chunk_4_dollar_seconds": 1.0,
+                },
+            )
+        ],
+        initial_policy=AblationPolicy(),
+        trainer=MeanRewardTrainer(),
+        workflow=action_space_ablation_rollout,
+        action_codecs=action_codecs,
+        action_space=action_space,
+        scheduler=scheduler,
+    )
+
+
+def _objective_scheduler() -> ObjectiveScheduler:
+    return ObjectiveScheduler(
+        min_train_batch_groups=1,
+        max_train_batch_groups=2,
+        min_policy_lag=1,
+        max_policy_lag=2,
+        min_actor_count=1,
+        max_actor_count=2,
+        exploration_bonus=0.0,
+    )
+
+
 def summary_metrics(summary: RunSummary) -> dict[str, float]:
     keys = [
         NORTH_STAR,
@@ -159,6 +275,19 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "scheduler/arm/bandwidth_token/pulls",
         "scheduler/arm/bandwidth_token/mean_rollout_dollar_seconds",
         "scheduler/arm/bandwidth_token/total_improvement_per_dollar_second",
+        "scheduler/arm/semantic_chunk_chunk_size_2/pulls",
+        "scheduler/arm/semantic_chunk_chunk_size_2/mean_rollout_dollar_seconds",
+        "scheduler/arm/semantic_chunk_chunk_size_2/total_improvement_per_dollar_second",
+        "scheduler/arm/semantic_chunk_chunk_size_4/pulls",
+        "scheduler/arm/semantic_chunk_chunk_size_4/mean_rollout_dollar_seconds",
+        "scheduler/arm/semantic_chunk_chunk_size_4/total_improvement_per_dollar_second",
+        "scheduler/arm/semantic_token/pulls",
+        "scheduler/arm/semantic_token/mean_rollout_dollar_seconds",
+        "scheduler/arm/semantic_token/total_improvement_per_dollar_second",
+        "action_space/active_codecs",
+        "action_space/promotions",
+        "action_space/max_chunk_size",
+        "action_space/codec/chunk_chunk_size_4/active",
         "scheduler/control/cadence_1/train_updates",
         "scheduler/control/policy_lag_2/train_updates",
         "scheduler/control/actor_count_1/rollout_updates",

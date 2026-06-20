@@ -4,6 +4,7 @@ import unittest
 from calm_puffer_art.objective_ablation import (
     ACCOUNTED_NORTH_STAR,
     NORTH_STAR,
+    run_action_space_ablation,
     run_ablation,
 )
 
@@ -68,6 +69,42 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertGreater(
             objective["scheduler/control/actor_count_1/score"],
             objective["scheduler/control/actor_count_2/score"],
+        )
+
+    def test_adaptive_action_space_ablation_beats_fixed_bandwidth(self):
+        result = asyncio.run(run_action_space_ablation())
+
+        fixed = result["fixed"]
+        adaptive = result["adaptive"]
+        lift = result["lift"]
+
+        self.assertGreater(
+            adaptive[ACCOUNTED_NORTH_STAR],
+            fixed[ACCOUNTED_NORTH_STAR],
+        )
+        self.assertGreater(lift["accounted_north_star_absolute"], 0.0)
+        self.assertGreater(lift["accounted_north_star_ratio"], 1.0)
+        self.assertGreater(adaptive["reward/delta"], fixed["reward/delta"])
+        self.assertGreater(
+            adaptive["actions/semantic_bandwidth_tokens_per_decision"],
+            fixed["actions/semantic_bandwidth_tokens_per_decision"],
+        )
+        self.assertEqual(
+            adaptive["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertGreaterEqual(adaptive["action_space/promotions"], 1.0)
+        self.assertGreater(
+            adaptive["scheduler/arm/semantic_chunk_chunk_size_4/pulls"],
+            0.0,
+        )
+        self.assertGreater(
+            adaptive[
+                "scheduler/arm/semantic_chunk_chunk_size_4/total_improvement_per_dollar_second"
+            ],
+            adaptive[
+                "scheduler/arm/semantic_chunk_chunk_size_2/total_improvement_per_dollar_second"
+            ],
         )
 
 
