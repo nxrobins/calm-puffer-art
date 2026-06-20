@@ -19,6 +19,7 @@ from .runtime import (
     TrajectoryRingBuffer,
     VersionedTrajectoryBatch,
     WeightBroadcastChannel,
+    restore_control_state as restore_runtime_control_state,
     train_result_dollar_seconds,
 )
 from .scheduler import (
@@ -29,6 +30,7 @@ from .scheduler import (
 )
 from .types import (
     ActionUnit,
+    Checkpoint,
     Message,
     PolicySnapshot,
     Scenario,
@@ -319,6 +321,33 @@ class AsyncArtBackend:
             if parsed is not None:
                 self._current_step = parsed
         return self._current_step
+
+    def restore_control_state(
+        self,
+        source: Mapping[str, Any] | PolicySnapshot | Checkpoint | None,
+    ) -> dict[str, bool]:
+        """Restore scheduler/action-space memory and the served policy step.
+
+        ART checkpoints carry plain metadata, while `PolicySnapshot` and
+        `Checkpoint` objects also carry the step used by stale-policy checks.
+        Restoring both keeps the scheduler's learned objective memory aligned
+        with the async ring's policy-lag baseline after a process restart.
+        """
+
+        restored = dict(
+            restore_runtime_control_state(
+                source,
+                scheduler=self.scheduler,
+                action_space=self.action_space,
+            )
+        )
+        restored["policy_step"] = False
+        step = _source_policy_step(source)
+        if step is not None:
+            self._current_step = max(self._current_step, step)
+            self.ring.current_policy_step = self._current_step
+            restored["policy_step"] = True
+        return restored
 
     async def admit_rollout(
         self,
@@ -1264,6 +1293,28 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _source_policy_step(
+    source: Mapping[str, Any] | PolicySnapshot | Checkpoint | None,
+) -> int | None:
+    if source is None:
+        return None
+    if isinstance(source, (PolicySnapshot, Checkpoint)):
+        return _optional_int(source.step)
+    if not isinstance(source, Mapping):
+        return None
+    for key in ("step", "policy_step", "art/step"):
+        parsed = _optional_int(source.get(key))
+        if parsed is not None:
+            return parsed
+    nested = source.get("metadata")
+    if isinstance(nested, Mapping):
+        for key in ("step", "policy_step", "art/step"):
+            parsed = _optional_int(nested.get(key))
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def _first_int(*values: Any) -> int:

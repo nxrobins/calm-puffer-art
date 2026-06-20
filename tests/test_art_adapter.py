@@ -365,6 +365,132 @@ class ArtAdapterTests(unittest.TestCase):
             4.0,
         )
 
+    def test_async_art_backend_restores_checkpointed_control_state(self):
+        async def run():
+            first_backend = FakeArtBackend()
+            first_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            first_action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            first_async_backend = AsyncArtBackend(
+                backend=first_backend,
+                scheduler=first_scheduler,
+                action_space=first_action_space,
+                weight_channel=channel,
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta gamma delta",
+                                )
+                            )
+                        ],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={
+                            "scenario_id": "resume-art",
+                            "scheduler/arm_id": (
+                                "resume-art|chunk(chunk_size=2)"
+                            ),
+                        },
+                    )
+                ],
+                metadata={"scenario_id": "resume-art"},
+            )
+
+            await first_async_backend.register("art-model")
+            await first_async_backend.train("art-model", [art_group])
+            update = updates.get_nowait()
+            await first_async_backend.close()
+
+            resumed_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            resumed_action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+            )
+            resumed_async_backend = AsyncArtBackend(
+                backend=FakeArtBackend(),
+                scheduler=resumed_scheduler,
+                action_space=resumed_action_space,
+            )
+            snapshot = PolicySnapshot(
+                step=update.step,
+                policy="art-model",
+                checkpoint_id=update.checkpoint_id,
+                created_at=update.created_at,
+                metadata=update.metadata,
+            )
+
+            restored = resumed_async_backend.restore_control_state(snapshot)
+            restored_metrics = resumed_scheduler.metrics()
+            await resumed_async_backend.register("art-model")
+            resolved_step = await resumed_async_backend._get_step("art-model")
+            first = resumed_async_backend.select_rollout(
+                scenarios=[Scenario(id="resume-art")],
+                actor_id=0,
+            )
+            second = resumed_async_backend.select_rollout(
+                scenarios=[Scenario(id="resume-art")],
+                actor_id=1,
+            )
+            resumed_stats = resumed_async_backend.stats()
+            await resumed_async_backend.close()
+            return (
+                update,
+                restored,
+                restored_metrics,
+                resolved_step,
+                first,
+                second,
+                resumed_stats,
+            )
+
+        (
+            update,
+            restored,
+            restored_metrics,
+            resolved_step,
+            first,
+            second,
+            resumed_stats,
+        ) = asyncio.run(run())
+
+        self.assertEqual(
+            restored,
+            {
+                "scheduler": True,
+                "action_space": True,
+                "promotion": False,
+                "policy_step": True,
+            },
+        )
+        self.assertEqual(resolved_step, update.step)
+        self.assertEqual(
+            resumed_stats["art_backend/current_step"],
+            float(update.step),
+        )
+        self.assertEqual(
+            resumed_stats["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/arm/resume_art_chunk_chunk_size_2/pulls"],
+            1.0,
+        )
+        selected_codec_keys = {
+            action_codec_key(first.action_codec),
+            action_codec_key(second.action_codec),
+        }
+        self.assertIn("chunk(chunk_size=4)", selected_codec_keys)
+
     def test_async_art_backend_selects_external_art_rollout_and_metadata(self):
         async def run():
             backend = FakeArtBackend()
