@@ -275,6 +275,7 @@ class AsyncArtBackend:
         self._stale_batches = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
+        self._sample_dollar_seconds = 0.0
         self._pending_groups: list[_PendingArtGroup] = []
         self._pending_lock = asyncio.Lock()
 
@@ -424,6 +425,7 @@ class AsyncArtBackend:
         stats["art_backend/trainer_wait_dollar_seconds"] = (
             self._trainer_wait_dollar_seconds
         )
+        stats["art_backend/sample_dollar_seconds"] = self._sample_dollar_seconds
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
         if self.action_space is not None:
             stats.update(self.action_space.metrics())
@@ -473,6 +475,7 @@ class AsyncArtBackend:
                     duration_s=duration_s,
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 )
+                sample_dollar_seconds = _groups_sample_dollar_seconds(batch.groups)
                 next_step = _optional_int(local_result.metadata.get("art/step"))
                 self._current_step = (
                     max(self._current_step + 1, next_step)
@@ -487,6 +490,7 @@ class AsyncArtBackend:
                         duration_s=duration_s,
                         dollar_seconds=(
                             train_dollar_seconds + train_wait_dollar_seconds
+                            + sample_dollar_seconds
                         ),
                         policy_step=policy_step,
                     )
@@ -564,6 +568,7 @@ class AsyncArtBackend:
             on_discard=self._discard_submitted_batch,
         )
         self._submitted_batches += 1
+        self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
         await self.ring.put(batch)
 
     async def _flush_pending_locked(self) -> int:
@@ -769,6 +774,74 @@ def _float_metrics(values: Mapping[str, Any]) -> dict[str, float]:
         if isfinite(float_value):
             metrics[str(key)] = float_value
     return metrics
+
+
+def _groups_sample_dollar_seconds(groups: Sequence[TrajectoryGroup]) -> float:
+    return sum(
+        _trajectory_sample_dollar_seconds(trajectory)
+        for group in groups
+        for trajectory in group.trajectories
+    )
+
+
+def _trajectory_sample_dollar_seconds(trajectory: Trajectory) -> float:
+    explicit_total = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/dollar_seconds",),
+    )
+    if explicit_total is None:
+        explicit_total = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/dollar_seconds",),
+        )
+    if explicit_total is not None:
+        return explicit_total
+
+    rollout_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("rollout/dollar_seconds",),
+    )
+    if rollout_cost is None:
+        rollout_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("rollout/dollar_seconds",),
+        )
+    queue_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/actor_queue_wait_dollar_seconds", "queue_wait/dollar_seconds"),
+    )
+    if queue_cost is None:
+        queue_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/actor_queue_wait_dollar_seconds", "queue_wait/dollar_seconds"),
+        )
+    admission_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+    )
+    if admission_cost is None:
+        admission_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+        )
+    return (rollout_cost or 0.0) + (queue_cost or 0.0) + (admission_cost or 0.0)
+
+
+def _first_nonnegative_mapping_float(
+    values: Mapping[str, Any],
+    keys: Sequence[str],
+) -> float | None:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            continue
+        if isfinite(candidate) and candidate >= 0.0:
+            return candidate
+    return None
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:

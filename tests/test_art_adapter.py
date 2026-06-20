@@ -401,6 +401,48 @@ class ArtAdapterTests(unittest.TestCase):
             17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
         )
 
+    def test_async_art_backend_charges_successful_art_sample_cost_to_scheduler(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(cost_per_second_usd=1000.0),
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 11.0},
+                        metadata={"scenario_id": "sample-cost-art"},
+                    )
+                ],
+                metadata={"scenario_id": "sample-cost-art"},
+            )
+
+            await async_backend.register("art-model")
+            result = await async_backend.train("art-model", [art_group])
+            metrics = scheduler.metrics()
+            stats = async_backend.stats()
+            await async_backend.close()
+            return result, metrics, stats
+
+        result, metrics, stats = asyncio.run(run())
+
+        self.assertEqual(result.step, 1)
+        self.assertEqual(stats["art_backend/sample_dollar_seconds"], 11.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/costs/train_dollar_seconds"],
+            28.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/accounted_last_dollar_seconds"],
+            28.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+        )
+
     def test_async_art_backend_charges_trainer_wait_to_scheduler(self):
         async def run():
             backend = CostedFakeArtBackend()
