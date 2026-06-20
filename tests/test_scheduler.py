@@ -564,6 +564,44 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(metrics["scheduler/train_last_objective"], 1.5)
 
+    def test_train_objective_prefers_promotion_score_when_present(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        group = TrajectoryGroup(
+            scenario_id="candidate",
+            trajectories=(
+                Trajectory(
+                    scenario_id="candidate",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "candidate|token"},
+                ),
+            ),
+        )
+
+        scheduler.observe_train(
+            groups=[group],
+            result=TrainResult(
+                metrics={
+                    "train/reward": 10.0,
+                    "promotion/score": 0.0,
+                    "promotion/promoted": 0.0,
+                }
+            ),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+
+        metrics = scheduler.metrics()
+        self.assertEqual(metrics["scheduler/train_last_reward_improvement"], 0.0)
+        self.assertEqual(metrics["scheduler/train_last_objective"], 0.0)
+        self.assertEqual(
+            metrics["scheduler/arm/candidate_token/policy_improvement_objective_ema"],
+            0.0,
+        )
+
     def test_train_group_scoring_prefers_high_objective_arms(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         high = Trajectory(

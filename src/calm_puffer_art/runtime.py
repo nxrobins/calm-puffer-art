@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import time
 from collections.abc import Mapping as MappingABC
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import isfinite
 from statistics import fmean
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -29,6 +30,7 @@ from .types import (
     Checkpoint,
     Message,
     PolicySnapshot,
+    PromotionDecision,
     RunSummary,
     Scenario,
     TrainResult,
@@ -60,6 +62,64 @@ class TrainerBackend(Protocol):
         groups: Sequence[TrajectoryGroup],
     ) -> TrainResult:
         ...
+
+
+class PromotionEvaluator(Protocol):
+    """Programmable gate for publishing trained candidate policies."""
+
+    async def __call__(
+        self,
+        *,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        ...
+
+
+@dataclass
+class MetricPromotionEvaluator:
+    """Promotes candidates when a result metric improves enough."""
+
+    metric_key: str = "train/reward"
+    min_delta: float = 0.0
+    initial_score: float = 0.0
+    best_score: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.min_delta < 0:
+            raise ValueError("min_delta must be non-negative")
+        self.best_score = self.initial_score
+
+    async def __call__(
+        self,
+        *,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        score = _result_metric_score(
+            result,
+            groups,
+            preferred_key=self.metric_key,
+        )
+        baseline = self.best_score
+        improvement = score - baseline
+        promoted = improvement >= self.min_delta
+        if promoted:
+            self.best_score = score
+        return PromotionDecision(
+            promoted=promoted,
+            score=score,
+            baseline_score=baseline,
+            improvement=improvement,
+            reason=(
+                "metric_improved"
+                if promoted
+                else "metric_below_promotion_threshold"
+            ),
+            metrics={f"promotion/metric/{self.metric_key}": score},
+        )
 
 
 @dataclass(frozen=True)
@@ -481,6 +541,14 @@ class RuntimeTelemetry:
         self.action_quality_total = 0.0
         self.action_quality_count = 0
         self.unsafe_trajectories = 0
+        self.promotion_evaluations = 0
+        self.promotions = 0
+        self.promotion_rejections = 0
+        self.promotion_eval_dollar_seconds = 0.0
+        self.latest_promotion_score = 0.0
+        self.latest_promotion_baseline_score = 0.0
+        self.latest_promotion_improvement = 0.0
+        self.latest_promotion_promoted = False
 
     def record_actor_queue_wait(self, seconds: float) -> None:
         self.actor_queue_wait_s += max(0.0, seconds)
@@ -532,6 +600,18 @@ class RuntimeTelemetry:
         if metric_reward is not None and isfinite(metric_reward):
             self.train_rewards.append(float(metric_reward))
 
+    def record_promotion(self, decision: PromotionDecision) -> None:
+        self.promotion_evaluations += 1
+        if decision.promoted:
+            self.promotions += 1
+        else:
+            self.promotion_rejections += 1
+        self.promotion_eval_dollar_seconds += max(0.0, decision.dollar_seconds)
+        self.latest_promotion_score = decision.score
+        self.latest_promotion_baseline_score = decision.baseline_score
+        self.latest_promotion_improvement = decision.improvement
+        self.latest_promotion_promoted = decision.promoted
+
     def metrics(self, *, stale_dropped: int) -> dict[str, float]:
         wall_s = max(time.perf_counter() - self.started_at, 1e-9)
         first_reward, last_reward = self._reward_windows()
@@ -546,6 +626,7 @@ class RuntimeTelemetry:
             rollout_dollar_seconds
             + trainer_dollar_seconds
             + queue_wait_dollar_seconds
+            + self.promotion_eval_dollar_seconds
         )
         if dollar_seconds > 0:
             reward_experience = (
@@ -576,6 +657,7 @@ class RuntimeTelemetry:
             "data/stale_trajectories_dropped": float(stale_dropped),
             "data/groups_trained": float(self.groups_trained),
             "data/train_steps": float(self.train_steps),
+            "data/checkpoints_promoted": float(self.promotions),
             "throughput/accepted_trajectories_per_s": self.trajectories_accepted
             / wall_s,
             "throughput/action_units_per_s": self.action_units / wall_s,
@@ -595,8 +677,27 @@ class RuntimeTelemetry:
             "costs/wall_clock_dollar_seconds": dollar_seconds,
             "costs/rollout_dollar_seconds": rollout_dollar_seconds,
             "costs/trainer_dollar_seconds": trainer_dollar_seconds,
+            "costs/promotion_eval_dollar_seconds": (
+                self.promotion_eval_dollar_seconds
+            ),
             "costs/actor_queue_wait_dollar_seconds": queue_wait_dollar_seconds,
             "costs/accounted_dollar_seconds": accounted_dollar_seconds,
+            "promotion/evaluations": float(self.promotion_evaluations),
+            "promotion/promoted": float(self.promotions),
+            "promotion/rejected": float(self.promotion_rejections),
+            "promotion/rate": (
+                self.promotions / self.promotion_evaluations
+                if self.promotion_evaluations
+                else 0.0
+            ),
+            "promotion/latest_score": self.latest_promotion_score,
+            "promotion/latest_baseline_score": (
+                self.latest_promotion_baseline_score
+            ),
+            "promotion/latest_improvement": self.latest_promotion_improvement,
+            "promotion/latest_promoted": (
+                1.0 if self.latest_promotion_promoted else 0.0
+            ),
             "north_star/reward_improving_experience_per_dollar_second": reward_experience,
             "north_star/accounted_reward_improving_experience_per_dollar_second": (
                 accounted_reward_experience
@@ -630,6 +731,7 @@ class ControlPlane:
         action_space: AdaptiveActionSpace | None = None,
         weight_channel: WeightBroadcastChannel | None = None,
         scheduler: AdaptiveScheduler | None = None,
+        promotion_evaluator: PromotionEvaluator | None = None,
     ) -> RunSummary:
         restore_control_state(
             initial_policy,
@@ -717,12 +819,20 @@ class ControlPlane:
                     duration_s=train_duration_s,
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 )
+                promotion = await self._evaluate_promotion(
+                    evaluator=promotion_evaluator,
+                    current=current,
+                    result=result,
+                    groups=batch.groups,
+                )
+                result = _with_promotion_metadata(result, promotion)
                 telemetry.record_train(
                     batch.groups,
                     result,
                     duration_s=train_duration_s,
                     dollar_seconds=train_dollar_seconds,
                 )
+                telemetry.record_promotion(promotion)
                 if scheduler is not None:
                     scheduler.observe_train(
                         groups=batch.groups,
@@ -733,15 +843,18 @@ class ControlPlane:
                     )
                     if action_space is not None:
                         action_space.update_from_metrics(scheduler.metrics())
-                latest = await registry.publish(
-                    _with_control_checkpoint_metadata(
-                        result,
-                        scheduler=scheduler,
-                        action_space=action_space,
+                if promotion.promoted:
+                    latest = await registry.publish(
+                        _with_control_checkpoint_metadata(
+                            result,
+                            scheduler=scheduler,
+                            action_space=action_space,
+                        )
                     )
-                )
-                train_ring.current_policy_step = latest.step
-                await broadcaster.publish(latest)
+                    train_ring.current_policy_step = latest.step
+                    await broadcaster.publish(latest)
+                else:
+                    train_ring.current_policy_step = current.step
         finally:
             stop.set()
             for actor in actors:
@@ -766,6 +879,47 @@ class ControlPlane:
             pending_trajectories=grouper.pending_trajectories
             + trajectory_queue.qsize(),
             pending_groups=len(ready_groups) + train_ring.pending_groups,
+        )
+
+    async def _evaluate_promotion(
+        self,
+        *,
+        evaluator: PromotionEvaluator | None,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        if evaluator is None:
+            score = _result_metric_score(result, groups)
+            return PromotionDecision(
+                promoted=True,
+                score=score,
+                baseline_score=0.0,
+                improvement=max(0.0, score),
+                reason="promote_all",
+            )
+
+        started = time.perf_counter()
+        decision_or_awaitable = evaluator(
+            current=current,
+            result=result,
+            groups=groups,
+        )
+        decision = (
+            await decision_or_awaitable
+            if inspect.isawaitable(decision_or_awaitable)
+            else decision_or_awaitable
+        )
+        if not isinstance(decision, PromotionDecision):
+            raise TypeError("promotion_evaluator must return PromotionDecision")
+        if decision.dollar_seconds > 0.0:
+            return decision
+        return replace(
+            decision,
+            dollar_seconds=(
+                (time.perf_counter() - started)
+                * self.config.cost_per_second_usd
+            ),
         )
 
     async def _batcher_loop(
@@ -1166,6 +1320,70 @@ def train_result_dollar_seconds(
     if explicit_cost is not None:
         return explicit_cost
     return max(0.0, duration_s) * cost_per_second_usd
+
+
+def _with_promotion_metadata(
+    result: TrainResult,
+    decision: PromotionDecision,
+) -> TrainResult:
+    metrics = dict(result.metrics)
+    effective_score = decision.score if decision.promoted else decision.baseline_score
+    metrics.update(
+        {
+            "promotion/promoted": 1.0 if decision.promoted else 0.0,
+            "promotion/score": effective_score,
+            "promotion/candidate_score": decision.score,
+            "promotion/baseline_score": decision.baseline_score,
+            "promotion/improvement": decision.improvement,
+            "promotion/dollar_seconds": max(0.0, decision.dollar_seconds),
+        }
+    )
+    for key, value in decision.metrics.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and isfinite(float(value)):
+            metrics[str(key)] = float(value)
+
+    metadata = dict(result.metadata)
+    metadata.update(
+        {
+            "promotion/promoted": decision.promoted,
+            "promotion/reason": decision.reason,
+            "promotion/score": decision.score,
+            "promotion/effective_score": effective_score,
+            "promotion/baseline_score": decision.baseline_score,
+            "promotion/improvement": decision.improvement,
+            "promotion/dollar_seconds": max(0.0, decision.dollar_seconds),
+        }
+    )
+    return TrainResult(
+        policy=result.policy,
+        metrics=metrics,
+        checkpoint_id=result.checkpoint_id,
+        metadata=metadata,
+    )
+
+
+def _result_metric_score(
+    result: TrainResult,
+    groups: Sequence[TrajectoryGroup],
+    *,
+    preferred_key: str = "train/reward",
+) -> float:
+    for key in (preferred_key, "promotion/score", "eval/reward", "train/reward"):
+        value = result.metrics.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and isfinite(float(value)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                parsed = float(value)
+            except ValueError:
+                continue
+            if isfinite(parsed):
+                return parsed
+    return mean([group.mean_reward for group in groups])
 
 
 def _first_nonnegative_float(

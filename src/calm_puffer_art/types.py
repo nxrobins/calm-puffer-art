@@ -101,6 +101,19 @@ class TrainResult:
 
 
 @dataclass(frozen=True)
+class PromotionDecision:
+    """Decision to publish or reject a trained candidate policy."""
+
+    promoted: bool
+    score: float
+    baseline_score: float = 0.0
+    improvement: float = 0.0
+    dollar_seconds: float = 0.0
+    reason: str = ""
+    metrics: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Checkpoint:
     """Published policy checkpoint metadata."""
 

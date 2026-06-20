@@ -9,9 +9,10 @@ The control plane has these stable contracts:
 3. `ActionCodec`: policy decisions are represented as semantic `ActionUnit` objects instead of assuming one generated token per action.
 4. `AdaptiveScheduler`: rollout selection, train-batch priority, batch cadence, policy lag, action granularity, and continuation are chosen from reward-per-cost feedback.
 5. `VersionedTrajectoryBatch`: grouped training payloads carry the policy-step range they were collected under.
-6. `WeightBroadcastChannel`: checkpoint updates are explicit events that inference workers or adapters can subscribe to.
-7. `RuntimeTelemetry`: actor, queue, trainer, reward, cost, and staleness signals are reported in one run summary.
-8. `art_adapter`: optional structural conversion for ART `Trajectory` and `TrajectoryGroup` objects without importing ART in the core package.
+6. `PromotionEvaluator`: optional user code decides whether a trained candidate becomes the served checkpoint.
+7. `WeightBroadcastChannel`: promoted checkpoint updates are explicit events that inference workers or adapters can subscribe to.
+8. `RuntimeTelemetry`: actor, queue, trainer, promotion, reward, cost, and staleness signals are reported in one run summary.
+9. `art_adapter`: optional structural conversion for ART `Trajectory` and `TrajectoryGroup` objects without importing ART in the core package.
 
 ## Runtime Loop
 
@@ -26,16 +27,17 @@ flowchart LR
     Q --> G["Background scenario grouper"]
     G --> R["Versioned train-batch ring"]
     R --> T["Trainer backend"]
-    T --> C["Checkpoint registry"]
+    T --> E["Promotion evaluator"]
+    E --> C["Checkpoint registry"]
     C --> P
     C --> W["Weight broadcast channel"]
     G --> S
-    T --> S
+    E --> S
 ```
 
 Actors continuously run user-defined workflows. Completed trajectories enter a bounded queue, so slow grouping applies backpressure rather than unbounded memory growth. A background batcher consumes those trajectories, forms same-scenario groups, and writes `VersionedTrajectoryBatch` objects into a bounded train-batch ring.
 
-The trainer consumes the highest-priority non-stale batch from the ring and publishes a new policy checkpoint. Trajectories whose policy step is older than `max_policy_lag` are dropped during grouping. Whole train batches can also be discarded if they become too stale while waiting in the ring.
+The trainer consumes the highest-priority non-stale batch from the ring and returns a candidate policy. A promotion gate decides whether that candidate becomes the served checkpoint and is broadcast. Trajectories whose policy step is older than `max_policy_lag` are dropped during grouping. Whole train batches can also be discarded if they become too stale while waiting in the ring.
 
 ## Closed-Loop Objective Scheduler
 
@@ -89,11 +91,13 @@ The control loop is online:
 5. The scheduler scores each candidate train batch from the arms, effective rewards, and quality signals inside it.
 6. The ring serves the highest-priority non-stale batch to the trainer.
 7. The trainer reports reward movement, useful trajectory count, and train dollar-seconds.
-8. The scheduler computes train objective as reward improvement times useful trajectory count per dollar-second, then distributes that policy-improvement objective back onto the contributing scenario/action-codec arms.
-9. The scheduler also credits the active train-batch cadence and policy-lag values used by the consumed trajectories.
-10. The adaptive action space can promote or retire higher-bandwidth chunk codecs from that feedback.
-11. The scheduler tightens cadence and policy lag when it sees positive marginal objective signal, and can reuse credited cadence or lag settings when they show better train objective.
-12. If configured with ROI patience, the scheduler stops the run early after repeated low-objective train steps.
+8. The promotion evaluator accepts or rejects the candidate policy and reports candidate score, baseline score, improvement, reason, and evaluation dollar-seconds.
+9. The scheduler computes train objective from the promotion-effective score when present, otherwise from `train/reward`.
+10. The scheduler distributes that policy-improvement objective back onto the contributing scenario/action-codec arms.
+11. The scheduler also credits the active train-batch cadence and policy-lag values used by the consumed trajectories.
+12. The adaptive action space can promote or retire higher-bandwidth chunk codecs from that feedback.
+13. The scheduler tightens cadence and policy lag when it sees positive marginal objective signal, and can reuse credited cadence or lag settings when they show better train objective.
+14. If configured with ROI patience, the scheduler stops the run early after repeated low-objective train steps.
 
 The scheduler deliberately keeps the configured policy-lag allowance until every known arm has at least one accepted sample. That prevents the closed loop from dropping exploratory rollouts before it has enough evidence to compare action granularities.
 
@@ -102,6 +106,8 @@ Arm scoring is objective-weighted. The default score is marginal rollout reward-
 Cadence is pressure-aware and credited. When the train ring is saturated and the scheduler has no positive objective signal, it widens train batches toward `max_train_batch_groups` to amortize trainer spend. When rollout or train feedback shows positive marginal reward improvement per dollar-second, it tightens cadence back to `min_train_batch_groups` so useful gradients are consumed sooner. Actor queue-wait cost is stamped onto trajectories before enqueue and included in the scheduler's rollout denominator, so backpressure can reduce the marginal objective of arms and control settings that create it. Consumed train batches also credit the active cadence and policy-lag values under `scheduler/control/*`, letting later decisions reuse settings that show better train objective than the default heuristic.
 
 Stale train-ring drops are negative feedback, not just telemetry. When a queued `VersionedTrajectoryBatch` becomes too stale to train, the runtime reports the discarded groups through `observe_stale_batch_feedback()`. `ObjectiveScheduler` converts their quality-weighted useful experience into a configurable negative objective credit, debiting the arms, batch-cadence values, and policy-lag values that produced the untrained samples.
+
+Promotion is programmable. Without a `PromotionEvaluator`, every train result is promoted to preserve the simple ART-like training loop. With one, a `TrainResult` becomes a candidate. Rejected candidates still count as train spend and promotion-evaluation spend, but they do not advance `PolicyRegistry`, do not append a checkpoint, and do not publish a `WeightUpdate`. `MetricPromotionEvaluator` is the built-in deterministic gate: it promotes only when a chosen result metric improves beyond `min_delta`. Custom evaluators can run held-out workflow checks and return `PromotionDecision` directly. The runtime writes promotion score, baseline, improvement, cost, and reason into candidate metrics/metadata; `ObjectiveScheduler.observe_train()` reads `promotion/score` first so rejected candidates do not receive false positive policy-improvement credit.
 
 Action quality is part of the objective. Unsafe or failed high-bandwidth actions get an effective reward multiplier of `0`, so a risky chunk arm cannot win merely by reporting a high raw reward when reconstruction or verification fails.
 
@@ -115,7 +121,7 @@ Resume uses the same metadata. `restore_control_state()` accepts checkpoint-styl
 
 ## Puffer-Bridge Semantics
 
-The implemented runtime borrows three Puffer-like rules:
+The implemented runtime borrows these Puffer-like rules:
 
 - **Static capacity:** train batches sit in a fixed-capacity ring, configured by `train_queue_capacity`.
 - **Backpressure:** when the train ring is full, the batcher blocks; if the trajectory queue fills after that, actors block.
@@ -254,6 +260,7 @@ Implemented now:
 - Rollout, trainer, queue-wait, wall-clock, and accounted cost telemetry.
 - Actor queue-wait cost attribution into scheduler rollout objective denominators.
 - Stale train-batch discard feedback into scheduler arm, cadence, and policy-lag objective memory.
+- Promotion-gated checkpoint publication with promotion cost telemetry and promotion-effective scheduler credit.
 - Static-vs-objective ablation harness that asserts positive north-star lift from scheduler control.
 - Quality-aware effective reward for unsafe or low-fidelity action granularities.
 - Opt-in ROI-based early stopping when marginal train objective is exhausted.

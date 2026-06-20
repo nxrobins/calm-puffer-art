@@ -454,7 +454,9 @@ class ObjectiveScheduler:
         dollar_seconds: float,
         policy_step: int,
     ) -> None:
-        metric_reward = result.metrics.get("train/reward")
+        metric_reward = result.metrics.get("promotion/score")
+        if metric_reward is None:
+            metric_reward = result.metrics.get("train/reward")
         reward = (
             float(metric_reward)
             if metric_reward is not None and math.isfinite(float(metric_reward))

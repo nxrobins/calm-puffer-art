@@ -55,6 +55,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
+- It can gate candidate checkpoints through a programmable `PromotionEvaluator`, so train spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward.
 
 This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as verifier failure modes, reward variance, reconstruction drift, and per-actor causal cost attribution.
 
@@ -122,6 +123,7 @@ Phase 1: Runtime bridge
 - Use verifier/reconstruction feedback to penalize unsafe action granularities before they affect rollout selection or train-batch priority.
 - Assign train-step policy-improvement credit back to the rollout/action arms that generated the consumed trajectories.
 - Feed stale train-batch drops back into scheduler arm, cadence, and policy-lag objective memory as negative experience.
+- Gate checkpoint publication on programmable promotion decisions and feed the promotion-effective score into scheduler train credit.
 - Make cadence pressure-aware so saturated trainers receive larger batches unless the objective signal justifies tighter updates.
 - Promote larger chunk codecs online when smaller chunks show positive objective signal and acceptable quality.
 - Add ROI patience so the runtime stops spending after repeated low-value training steps instead of blindly exhausting `max_train_steps`.

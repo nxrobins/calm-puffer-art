@@ -12,6 +12,7 @@ from calm_puffer_art import (
     ChunkActionCodec,
     ControlPlane,
     ControlPlaneConfig,
+    MetricPromotionEvaluator,
     Message,
     ObjectiveScheduler,
     PolicySnapshot,
@@ -91,6 +92,28 @@ class CostedTrainer:
             metrics={
                 "train/reward": fmean(rewards),
                 "train/dollar_seconds": 42.0,
+            },
+        )
+
+
+class SequencedMetricTrainer:
+    def __init__(self, scores: Sequence[float]) -> None:
+        self.scores = tuple(scores)
+        self.calls = 0
+
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        score = self.scores[min(self.calls, len(self.scores) - 1)]
+        self.calls += 1
+        return TrainResult(
+            policy=CountingPolicy(level=current.policy.level + self.calls),
+            checkpoint_id=f"candidate-{self.calls}",
+            metrics={
+                "train/reward": score,
+                "eval/reward": score,
             },
         )
 
@@ -284,6 +307,71 @@ class RuntimeTests(unittest.TestCase):
                 "total_pulls"
             ],
             scheduler_state["learning_state"]["total_pulls"],
+        )
+
+    def test_control_plane_promotion_gate_rejects_unimproved_candidate(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            trainer = SequencedMetricTrainer([0.1, 1.0])
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=trainer,
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                weight_channel=channel,
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(summary.metrics["data/train_steps"], 2.0)
+        self.assertEqual(summary.metrics["data/checkpoints_promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(summary.metrics["promotion/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/rejected"], 1.0)
+        self.assertEqual(summary.metrics["weights/broadcasts"], 1.0)
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(len(summary.checkpoints), 2)
+        self.assertEqual([update.step for update in emitted], [1])
+        self.assertEqual(summary.checkpoints[-1].checkpoint_id, "candidate-2")
+        self.assertTrue(summary.checkpoints[-1].metadata["promotion/promoted"])
+        self.assertEqual(
+            summary.checkpoints[-1].metadata["promotion/reason"],
+            "metric_improved",
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/train_last_reward_improvement"],
+            1.0,
         )
 
     def test_control_plane_promotes_adaptive_action_space_codecs(self):

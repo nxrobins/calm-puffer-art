@@ -90,6 +90,26 @@ summary = await ControlPlane(config).run(
 
 The scheduler explores `(scenario, action_codec)` arms, estimates marginal reward improvement per dollar-second, credits train-step policy improvement back to the arms and runtime controls that produced each consumed batch, and uses that signal to choose future rollouts, action granularity, train-batch priority, batch cadence, policy lag, and optional early stopping. Train feedback uses reward improvement multiplied by useful trajectory count, aligning it with the run-level north-star numerator. Raw reward efficiency is an explicit opt-in scoring weight; by default rollout selection and batch priority are driven by marginal rollout objective plus train-improvement objective. Rollouts can set `metrics["cost/dollar_seconds"]` or `metadata["cost/dollar_seconds"]` to account for API, token, tool, or GPU cost; otherwise runtime duration is multiplied by the configured infrastructure rate. Actor queue-wait cost is stamped onto trajectories as `cost/actor_queue_wait_dollar_seconds` and included in scheduler rollout cost, so backpressure lowers the marginal objective of the arms and runtime settings that caused it. Trainers can report `cost/dollar_seconds`, `train/dollar_seconds`, or `trainer/dollar_seconds` in `TrainResult.metrics` or metadata; that explicit cost feeds runtime telemetry and scheduler train-objective credit. It widens train batches under trainer pressure when no objective signal justifies tight updates, but credited cadence and lag settings can be reused when their observed objective is better. Rollouts can add `action/safe`, `action/quality`, `reconstruction/accuracy`, or `verifier/passed` metadata; unsafe actions receive zero effective reward and no train-improvement credit.
 
+Gate checkpoint promotion when train reward is not enough:
+
+```python
+summary = await ControlPlane(config).run(
+    scenarios=scenarios,
+    initial_policy=policy,
+    trainer=trainer,
+    workflow=rollout,
+    action_codecs=[TokenActionCodec()],
+    scheduler=ObjectiveScheduler(),
+    promotion_evaluator=MetricPromotionEvaluator(
+        metric_key="eval/reward",
+        min_delta=0.05,
+        initial_score=baseline_eval_reward,
+    ),
+)
+```
+
+Without a `promotion_evaluator`, every train result is promoted, preserving the simple default. With one, each train result becomes a candidate: rejected candidates still count as train spend, but they do not advance the served policy step, do not append a checkpoint, and do not broadcast weights. `PromotionDecision` metadata records candidate score, baseline score, improvement, cost, and reason. Scheduler train credit uses the promotion-effective score under `promotion/score`, so rejected candidates do not create false positive policy-improvement credit merely because their trainer-local reward looked high.
+
 Use `ObjectiveScheduler.state_dict()` and `ObjectiveScheduler.load_state_dict()` to persist the controller's learned arm statistics, runtime-control credit, budget counters, configuration, and scalar last-decision metadata alongside ART checkpoints. `ControlPlane` and `AsyncArtBackend` attach that snapshot under `scheduler/state` after train feedback is observed and before the checkpoint update is published. The snapshot intentionally excludes live `Scenario` and `ActionCodec` objects, so resumed runs should reconstruct those from user code and reload only the scheduler's numeric control memory.
 
 To resume local control state, pass a `PolicySnapshot` as `initial_policy` and include the saved checkpoint metadata:
@@ -186,7 +206,7 @@ result = await future
 - `calm_puffer_art.actions`: token, chunk, latent-patch, command, and reasoning-step codecs, plus the adaptive chunk promotion/demotion action space with checkpointable state.
 - `calm_puffer_art.art_adapter`: dependency-free conversion between ART-shaped trajectory groups and local runtime groups, a delegating trainer wrapper, and a structural async ART backend wrapper.
 - `calm_puffer_art.scheduler`: objective-driven rollout/action/train-priority/cadence/lag scheduler with action-quality, train-improvement, stale-drop, pressure feedback, and checkpointable control state.
-- `calm_puffer_art.runtime`: async control plane with actor pools, bounded queues, background group assembly, priority-aware versioned train-batch rings, checkpoint broadcasts, stale-sample filtering, cost attribution, and telemetry.
+- `calm_puffer_art.runtime`: async control plane with actor pools, bounded queues, background group assembly, priority-aware versioned train-batch rings, promotion-gated checkpoint broadcasts, stale-sample filtering, cost attribution, and telemetry.
 - `examples/counting_agent.py`: a deterministic trainable toy policy whose reward improves over checkpoints.
 - `examples/adaptive_scheduler_agent.py`: a deterministic closed-loop scheduler demo that learns which scenario/action-codec arm has better reward-per-cost signal.
 - `examples/adaptive_action_space_agent.py`: a deterministic demo where objective feedback promotes a larger chunk action codec during the run.
