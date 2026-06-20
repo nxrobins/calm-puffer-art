@@ -66,6 +66,52 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
 
+    def test_adaptive_action_space_requires_parent_margin_for_promotion(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            promotion_parent_margin=0.1,
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_token/pulls": 3.0,
+                "scheduler/arm/task_token/objective_score": 2.0,
+                "scheduler/arm/task_token/action_quality_ema": 1.0,
+                "scheduler/arm/task_token/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.05,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_token/pulls": 4.0,
+                "scheduler/arm/task_token/objective_score": 2.0,
+                "scheduler/arm/task_token/action_quality_ema": 1.0,
+                "scheduler/arm/task_token/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.2,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
+
     def test_adaptive_action_space_can_promote_latent_patch_from_chunk_signal(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -383,6 +429,7 @@ class ActionCodecTests(unittest.TestCase):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
             max_chunk_size=8,
+            promotion_parent_margin=0.1,
             demotion_parent_margin=0.25,
             promote_latent_patches=True,
             latent_patch_latent_size=3,
@@ -411,6 +458,7 @@ class ActionCodecTests(unittest.TestCase):
 
         self.assertEqual(restored.min_chunk_size, 2)
         self.assertEqual(restored.max_chunk_size, 8)
+        self.assertEqual(restored.promotion_parent_margin, 0.1)
         self.assertEqual(restored.promotion_semantic_bandwidth_threshold, 1.0)
         self.assertEqual(restored.demotion_parent_margin, 0.25)
         self.assertEqual(restored.demotion_semantic_bandwidth_threshold, 1.0)

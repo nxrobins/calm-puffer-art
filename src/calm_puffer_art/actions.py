@@ -241,6 +241,7 @@ class AdaptiveActionSpace:
     min_chunk_size: int = 2
     max_chunk_size: int = 8
     promotion_objective_threshold: float = 0.0
+    promotion_parent_margin: float = 0.0
     promotion_quality_threshold: float = 0.95
     promotion_semantic_bandwidth_threshold: float = 1.0
     unsafe_rate_threshold: float = 0.0
@@ -265,6 +266,8 @@ class AdaptiveActionSpace:
             raise ValueError("max_chunk_size must be >= min_chunk_size")
         if self.promotion_quality_threshold < 0:
             raise ValueError("promotion_quality_threshold must be non-negative")
+        if self.promotion_parent_margin < 0:
+            raise ValueError("promotion_parent_margin must be non-negative")
         if self.promotion_semantic_bandwidth_threshold < 0:
             raise ValueError(
                 "promotion_semantic_bandwidth_threshold must be non-negative"
@@ -318,6 +321,8 @@ class AdaptiveActionSpace:
                 continue
             if signal.unsafe_rate > self.unsafe_rate_threshold:
                 continue
+            if not self._parent_allows_promotion(codec, signal, metrics):
+                continue
             if codec.chunk_size < self.max_chunk_size:
                 next_size = min(self.max_chunk_size, codec.chunk_size * 2)
                 candidate = ChunkActionCodec(chunk_size=next_size)
@@ -342,6 +347,24 @@ class AdaptiveActionSpace:
                     continue
                 if self.add_codec(latent_candidate):
                     self._promotions += 1
+
+    def _parent_allows_promotion(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
+        parent = self._parent_codec(codec)
+        if parent is None:
+            return True
+        parent_signal = self._codec_signal(parent, metrics)
+        if parent_signal.pulls <= 0.0:
+            return True
+        if parent_signal.unsafe_rate > self.unsafe_rate_threshold:
+            return True
+        return signal.objective > (
+            parent_signal.objective + self.promotion_parent_margin
+        )
 
     def _demote_from_metrics(self, metrics: Mapping[str, float]) -> set[str]:
         disabled: set[str] = set()
@@ -423,7 +446,7 @@ class AdaptiveActionSpace:
 
     def _parent_codec(self, codec: ActionCodec) -> ActionCodec | None:
         if isinstance(codec, ChunkActionCodec):
-            return self._nearest_smaller_chunk(codec)
+            return self._nearest_smaller_chunk(codec) or self._token_codec()
         if isinstance(codec, LatentPatchActionCodec):
             chunks = [
                 candidate
@@ -436,6 +459,12 @@ class AdaptiveActionSpace:
             if not chunks:
                 return None
             return max(chunks, key=lambda candidate: candidate.chunk_size)
+        return None
+
+    def _token_codec(self) -> TokenActionCodec | None:
+        for codec in self._codecs:
+            if isinstance(codec, TokenActionCodec):
+                return codec
         return None
 
     def _nearest_smaller_chunk(
@@ -465,6 +494,7 @@ class AdaptiveActionSpace:
                 "promotion_objective_threshold": (
                     self.promotion_objective_threshold
                 ),
+                "promotion_parent_margin": self.promotion_parent_margin,
                 "promotion_quality_threshold": self.promotion_quality_threshold,
                 "promotion_semantic_bandwidth_threshold": (
                     self.promotion_semantic_bandwidth_threshold
@@ -509,6 +539,10 @@ class AdaptiveActionSpace:
         self.promotion_objective_threshold = _state_float(
             config.get("promotion_objective_threshold"),
             self.promotion_objective_threshold,
+        )
+        self.promotion_parent_margin = _state_float(
+            config.get("promotion_parent_margin"),
+            self.promotion_parent_margin,
         )
         self.promotion_quality_threshold = _state_float(
             config.get("promotion_quality_threshold"),
@@ -560,6 +594,7 @@ class AdaptiveActionSpace:
             0.0,
             self.promotion_semantic_bandwidth_threshold,
         )
+        self.promotion_parent_margin = max(0.0, self.promotion_parent_margin)
         self.demotion_semantic_bandwidth_threshold = max(
             0.0,
             self.demotion_semantic_bandwidth_threshold,
