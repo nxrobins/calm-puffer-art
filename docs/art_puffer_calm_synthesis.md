@@ -41,6 +41,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It treats each `(scenario, action_codec)` pair as an arm.
 - It estimates marginal reward improvement per dollar-second for each arm.
 - It explores untried arms, then prefers arms with better objective estimates.
+- It reserves in-flight rollout decisions so concurrent actors explore distinct untried arms before feedback arrives.
 - It scores candidate train batches so ready samples with higher estimated objective value train first.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
 - It credits train-step reward improvement back to active cadence and policy-lag values from the same arm-local credit map, reported under `scheduler/control/*`.

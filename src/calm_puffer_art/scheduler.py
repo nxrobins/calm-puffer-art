@@ -113,6 +113,8 @@ class AdaptiveScheduler(Protocol):
 
 @dataclass
 class ArmStats:
+    decisions: int = 0
+    inflight: int = 0
     pulls: int = 0
     accepted: int = 0
     unsafe: int = 0
@@ -219,6 +221,7 @@ class ObjectiveScheduler:
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
         self._arms: dict[str, ArmStats] = {}
+        self._total_decisions = 0
         self._total_pulls = 0
         self._global_objective_ema = 0.0
         self._train_reward_ema = 0.0
@@ -267,8 +270,10 @@ class ObjectiveScheduler:
         arms = self._arm_candidates(scenarios, action_codecs)
         arm_id, scenario, codec = max(arms, key=lambda arm: self._score_arm(arm[0]))
         selected_stats = self._arms[arm_id]
+        decision_score = self._score_arm(arm_id)
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
+        self._record_arm_decision(selected_stats)
         decision = SchedulerDecision(
             scenario=scenario,
             action_codec=codec,
@@ -289,9 +294,10 @@ class ObjectiveScheduler:
                 "policy_step": policy_step,
                 "trajectory_queue_pressure": trajectory_queue_pressure,
                 "train_queue_pressure": train_queue_pressure,
-                "score": self._score_arm(arm_id),
+                "score": decision_score,
                 "objective_score": objective_score,
                 "exploration_score": exploration_score,
+                "inflight_rollouts": selected_stats.inflight,
                 "expected_rollout_dollar_seconds": (
                     selected_stats.dollar_seconds_ema
                     if selected_stats.pulls
@@ -386,6 +392,8 @@ class ObjectiveScheduler:
     ) -> None:
         arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
         stats = self._arms.setdefault(arm_id, ArmStats())
+        if stats.inflight > 0:
+            stats.inflight -= 1
         rollout_cost = max(dollar_seconds, 1e-12)
         queue_wait_cost = max(0.0, queue_wait_dollar_seconds)
         cost = max(rollout_cost + queue_wait_cost, 1e-12)
@@ -636,6 +644,7 @@ class ObjectiveScheduler:
                 "min_train_objective": self.min_train_objective,
             },
             "learning_state": {
+                "total_decisions": self._total_decisions,
                 "total_pulls": self._total_pulls,
                 "global_objective_ema": self._global_objective_ema,
                 "train_reward_ema": self._train_reward_ema,
@@ -667,7 +676,7 @@ class ObjectiveScheduler:
                 "stale_experience": self._stale_experience,
             },
             "arms": {
-                arm_id: _dataclass_state(stats)
+                arm_id: _arm_stats_state(stats)
                 for arm_id, stats in self._arms.items()
             },
             "cadence_controls": {
@@ -764,9 +773,18 @@ class ObjectiveScheduler:
 
         learning_state = _mapping_state(state.get("learning_state"))
         total_pulls_default = sum(stats.pulls for stats in self._arms.values())
+        total_decisions_default = sum(
+            stats.decisions for stats in self._arms.values()
+        )
+        if total_decisions_default == 0:
+            total_decisions_default = total_pulls_default
         self._total_pulls = _state_int(
             learning_state.get("total_pulls"),
             total_pulls_default,
+        )
+        self._total_decisions = _state_int(
+            learning_state.get("total_decisions"),
+            total_decisions_default,
         )
         self._global_objective_ema = _state_float(
             learning_state.get("global_objective_ema"),
@@ -861,8 +879,11 @@ class ObjectiveScheduler:
         )
 
     def metrics(self) -> dict[str, float]:
+        inflight_rollouts = sum(stats.inflight for stats in self._arms.values())
         metrics: dict[str, float] = {
-            "scheduler/total_rollout_decisions": float(self._total_pulls),
+            "scheduler/total_rollout_decisions": float(self._total_decisions),
+            "scheduler/total_rollout_observations": float(self._total_pulls),
+            "scheduler/total_inflight_rollouts": float(inflight_rollouts),
             "scheduler/global_marginal_objective_ema": self._global_objective_ema,
             "scheduler/global_action_quality_ema": self._global_action_quality_ema,
             "scheduler/train_reward_ema": self._train_reward_ema,
@@ -917,6 +938,8 @@ class ObjectiveScheduler:
             )
         for arm_id, stats in self._arms.items():
             prefix = f"scheduler/arm/{_safe_metric_key(arm_id)}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/inflight"] = float(stats.inflight)
             metrics[f"{prefix}/pulls"] = float(stats.pulls)
             metrics[f"{prefix}/accepted"] = float(stats.accepted)
             metrics[f"{prefix}/unsafe"] = float(stats.unsafe)
@@ -1031,8 +1054,8 @@ class ObjectiveScheduler:
     def _score_arm(self, arm_id: str) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
         if stats.pulls == 0:
-            # Explore each arm once in deterministic candidate order.
-            return float("inf") - len(self._arms) * 1e-9
+            # Reserve unobserved arms before repeating in-flight work.
+            return 1_000_000_000.0 - stats.inflight
         exploitation = self._arm_value(stats)
         exploration = self._exploration_value(stats)
         return exploitation + exploration
@@ -1040,8 +1063,10 @@ class ObjectiveScheduler:
     def _exploration_value(self, stats: ArmStats) -> float:
         if stats.pulls == 0:
             return 0.0
+        effective_pulls = stats.pulls + stats.inflight
         return self.exploration_bonus * math.sqrt(
-            math.log(self._total_pulls + 1) / stats.pulls
+            math.log(self._total_pulls + self._total_inflight_rollouts() + 1)
+            / effective_pulls
         )
 
     def _has_unaccepted_known_arm(self) -> bool:
@@ -1337,6 +1362,14 @@ class ObjectiveScheduler:
         controls.setdefault(value, ControlStats()).decisions += 1
         return value
 
+    def _record_arm_decision(self, stats: ArmStats) -> None:
+        stats.decisions += 1
+        stats.inflight += 1
+        self._total_decisions += 1
+
+    def _total_inflight_rollouts(self) -> int:
+        return sum(stats.inflight for stats in self._arms.values())
+
     def _ema(self, current: float, value: float, count: int) -> float:
         if count <= 1:
             return value
@@ -1429,6 +1462,12 @@ def _dataclass_state(value: Any) -> dict[str, Any]:
     return {field.name: getattr(value, field.name) for field in fields(value)}
 
 
+def _arm_stats_state(stats: ArmStats) -> dict[str, Any]:
+    state = _dataclass_state(stats)
+    state["inflight"] = 0
+    return state
+
+
 def _arm_credit_weights(groups: Sequence[TrajectoryGroup]) -> dict[str, float]:
     arm_weights: dict[str, float] = {}
     for group in groups:
@@ -1466,6 +1505,9 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
     state = _mapping_state(value)
     default = ArmStats()
     return ArmStats(
+        decisions=_state_int(state.get("decisions"), default.decisions),
+        # In-flight reservations belong to a live process and should not resume.
+        inflight=0,
         pulls=_state_int(state.get("pulls"), default.pulls),
         accepted=_state_int(state.get("accepted"), default.accepted),
         unsafe=_state_int(state.get("unsafe"), default.unsafe),

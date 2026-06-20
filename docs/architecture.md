@@ -41,7 +41,7 @@ The trainer consumes the highest-priority non-stale batch from the ring and retu
 
 ## Closed-Loop Objective Scheduler
 
-`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories. Train credit is arm-baseline-aware: a batch only creates reward-improving experience for an arm when the train score improves over that arm's own previous train score, preventing alternating workflows from inheriting each other's baselines.
+`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories. Concurrent actor selections reserve in-flight arms until their rollout feedback is observed, preventing high-throughput actors from all choosing the same untried arm before the first result returns. Train credit is arm-baseline-aware: a batch only creates reward-improving experience for an arm when the train score improves over that arm's own previous train score, preventing alternating workflows from inheriting each other's baselines.
 
 The scheduler currently controls six things:
 
@@ -84,7 +84,7 @@ Action-space state is checkpointable. `AdaptiveActionSpace.state_dict()` capture
 
 The control loop is online:
 
-1. Actors ask the scheduler for a scenario and action codec.
+1. Actors ask the scheduler for a scenario and action codec, reserving that arm as in-flight until the rollout is observed.
 2. Runtime tags the resulting trajectory with the scheduler arm.
 3. Workflows or verifiers can attach action-quality metadata such as `action/safe`, `action/quality`, `reconstruction/accuracy`, `reconstruction/safe`, `verifier/score`, or `verifier/passed`.
 4. The batcher reports accepted or rejected rollout outcomes, effective reward, action quality, and dollar-seconds.
@@ -115,7 +115,7 @@ Train credit is also quality-aware. A batch can improve the trainer's reported r
 
 ROI patience is opt-in. By default, `ObjectiveScheduler` will run to `max_train_steps`; setting `roi_patience` and `min_train_objective` lets the scheduler stop spending once train-step marginal reward improvement per dollar-second has stayed too low for the configured patience window.
 
-Scheduler state is checkpointable. `state_dict()` captures the numeric control policy memory: arm statistics, cadence and lag control credit, stale-drop penalties, budget counters, ROI state, scoring configuration, and scalar last-decision metadata. `load_state_dict()` restores that memory into a fresh scheduler and tolerates missing sections for older checkpoints. `ControlPlane` writes the snapshot into checkpoint metadata under `scheduler/state` after `observe_train()` has credited the consumed batch, so resumed runs see the controller state that produced the published policy. It does not serialize live `Scenario` or `ActionCodec` objects; those remain user-code/programming-layer concerns, preserving ART's control-plane boundary.
+Scheduler state is checkpointable. `state_dict()` captures the numeric control policy memory: arm statistics, decision counts, cadence and lag control credit, stale-drop penalties, budget counters, ROI state, scoring configuration, and scalar last-decision metadata. Live in-flight reservations are not restored across process resume. `load_state_dict()` restores that memory into a fresh scheduler and tolerates missing sections for older checkpoints. `ControlPlane` writes the snapshot into checkpoint metadata under `scheduler/state` after `observe_train()` has credited the consumed batch, so resumed runs see the controller state that produced the published policy. It does not serialize live `Scenario` or `ActionCodec` objects; those remain user-code/programming-layer concerns, preserving ART's control-plane boundary.
 
 Resume uses the same metadata. `restore_control_state()` accepts checkpoint-style metadata, `PolicySnapshot`, or `Checkpoint` objects and loads compatible scheduler, action-space, and promotion-evaluator objects. `ControlPlane.run()` calls it automatically when `initial_policy` is a `PolicySnapshot`; the registry seeds from that snapshot's step, checkpoint id, policy object, and metadata. That keeps policy-lag accounting and promotion gating on the resumed version instead of resetting the async runtime to step 0.
 

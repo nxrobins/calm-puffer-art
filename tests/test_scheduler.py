@@ -72,6 +72,68 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(next_decision.arm_id, "easy|chunk(chunk_size=2)")
 
+    def test_scheduler_reserves_inflight_untried_arms_for_async_actors(self):
+        scenarios = [Scenario(id="easy"), Scenario(id="hard")]
+        codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+
+        decisions = [
+            scheduler.select_rollout(
+                scenarios=scenarios,
+                action_codecs=codecs,
+                actor_id=actor_id,
+                policy_step=0,
+                trajectory_queue_pressure=0.0,
+                train_queue_pressure=0.0,
+                configured_train_batch_groups=2,
+                configured_max_policy_lag=2,
+            )
+            for actor_id in range(4)
+        ]
+
+        self.assertEqual(
+            [decision.arm_id for decision in decisions],
+            [
+                "easy|token",
+                "easy|chunk(chunk_size=2)",
+                "hard|token",
+                "hard|chunk(chunk_size=2)",
+            ],
+        )
+        metrics = scheduler.metrics()
+        self.assertEqual(metrics["scheduler/total_rollout_decisions"], 4.0)
+        self.assertEqual(metrics["scheduler/total_rollout_observations"], 0.0)
+        self.assertEqual(metrics["scheduler/total_inflight_rollouts"], 4.0)
+        self.assertEqual(metrics["scheduler/arm/easy_token/inflight"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/arm/easy_chunk_chunk_size_2/inflight"],
+            1.0,
+        )
+        self.assertEqual(
+            scheduler.state_dict()["arms"]["easy|token"]["inflight"],
+            0,
+        )
+
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id=decisions[0].scenario.id,
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.1,
+                metadata={"scheduler/arm_id": decisions[0].arm_id},
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/total_rollout_decisions"], 4.0)
+        self.assertEqual(metrics["scheduler/total_rollout_observations"], 1.0)
+        self.assertEqual(metrics["scheduler/total_inflight_rollouts"], 3.0)
+        self.assertEqual(metrics["scheduler/arm/easy_token/inflight"], 0.0)
+        self.assertEqual(metrics["scheduler/arm/easy_token/pulls"], 1.0)
+
     def test_scheduler_defaults_to_marginal_objective_over_raw_reward_efficiency(self):
         scenarios = [Scenario(id="stale-high"), Scenario(id="fresh-improver")]
         codecs = [TokenActionCodec()]

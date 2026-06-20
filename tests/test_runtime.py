@@ -704,7 +704,7 @@ class RuntimeTests(unittest.TestCase):
             {"scheduler": True, "action_space": True, "promotion": True},
         )
         self.assertEqual(
-            restored_scheduler.metrics()["scheduler/total_rollout_decisions"],
+            restored_scheduler.metrics()["scheduler/total_rollout_observations"],
             1.0,
         )
         self.assertEqual(restored_action_space.min_chunk_size, 4)
