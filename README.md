@@ -202,15 +202,22 @@ For scheduler-chosen ART rollout work, ask the backend for a decision and merge 
 ```python
 from calm_puffer_art import Scenario, art_rollout_metadata
 
+admission = await backend.admit_rollout(
+    actor_id=0,
+    configured_actor_count=8,
+    trajectory_queue_pressure=0.8,
+)
+if not admission.admitted:
+    return None
 decision = backend.select_rollout(
     scenarios=[Scenario(id="math")],
     actor_id=0,
 )
-trajectory_metadata = art_rollout_metadata(decision)
+trajectory_metadata = art_rollout_metadata(decision, extra=admission.metadata)
 # Put trajectory_metadata into the ART Trajectory metadata before submit_group().
 ```
 
-When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
+`admit_rollout()` applies the scheduler's active actor-count and pre-rollout admission-delay controls for external ART actor pools. When it sleeps, the delay cost is recorded once in scheduler admission telemetry and stamped into the returned metadata so the submitted trajectory can credit the chosen actor-count and admission-delay values. When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
 
 For no-stop-the-world submission, use `submit_train()`:
 

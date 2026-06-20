@@ -157,10 +157,12 @@ The versioned batch metadata stays in the control plane. A future ART backend ca
 - It preserves the original ART group and trajectory objects in metadata under `art/raw_group` and `art/raw_trajectory`.
 - It assigns untagged converted ART trajectories a scenario-scoped default scheduler arm like `scenario_id|art`, while preserving explicit `scheduler/arm_id` metadata from user workflows.
 - `ArtBackendTrainer` unwraps those preserved groups and delegates to a supplied ART-like backend with `train(model, trajectory_groups, **kwargs)`.
-- `AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `select_rollout()`, `submit_train()`, `submit_group()`, `flush_pending_groups()`, `_get_step()`, `_model_inference_name()`, and `close()` methods around the same fixed-capacity stale-aware train ring.
+- `AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `admit_rollout()`, `select_rollout()`, `submit_train()`, `submit_group()`, `flush_pending_groups()`, `_get_step()`, `_model_inference_name()`, and `close()` methods around the same fixed-capacity stale-aware train ring.
 - `art_rollout_metadata()` turns a `SchedulerDecision` from `select_rollout()` into plain ART trajectory metadata, including the chosen scheduler arm, scenario, action codec, train-batch cadence, policy-lag limit, actor id, and policy step.
 
 This means the async runtime can reason about ART data without taking a hard dependency on ART or reimplementing ART's GRPO/CISPO losses. The full drop-in `art.Backend` remains deferred; this adapter is the tested object-preservation seam it should use.
+
+`AsyncArtBackend.admit_rollout()` is the ART-side counterpart to the local runtime's actor-cap and pre-rollout admission-delay controls. External ART actor pools pass their actor id, configured pool size, and queue pressure. The method returns whether that actor should run now, optionally waits for the scheduler-selected delay, records admission cost once in scheduler telemetry, and returns metadata that stamps `scheduler/active_actor_count`, `scheduler/active_rollout_admission_delay_*`, and admission dollar-seconds onto the eventual ART trajectory.
 
 `AsyncArtBackend.select_rollout()` is the ART-side counterpart to the local runtime actor loop. External ART rollout producers pass live `Scenario` objects and optional codecs; the method uses the attached `ObjectiveScheduler` plus the current `AdaptiveActionSpace` codec set to return a `SchedulerDecision` for the next scenario/action granularity. If no scheduler is attached, it falls back to the first scenario and first codec while preserving the configured cadence and lag values.
 

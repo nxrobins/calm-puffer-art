@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Any, Awaitable, Iterable, Mapping, Sequence
@@ -239,6 +239,18 @@ class _PendingArtGroup:
     future: asyncio.Future[Any]
 
 
+@dataclass(frozen=True)
+class ArtRolloutAdmission:
+    """Admission decision for an external ART rollout producer."""
+
+    actor_id: int
+    active_actor_count: int
+    admitted: bool
+    delay_s: float = 0.0
+    delay_dollar_seconds: float = 0.0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
 class AsyncArtBackend:
     """Backend-shaped ART wrapper backed by the local Puffer-style train ring.
 
@@ -279,6 +291,8 @@ class AsyncArtBackend:
         self._stale_batches = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
+        self._actor_admission_delay_s = 0.0
+        self._actor_admission_dollar_seconds = 0.0
         self._sample_dollar_seconds = 0.0
         self._pending_groups: list[_PendingArtGroup] = []
         self._pending_lock = asyncio.Lock()
@@ -305,6 +319,135 @@ class AsyncArtBackend:
             if parsed is not None:
                 self._current_step = parsed
         return self._current_step
+
+    async def admit_rollout(
+        self,
+        *,
+        actor_id: int = 0,
+        configured_actor_count: int = 1,
+        trajectory_queue_pressure: float = 0.0,
+        apply_delay: bool = True,
+    ) -> ArtRolloutAdmission:
+        """Apply scheduler actor-count and admission-delay control.
+
+        External ART rollout pools can call this before `select_rollout()`.
+        If `admitted` is false, the actor should skip this rollout attempt.
+        If admitted, merge `metadata` into the eventual ART trajectory metadata.
+        """
+
+        configured = max(1, int(configured_actor_count))
+        queue_pressure = max(0.0, float(trajectory_queue_pressure))
+        active_count = self.active_actor_count(
+            configured=configured,
+            trajectory_queue_pressure=queue_pressure,
+        )
+        base_metadata: dict[str, Any] = {
+            "actor_id": actor_id,
+            "scheduler/active_actor_count": active_count,
+            "scheduler/admitted": actor_id < active_count,
+        }
+        if actor_id >= active_count:
+            return ArtRolloutAdmission(
+                actor_id=actor_id,
+                active_actor_count=active_count,
+                admitted=False,
+                metadata=base_metadata,
+            )
+
+        requested_delay_s = self.rollout_admission_delay_s(
+            trajectory_queue_pressure=queue_pressure,
+        )
+        elapsed_s = 0.0
+        if requested_delay_s > 0.0:
+            if apply_delay:
+                started = time.perf_counter()
+                await asyncio.sleep(requested_delay_s)
+                elapsed_s = time.perf_counter() - started
+            else:
+                elapsed_s = requested_delay_s
+        delay_dollar_seconds = elapsed_s * self.config.cost_per_second_usd
+        if delay_dollar_seconds > 0.0:
+            self._actor_admission_delay_s += elapsed_s
+            self._actor_admission_dollar_seconds += delay_dollar_seconds
+            observer = getattr(self.scheduler, "observe_rollout_admission_delay", None)
+            if observer is not None:
+                observer(
+                    seconds=elapsed_s,
+                    dollar_seconds=delay_dollar_seconds,
+                )
+        admission_delay_ms = max(0, int(round(elapsed_s * 1000.0)))
+        metadata = {
+            **base_metadata,
+            "scheduler/active_rollout_admission_delay_ms": admission_delay_ms,
+            "scheduler/active_rollout_admission_delay_s": elapsed_s,
+            "scheduler/admission_observed": delay_dollar_seconds > 0.0,
+        }
+        if delay_dollar_seconds > 0.0:
+            metadata["cost/actor_admission_dollar_seconds"] = (
+                delay_dollar_seconds
+            )
+        return ArtRolloutAdmission(
+            actor_id=actor_id,
+            active_actor_count=active_count,
+            admitted=True,
+            delay_s=elapsed_s,
+            delay_dollar_seconds=delay_dollar_seconds,
+            metadata=metadata,
+        )
+
+    def active_actor_count(
+        self,
+        *,
+        configured: int,
+        trajectory_queue_pressure: float = 0.0,
+    ) -> int:
+        configured = max(1, int(configured))
+        if self.scheduler is None:
+            return configured
+        controller = getattr(self.scheduler, "active_actor_count", None)
+        if controller is None:
+            return configured
+        return min(
+            configured,
+            max(
+                1,
+                int(
+                    controller(
+                        configured=configured,
+                        trajectory_queue_pressure=max(
+                            0.0,
+                            float(trajectory_queue_pressure),
+                        ),
+                        train_queue_pressure=self._train_queue_pressure(),
+                        policy_step=self._current_step,
+                    )
+                ),
+            ),
+        )
+
+    def rollout_admission_delay_s(
+        self,
+        *,
+        trajectory_queue_pressure: float = 0.0,
+    ) -> float:
+        if self.scheduler is None:
+            return 0.0
+        controller = getattr(self.scheduler, "rollout_admission_delay_s", None)
+        if controller is None:
+            return 0.0
+        return max(
+            0.0,
+            float(
+                controller(
+                    trajectory_queue_pressure=max(
+                        0.0,
+                        float(trajectory_queue_pressure),
+                    ),
+                    train_queue_pressure=self._train_queue_pressure(),
+                    policy_step=self._current_step,
+                )
+            ),
+        )
 
     def select_rollout(
         self,
@@ -484,6 +627,12 @@ class AsyncArtBackend:
         stats["art_backend/trainer_wait_dollar_seconds"] = (
             self._trainer_wait_dollar_seconds
         )
+        stats["art_backend/actor_admission_delay_s"] = (
+            self._actor_admission_delay_s
+        )
+        stats["art_backend/actor_admission_dollar_seconds"] = (
+            self._actor_admission_dollar_seconds
+        )
         stats["art_backend/sample_dollar_seconds"] = self._sample_dollar_seconds
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
         if self.action_space is not None:
@@ -608,7 +757,14 @@ class AsyncArtBackend:
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 )
                 admission_cost = _trajectory_admission_dollar_seconds(trajectory)
-                if admission_cost > 0.0 and observe_admission_delay is not None:
+                admission_observed = bool(
+                    trajectory.metadata.get("scheduler/admission_observed")
+                )
+                if (
+                    admission_cost > 0.0
+                    and observe_admission_delay is not None
+                    and not admission_observed
+                ):
                     observe_admission_delay(
                         seconds=_trajectory_admission_seconds(
                             trajectory,

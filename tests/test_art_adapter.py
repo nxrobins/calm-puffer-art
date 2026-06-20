@@ -430,6 +430,120 @@ class ArtAdapterTests(unittest.TestCase):
             3.0,
         )
 
+    def test_async_art_backend_applies_external_actor_admission_control(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_actor_count=1,
+                max_actor_count=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+                max_rollout_admission_delay_s=0.001,
+                rollout_admission_pressure_threshold=0.0,
+                rollout_admission_positive_signal_scale=1.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=1,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1000.0,
+                ),
+            )
+
+            rejected = await async_backend.admit_rollout(
+                actor_id=1,
+                configured_actor_count=2,
+                trajectory_queue_pressure=1.0,
+                apply_delay=False,
+            )
+            admitted = await async_backend.admit_rollout(
+                actor_id=0,
+                configured_actor_count=2,
+                trajectory_queue_pressure=1.0,
+                apply_delay=False,
+            )
+            decision = async_backend.select_rollout(
+                scenarios=[Scenario(id="admission-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=0,
+                trajectory_queue_pressure=1.0,
+            )
+            metadata = art_rollout_metadata(decision, extra=admitted.metadata)
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta",
+                                )
+                            )
+                        ],
+                        reward=1.0,
+                        initial_policy_version=metadata[
+                            "art/initial_policy_version"
+                        ],
+                        metrics={"rollout/dollar_seconds": 2.0},
+                        metadata=metadata,
+                    )
+                ],
+                metadata={"scenario_id": "admission-art"},
+            )
+
+            await async_backend.register("art-model")
+            await async_backend.train("art-model", [art_group])
+            metrics = scheduler.metrics()
+            stats = async_backend.stats()
+            await async_backend.close()
+            return rejected, admitted, metadata, metrics, stats
+
+        rejected, admitted, metadata, metrics, stats = asyncio.run(run())
+
+        self.assertFalse(rejected.admitted)
+        self.assertEqual(rejected.active_actor_count, 1)
+        self.assertTrue(admitted.admitted)
+        self.assertEqual(admitted.active_actor_count, 1)
+        self.assertEqual(admitted.metadata["scheduler/active_actor_count"], 1)
+        self.assertEqual(
+            admitted.metadata["scheduler/active_rollout_admission_delay_ms"],
+            1,
+        )
+        self.assertTrue(admitted.metadata["scheduler/admission_observed"])
+        self.assertAlmostEqual(admitted.delay_dollar_seconds, 1.0)
+        self.assertEqual(metadata["scheduler/active_actor_count"], 1)
+        self.assertEqual(metadata["cost/actor_admission_dollar_seconds"], 1.0)
+        self.assertAlmostEqual(
+            stats["art_backend/actor_admission_dollar_seconds"],
+            admitted.delay_dollar_seconds,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+            admitted.delay_dollar_seconds,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/admission_art_token/admission_dollar_seconds"],
+            admitted.delay_dollar_seconds,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/admission_delay_ms_1/rollout_updates"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/actor_count_1/rollout_updates"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/actor/actor_0/admission_dollar_seconds"],
+            admitted.delay_dollar_seconds,
+        )
+
     def test_async_art_backend_select_rollout_uses_promoted_action_space_codecs(self):
         async def run():
             backend = FakeArtBackend()
