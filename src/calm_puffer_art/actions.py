@@ -229,12 +229,13 @@ class ReasoningStepCodec:
 
 @dataclass
 class AdaptiveActionSpace:
-    """Promotes higher-bandwidth chunk codecs from objective feedback.
+    """Promotes higher-bandwidth action codecs from objective feedback.
 
     This is intentionally conservative: the baseline token codec remains active,
-    and larger chunk codecs are added only after the current chunk size has
-    positive objective signal, strong action quality, and an acceptable unsafe
-    rate in scheduler metrics.
+    larger chunk codecs are added only after the current chunk size has positive
+    objective signal, strong action quality, and an acceptable unsafe rate in
+    scheduler metrics. Opt-in latent-patch candidates use the same evidence
+    gate and can be retired from their own objective feedback.
     """
 
     min_chunk_size: int = 2
@@ -244,9 +245,12 @@ class AdaptiveActionSpace:
     promotion_semantic_bandwidth_threshold: float = 1.0
     unsafe_rate_threshold: float = 0.0
     demotion_objective_threshold: float = 0.0
+    demotion_parent_margin: float = 0.0
     demotion_quality_threshold: float = 0.5
     demotion_semantic_bandwidth_threshold: float = 1.0
     demotion_min_pulls: int = 2
+    promote_latent_patches: bool = False
+    latent_patch_latent_size: int = 8
     include_token: bool = True
     seed_codecs: Sequence[ActionCodec] = field(default_factory=tuple)
     _codecs: list[ActionCodec] = field(default_factory=list, init=False)
@@ -269,12 +273,16 @@ class AdaptiveActionSpace:
             raise ValueError("unsafe_rate_threshold must be non-negative")
         if self.demotion_quality_threshold < 0:
             raise ValueError("demotion_quality_threshold must be non-negative")
+        if self.demotion_parent_margin < 0:
+            raise ValueError("demotion_parent_margin must be non-negative")
         if self.demotion_semantic_bandwidth_threshold < 0:
             raise ValueError(
                 "demotion_semantic_bandwidth_threshold must be non-negative"
             )
         if self.demotion_min_pulls < 0:
             raise ValueError("demotion_min_pulls must be non-negative")
+        if self.latent_patch_latent_size <= 0:
+            raise ValueError("latent_patch_latent_size must be positive")
         if self.include_token:
             self.add_codec(TokenActionCodec())
         self.add_codec(ChunkActionCodec(chunk_size=self.min_chunk_size))
@@ -298,8 +306,6 @@ class AdaptiveActionSpace:
         for codec in tuple(self._codecs):
             if not isinstance(codec, ChunkActionCodec):
                 continue
-            if codec.chunk_size >= self.max_chunk_size:
-                continue
             signal = self._codec_signal(codec, metrics)
             if signal.objective <= self.promotion_objective_threshold:
                 continue
@@ -312,35 +318,43 @@ class AdaptiveActionSpace:
                 continue
             if signal.unsafe_rate > self.unsafe_rate_threshold:
                 continue
-            next_size = min(self.max_chunk_size, codec.chunk_size * 2)
-            candidate = ChunkActionCodec(chunk_size=next_size)
-            candidate_key = action_codec_key(candidate)
-            if (
-                candidate_key in self._disabled_codec_keys
-                or candidate_key in disabled_this_update
-            ):
-                continue
-            if self.add_codec(candidate):
-                self._promotions += 1
+            if codec.chunk_size < self.max_chunk_size:
+                next_size = min(self.max_chunk_size, codec.chunk_size * 2)
+                candidate = ChunkActionCodec(chunk_size=next_size)
+                candidate_key = action_codec_key(candidate)
+                if (
+                    candidate_key in self._disabled_codec_keys
+                    or candidate_key in disabled_this_update
+                ):
+                    pass
+                elif self.add_codec(candidate):
+                    self._promotions += 1
+            if self.promote_latent_patches:
+                latent_candidate = LatentPatchActionCodec(
+                    patch_size=codec.chunk_size,
+                    latent_size=self.latent_patch_latent_size,
+                )
+                latent_key = action_codec_key(latent_candidate)
+                if (
+                    latent_key in self._disabled_codec_keys
+                    or latent_key in disabled_this_update
+                ):
+                    continue
+                if self.add_codec(latent_candidate):
+                    self._promotions += 1
 
     def _demote_from_metrics(self, metrics: Mapping[str, float]) -> set[str]:
         disabled: set[str] = set()
         for codec in tuple(self._codecs):
-            if not isinstance(codec, ChunkActionCodec):
-                continue
-            if codec.chunk_size <= self.min_chunk_size:
+            if self._is_protected_codec(codec):
                 continue
             signal = self._codec_signal(codec, metrics)
             if signal.pulls < self.demotion_min_pulls:
                 continue
-            if not self._should_demote(signal):
+            if not self._should_demote(codec, signal, metrics):
                 continue
             for candidate in tuple(self._codecs):
-                if (
-                    isinstance(candidate, ChunkActionCodec)
-                    and candidate.chunk_size >= codec.chunk_size
-                    and candidate.chunk_size > self.min_chunk_size
-                ):
+                if self._should_disable_with(codec, candidate):
                     key = action_codec_key(candidate)
                     self._codecs.remove(candidate)
                     self._disabled_codec_keys.add(key)
@@ -348,14 +362,97 @@ class AdaptiveActionSpace:
                     self._demotions += 1
         return disabled
 
-    def _should_demote(self, signal: "_CodecSignal") -> bool:
+    def _should_demote(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
         if signal.unsafe_rate > self.unsafe_rate_threshold:
             return True
         if signal.quality < self.demotion_quality_threshold:
             return True
         if signal.semantic_bandwidth < self.demotion_semantic_bandwidth_threshold:
             return True
+        if self._parent_outperforms(codec, signal, metrics):
+            return True
         return signal.objective <= self.demotion_objective_threshold
+
+    def _parent_outperforms(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
+        parent = self._parent_codec(codec)
+        if parent is None:
+            return False
+        parent_signal = self._codec_signal(parent, metrics)
+        if parent_signal.pulls < self.demotion_min_pulls:
+            return False
+        if parent_signal.unsafe_rate > self.unsafe_rate_threshold:
+            return False
+        if parent_signal.quality < self.demotion_quality_threshold:
+            return False
+        return parent_signal.objective > (
+            signal.objective + self.demotion_parent_margin
+        )
+
+    def _is_protected_codec(self, codec: ActionCodec) -> bool:
+        if isinstance(codec, TokenActionCodec):
+            return True
+        return (
+            isinstance(codec, ChunkActionCodec)
+            and codec.chunk_size <= self.min_chunk_size
+        )
+
+    def _should_disable_with(
+        self,
+        demoted_codec: ActionCodec,
+        candidate: ActionCodec,
+    ) -> bool:
+        if self._is_protected_codec(candidate):
+            return False
+        if action_codec_key(candidate) == action_codec_key(demoted_codec):
+            return True
+        return (
+            isinstance(demoted_codec, ChunkActionCodec)
+            and isinstance(candidate, ChunkActionCodec)
+            and candidate.chunk_size >= demoted_codec.chunk_size
+        )
+
+    def _parent_codec(self, codec: ActionCodec) -> ActionCodec | None:
+        if isinstance(codec, ChunkActionCodec):
+            return self._nearest_smaller_chunk(codec)
+        if isinstance(codec, LatentPatchActionCodec):
+            chunks = [
+                candidate
+                for candidate in self._codecs
+                if (
+                    isinstance(candidate, ChunkActionCodec)
+                    and candidate.chunk_size <= codec.patch_size
+                )
+            ]
+            if not chunks:
+                return None
+            return max(chunks, key=lambda candidate: candidate.chunk_size)
+        return None
+
+    def _nearest_smaller_chunk(
+        self,
+        codec: ChunkActionCodec,
+    ) -> ChunkActionCodec | None:
+        smaller = [
+            candidate
+            for candidate in self._codecs
+            if (
+                isinstance(candidate, ChunkActionCodec)
+                and candidate.chunk_size < codec.chunk_size
+            )
+        ]
+        if not smaller:
+            return None
+        return max(smaller, key=lambda candidate: candidate.chunk_size)
 
     def state_dict(self) -> dict[str, Any]:
         """Return JSON-friendly action-space state for checkpoint/resume."""
@@ -374,11 +471,14 @@ class AdaptiveActionSpace:
                 ),
                 "unsafe_rate_threshold": self.unsafe_rate_threshold,
                 "demotion_objective_threshold": self.demotion_objective_threshold,
+                "demotion_parent_margin": self.demotion_parent_margin,
                 "demotion_quality_threshold": self.demotion_quality_threshold,
                 "demotion_semantic_bandwidth_threshold": (
                     self.demotion_semantic_bandwidth_threshold
                 ),
                 "demotion_min_pulls": self.demotion_min_pulls,
+                "promote_latent_patches": self.promote_latent_patches,
+                "latent_patch_latent_size": self.latent_patch_latent_size,
                 "include_token": self.include_token,
             },
             "active_codecs": [_codec_to_state(codec) for codec in self._codecs],
@@ -426,6 +526,10 @@ class AdaptiveActionSpace:
             config.get("demotion_objective_threshold"),
             self.demotion_objective_threshold,
         )
+        self.demotion_parent_margin = _state_float(
+            config.get("demotion_parent_margin"),
+            self.demotion_parent_margin,
+        )
         self.demotion_quality_threshold = _state_float(
             config.get("demotion_quality_threshold"),
             self.demotion_quality_threshold,
@@ -437,6 +541,14 @@ class AdaptiveActionSpace:
         self.demotion_min_pulls = _state_int(
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
+        )
+        self.promote_latent_patches = _state_bool(
+            config.get("promote_latent_patches"),
+            self.promote_latent_patches,
+        )
+        self.latent_patch_latent_size = _state_int(
+            config.get("latent_patch_latent_size"),
+            self.latent_patch_latent_size,
         )
         self.include_token = _state_bool(
             config.get("include_token"),
@@ -452,6 +564,8 @@ class AdaptiveActionSpace:
             0.0,
             self.demotion_semantic_bandwidth_threshold,
         )
+        self.demotion_parent_margin = max(0.0, self.demotion_parent_margin)
+        self.latent_patch_latent_size = max(1, self.latent_patch_latent_size)
 
         active_codec_states = state.get("active_codecs")
         if isinstance(active_codec_states, (list, tuple)) and not isinstance(

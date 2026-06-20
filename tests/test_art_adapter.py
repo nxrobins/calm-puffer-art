@@ -3,8 +3,10 @@ import unittest
 from dataclasses import dataclass, field
 
 from calm_puffer_art import (
+    ACTION_SPACE_STATE_KEY,
     ART_RAW_GROUP_KEY,
     ART_RAW_TRAJECTORY_KEY,
+    AdaptiveActionSpace,
     ArtBackendTrainer,
     AsyncArtBackend,
     AsyncArtBackendConfig,
@@ -285,6 +287,61 @@ class ArtAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(credited_lag_updates, [1.0])
         self.assertTrue(backend.closed)
+
+    def test_async_art_backend_snapshots_action_space_state_after_train_feedback(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=2,
+                promote_latent_patches=True,
+                latent_patch_latent_size=3,
+                promotion_semantic_bandwidth_threshold=0.0,
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                action_space=action_space,
+                weight_channel=channel,
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metadata={
+                            "scenario_id": "art-task",
+                            "scheduler/arm_id": "art-task|chunk(chunk_size=2)",
+                        },
+                    )
+                ],
+                metadata={"scenario_id": "art-task"},
+            )
+
+            await async_backend.register("art-model")
+            await async_backend.train("art-model", [art_group])
+            update = updates.get_nowait()
+            stats = async_backend.stats()
+            await async_backend.close()
+            return update, stats
+
+        update, stats = asyncio.run(run())
+
+        action_space_state = update.metadata[ACTION_SPACE_STATE_KEY]
+        self.assertIn(
+            "latent_patch(latent_size=3,patch_size=2)",
+            [codec["key"] for codec in action_space_state["active_codecs"]],
+        )
+        self.assertEqual(action_space_state["learning_state"]["promotions"], 1)
+        self.assertEqual(stats["action_space/promotions"], 1.0)
+        self.assertEqual(
+            stats["action_space/codec/latent_patch_latent_size_3_patch_size_2/active"],
+            1.0,
+        )
 
     def test_async_art_backend_synchronous_fallback_calls_backend_directly(self):
         async def run():

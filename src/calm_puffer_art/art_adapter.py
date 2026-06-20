@@ -9,6 +9,10 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Awaitable, Iterable, Mapping, Sequence
 
+from .actions import (
+    AdaptiveActionSpace,
+    action_space_checkpoint_metadata,
+)
 from .runtime import (
     TrajectoryRingBuffer,
     VersionedTrajectoryBatch,
@@ -246,6 +250,7 @@ class AsyncArtBackend:
         config: AsyncArtBackendConfig | None = None,
         adapter_config: ArtAdapterConfig | None = None,
         scheduler: AdaptiveScheduler | None = None,
+        action_space: AdaptiveActionSpace | None = None,
         weight_channel: WeightBroadcastChannel | None = None,
     ) -> None:
         self.backend = backend
@@ -253,6 +258,7 @@ class AsyncArtBackend:
         self.config.validate()
         self.adapter_config = adapter_config or ArtAdapterConfig()
         self.scheduler = scheduler
+        self.action_space = action_space
         self.weight_channel = weight_channel or WeightBroadcastChannel()
         self.ring = TrajectoryRingBuffer(
             capacity=self.config.train_queue_capacity,
@@ -419,6 +425,8 @@ class AsyncArtBackend:
             self._trainer_wait_dollar_seconds
         )
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
+        if self.action_space is not None:
+            stats.update(self.action_space.metrics())
         return stats
 
     def _ensure_worker(self) -> None:
@@ -482,8 +490,15 @@ class AsyncArtBackend:
                         ),
                         policy_step=policy_step,
                     )
+                    if self.action_space is not None:
+                        self.action_space.update_from_metrics(
+                            self.scheduler.metrics()
+                        )
                 checkpoint_metadata = dict(local_result.metadata)
                 checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
+                checkpoint_metadata.update(
+                    action_space_checkpoint_metadata(self.action_space)
+                )
                 await self.weight_channel.publish(
                     PolicySnapshot(
                         step=self._current_step,

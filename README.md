@@ -163,7 +163,7 @@ summary = await ControlPlane(config).run(
 )
 ```
 
-`AdaptiveActionSpace` starts with token and small chunk actions, then promotes larger `ChunkActionCodec` sizes only when scheduler metrics show positive objective signal, high action quality, low unsafe rate, and observed semantic bandwidth from the current chunk arm. Promoted chunk sizes can also be disabled after enough bad evidence, so unsafe, low-bandwidth, or non-improving high-bandwidth actions stop competing for rollout slots in the same run.
+`AdaptiveActionSpace` starts with token and small chunk actions, then promotes larger `ChunkActionCodec` sizes only when scheduler metrics show positive objective signal, high action quality, low unsafe rate, and observed semantic bandwidth from the current chunk arm. With `promote_latent_patches=True`, the same evidence can introduce a deterministic `LatentPatchActionCodec` candidate for that chunk size, so the scheduler can test a CALM-like latent action unit inside the same run. Promoted chunk and latent-patch codecs can be disabled after enough bad evidence, or when the nearest smaller active chunk has better reward-improving objective per dollar-second after enough pulls, so unsafe, low-bandwidth, or lower-ROI high-bandwidth actions stop competing for rollout slots.
 
 `AdaptiveActionSpace.state_dict()` and `load_state_dict()` persist active codecs, disabled codec keys, promotion/demotion counters, and action-space configuration. `ControlPlane` writes this snapshot under `action_space/state` in checkpoint metadata after applying scheduler feedback, so resumed runs keep the discovered semantic-bandwidth ladder instead of relearning chunk promotions from scratch. Built-in codecs are reconstructed directly; custom codecs remain user-code objects and are restored only when an equivalent codec is already present.
 
@@ -181,18 +181,19 @@ Converted groups retain the original ART group and trajectory objects in metadat
 Wrap an ART-like backend in the bounded async substrate:
 
 ```python
-from calm_puffer_art import AsyncArtBackend, AsyncArtBackendConfig
+from calm_puffer_art import AdaptiveActionSpace, AsyncArtBackend, AsyncArtBackendConfig, ObjectiveScheduler
 
 backend = AsyncArtBackend(
     backend=art_backend,
     config=AsyncArtBackendConfig(train_queue_capacity=3, max_policy_lag=2),
     scheduler=ObjectiveScheduler(),
+    action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8),
 )
 await backend.register(art_model)
 result = await backend.train(art_model, art_groups)
 ```
 
-`AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `_get_step()`, and `close()` methods, enqueues converted ART groups through the same fixed-capacity stale-aware train ring, observes train results through the scheduler, and publishes checkpoint updates. The scheduler controls train-batch cadence and the active stale-policy lag limit before each ring consume. Trainer wait for a ready ART batch is added to the scheduler's train-objective denominator and exposed in backend stats. Stale ART batches fail waiting callers and report lost useful experience back to the scheduler as negative objective feedback. The wrapper delegates the actual ART loss/checkpoint work to the supplied backend.
+`AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `_get_step()`, and `close()` methods, enqueues converted ART groups through the same fixed-capacity stale-aware train ring, observes train results through the scheduler, updates an optional adaptive action space from scheduler feedback, and publishes checkpoint updates. The scheduler controls train-batch cadence and the active stale-policy lag limit before each ring consume. Trainer wait for a ready ART batch is added to the scheduler's train-objective denominator and exposed in backend stats. Stale ART batches fail waiting callers and report lost useful experience back to the scheduler as negative objective feedback. Published backend checkpoints include `scheduler/state` and, when supplied, `action_space/state`. The wrapper delegates the actual ART loss/checkpoint work to the supplied backend.
 
 For no-stop-the-world submission, use `submit_train()`:
 
@@ -218,7 +219,7 @@ result = await future
 ## Core pieces
 
 - `calm_puffer_art.types`: ART-like primitives for scenarios, action units, trajectories, trajectory groups, checkpoints, and run summaries.
-- `calm_puffer_art.actions`: token, chunk, latent-patch, command, and reasoning-step codecs, plus the adaptive chunk promotion/demotion action space with checkpointable state.
+- `calm_puffer_art.actions`: token, chunk, latent-patch, command, and reasoning-step codecs, plus the adaptive chunk and latent-patch promotion/demotion action space with checkpointable state.
 - `calm_puffer_art.art_adapter`: dependency-free conversion between ART-shaped trajectory groups and local runtime groups, a delegating trainer wrapper, and a structural async ART backend wrapper.
 - `calm_puffer_art.scheduler`: objective-driven rollout/action/train-priority/actor-count/cadence/lag scheduler with action-quality, train-improvement, stale-drop, pressure feedback, exploratory runtime-control scoring, and checkpointable control state.
 - `calm_puffer_art.runtime`: async control plane with actor pools, bounded queues, background group assembly, priority-aware versioned train-batch rings, promotion-gated checkpoint broadcasts, stale-sample filtering, cost attribution, and telemetry.

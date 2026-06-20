@@ -671,6 +671,160 @@ class RuntimeTests(unittest.TestCase):
             action_space_state["learning_state"]["promotions"],
         )
 
+    def test_control_plane_demotes_promoted_chunk_when_parent_has_better_objective(self):
+        async def low_value_promoted_chunk_rollout(
+            policy: CountingPolicy,
+            scenario: Scenario,
+            context: RolloutContext,
+        ) -> Trajectory:
+            chunk_size = int(getattr(context.action_codec, "chunk_size", 1))
+            actions = context.action_codec.encode("alpha beta gamma delta")
+            reward = {1: 0.1, 2: 1.0, 4: 0.6}.get(chunk_size, 0.0)
+            return Trajectory(
+                scenario_id=scenario.id,
+                policy_step=context.policy_step,
+                messages=[Message(role="user", content="adapt chunks")],
+                actions=actions,
+                reward=reward,
+            )
+
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_parent_margin=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=10,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=low_value_promoted_chunk_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            summary.metrics,
+        )
+        self.assertGreaterEqual(summary.metrics["action_space/promotions"], 1.0)
+        self.assertEqual(summary.metrics["action_space/demotions"], 1.0)
+        action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            action_space_state["disabled_codec_keys"],
+        )
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [codec["key"] for codec in action_space_state["active_codecs"]],
+        )
+
+    def test_control_plane_promotes_and_demotes_latent_patch_candidate(self):
+        async def low_value_latent_rollout(
+            policy: CountingPolicy,
+            scenario: Scenario,
+            context: RolloutContext,
+        ) -> Trajectory:
+            name = getattr(context.action_codec, "name", "")
+            reward = 0.2 if name == "latent_patch" else 1.0 if name == "chunk" else 0.1
+            return Trajectory(
+                scenario_id=scenario.id,
+                policy_step=context.policy_step,
+                messages=[Message(role="user", content="adapt latent patches")],
+                actions=context.action_codec.encode("alpha beta gamma delta"),
+                reward=reward,
+            )
+
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=2,
+                promote_latent_patches=True,
+                latent_patch_latent_size=3,
+                demotion_parent_margin=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=10,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=low_value_latent_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        latent_metric_key = "latent_patch_latent_size_3_patch_size_2"
+        self.assertEqual(summary.metrics["action_space/promotions"], 1.0)
+        self.assertEqual(summary.metrics["action_space/demotions"], 1.0)
+        self.assertEqual(
+            summary.metrics[f"action_space/codec/{latent_metric_key}/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            f"action_space/codec/{latent_metric_key}/active",
+            summary.metrics,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            summary.metrics,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "scheduler/arm/adapt_latent_patch_latent_size_3_patch_size_2/pulls"
+            ],
+            0.0,
+        )
+        action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
+        self.assertIn(
+            "latent_patch(latent_size=3,patch_size=2)",
+            action_space_state["disabled_codec_keys"],
+        )
+
     def test_restore_control_state_loads_scheduler_and_action_space_metadata(self):
         source_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         source_scheduler.observe_rollout(

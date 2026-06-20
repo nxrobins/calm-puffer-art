@@ -56,7 +56,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective, quality, and observed semantic-bandwidth signals make higher-bandwidth actions worth trying, retires promoted chunks after enough bad objective, bandwidth, quality, failure-rate, or safety evidence, and snapshots that action-space state under `action_space/state`.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when objective, quality, and observed semantic-bandwidth signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, failure-rate, safety, or lower-than-parent objective evidence, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory, including runtime-control scores and exploration configuration, through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
@@ -98,7 +98,7 @@ Those corrections are now reflected in the local `TrajectoryRingBuffer`, `Versio
 
 The local `art_adapter` module now covers the safe part of that bridge: structural ART `Trajectory`/`TrajectoryGroup` conversion and raw-object preservation. It can hand preserved ART groups back to a supplied ART-like backend, so the scheduler can inspect rewards, versions, metrics, and messages without reimplementing ART's trainer.
 
-`AsyncArtBackend` adds the backend-shaped lifecycle around that seam. It preserves ART's `train(model, trajectory_groups, **kwargs)` result path, but routes submitted groups through the bounded local train ring, scheduler observation, stale-batch rejection, stale-waste feedback, and checkpoint broadcast before delegating the actual ART train call. Its `submit_train()` path returns a future immediately after ring admission, allowing rollout producers to keep working while the background trainer consumes queued ART groups. Its `submit_group()` path accumulates individual ART `TrajectoryGroup` objects and flushes them according to scheduler-selected batch cadence, while the trainer loop asks the scheduler for the active `max_policy_lag` before consuming queued ART batches. Untagged ART trajectories receive scenario-scoped scheduler arms such as `math|art`, so train credit does not collapse unrelated workflows into a single global arm.
+`AsyncArtBackend` adds the backend-shaped lifecycle around that seam. It preserves ART's `train(model, trajectory_groups, **kwargs)` result path, but routes submitted groups through the bounded local train ring, scheduler observation, stale-batch rejection, stale-waste feedback, optional action-space updates, and checkpoint broadcast before delegating the actual ART train call. Its `submit_train()` path returns a future immediately after ring admission, allowing rollout producers to keep working while the background trainer consumes queued ART groups. Its `submit_group()` path accumulates individual ART `TrajectoryGroup` objects and flushes them according to scheduler-selected batch cadence, while the trainer loop asks the scheduler for the active `max_policy_lag` before consuming queued ART batches. Untagged ART trajectories receive scenario-scoped scheduler arms such as `math|art`, so train credit does not collapse unrelated workflows into a single global arm.
 
 ## CALM Layer Boundary
 
@@ -109,7 +109,7 @@ The current default package provides lightweight action codecs:
 - deterministic latent-patch stand-ins
 - command units
 - reasoning-step units
-- an adaptive chunk-promotion action space
+- an adaptive chunk and latent-patch promotion action space
 
 The torch-backed CALM path should be optional and later. Before it is used for real policy optimization, it needs:
 
