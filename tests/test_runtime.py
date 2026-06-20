@@ -17,6 +17,7 @@ from calm_puffer_art import (
     ObjectiveScheduler,
     PolicySnapshot,
     PROMOTION_STATE_KEY,
+    PromotionDecision,
     RolloutContext,
     RolloutPromotionEvaluator,
     SCHEDULER_STATE_KEY,
@@ -99,6 +100,26 @@ class CostedTrainer:
         )
 
 
+class FixedCostTrainer:
+    def __init__(self, *, score: float, dollar_seconds: float) -> None:
+        self.score = score
+        self.dollar_seconds = dollar_seconds
+
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        return TrainResult(
+            policy=current.policy,
+            checkpoint_id=f"step-{current.step + 1}",
+            metrics={
+                "train/reward": self.score,
+                "train/dollar_seconds": self.dollar_seconds,
+            },
+        )
+
+
 class SequencedMetricTrainer:
     def __init__(self, scores: Sequence[float]) -> None:
         self.scores = tuple(scores)
@@ -118,6 +139,28 @@ class SequencedMetricTrainer:
                 "train/reward": score,
                 "eval/reward": score,
             },
+        )
+
+
+class FixedCostPromotionEvaluator:
+    def __init__(self, *, score: float, dollar_seconds: float) -> None:
+        self.score = score
+        self.dollar_seconds = dollar_seconds
+
+    async def __call__(
+        self,
+        *,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        return PromotionDecision(
+            promoted=True,
+            score=self.score,
+            baseline_score=0.0,
+            improvement=self.score,
+            dollar_seconds=self.dollar_seconds,
+            reason="fixed_cost_eval",
         )
 
 
@@ -830,6 +873,58 @@ class RuntimeTests(unittest.TestCase):
                 "learning_state"
             ]["train_dollar_seconds"],
             42.0,
+        )
+
+    def test_scheduler_train_objective_includes_promotion_eval_cost(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="costed-promotion")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=FixedCostTrainer(score=1.0, dollar_seconds=2.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                promotion_evaluator=FixedCostPromotionEvaluator(
+                    score=1.0,
+                    dollar_seconds=8.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 8.0)
+        self.assertEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            10.0,
+        )
+        self.assertAlmostEqual(summary.metrics["scheduler/train_last_objective"], 0.1)
+        self.assertEqual(
+            summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY][
+                "learning_state"
+            ]["train_dollar_seconds"],
+            10.0,
         )
 
     def test_grouper_drops_trajectories_that_exceed_policy_lag(self):

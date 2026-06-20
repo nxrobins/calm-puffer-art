@@ -57,7 +57,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space/promotion control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
-- It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward.
+- It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation dollar-seconds are included in the train-objective denominator for the candidate.
 
 This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as verifier failure modes, reward variance, reconstruction drift, and per-actor causal cost attribution.
 

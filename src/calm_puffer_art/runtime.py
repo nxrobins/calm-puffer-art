@@ -1023,6 +1023,10 @@ class ControlPlane:
                     result=result,
                     groups=batch.groups,
                 )
+                candidate_dollar_seconds = train_dollar_seconds + max(
+                    0.0,
+                    promotion.dollar_seconds,
+                )
                 if scheduler is not None:
                     self._observe_promotion_rollouts(
                         scheduler=scheduler,
@@ -1041,7 +1045,7 @@ class ControlPlane:
                         groups=batch.groups,
                         result=result,
                         duration_s=train_duration_s,
-                        dollar_seconds=train_dollar_seconds,
+                        dollar_seconds=candidate_dollar_seconds,
                         policy_step=current.step,
                     )
                     if action_space is not None:
