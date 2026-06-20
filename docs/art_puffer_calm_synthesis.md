@@ -70,6 +70,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
 - It stamps actor admission-delay cost onto trajectories, so pre-rollout backpressure avoidance is visible in accounted dollar-seconds and in the per-arm/control objective audit.
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation dollar-seconds are included in the train-objective denominator for the candidate.
+- It reports a published-policy north-star companion that counts only positive promoted-checkpoint score improvement times useful promoted-batch experience, so rejected candidates remain spend without becoming useful policy improvement in run-level audits.
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 - It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
 

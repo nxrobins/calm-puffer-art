@@ -794,6 +794,11 @@ class RuntimeTelemetry:
         self.latest_promotion_baseline_score = 0.0
         self.latest_promotion_improvement = 0.0
         self.latest_promotion_promoted = False
+        self.published_policy_updates = 0
+        self.published_policy_improvement = 0.0
+        self.published_policy_reward_improving_experience = 0.0
+        self.latest_published_policy_score = 0.0
+        self._last_published_policy_score: float | None = None
 
     def record_actor_admission_delay(self, seconds: float) -> None:
         self.actor_admission_delay_s += max(0.0, seconds)
@@ -851,10 +856,29 @@ class RuntimeTelemetry:
         if metric_reward is not None and isfinite(metric_reward):
             self.train_rewards.append(float(metric_reward))
 
-    def record_promotion(self, decision: PromotionDecision) -> None:
+    def record_promotion(
+        self,
+        decision: PromotionDecision,
+        *,
+        groups: Sequence[TrajectoryGroup] = (),
+    ) -> None:
         self.promotion_evaluations += 1
         if decision.promoted:
             self.promotions += 1
+            previous_score = (
+                self._last_published_policy_score
+                if self._last_published_policy_score is not None
+                else decision.baseline_score
+            )
+            improvement = max(0.0, decision.score - previous_score)
+            experience = _useful_experience_count(groups)
+            self.published_policy_updates += 1
+            self.published_policy_improvement += improvement
+            self.published_policy_reward_improving_experience += (
+                improvement * experience
+            )
+            self._last_published_policy_score = decision.score
+            self.latest_published_policy_score = decision.score
         else:
             self.promotion_rejections += 1
         self.promotion_eval_dollar_seconds += max(0.0, decision.dollar_seconds)
@@ -901,6 +925,20 @@ class RuntimeTelemetry:
             )
         else:
             accounted_reward_experience = 0.0
+        if dollar_seconds > 0:
+            published_reward_experience = (
+                self.published_policy_reward_improving_experience
+                / max(dollar_seconds, 1e-9)
+            )
+        else:
+            published_reward_experience = 0.0
+        if accounted_dollar_seconds > 0:
+            accounted_published_reward_experience = (
+                self.published_policy_reward_improving_experience
+                / max(accounted_dollar_seconds, 1e-9)
+            )
+        else:
+            accounted_published_reward_experience = 0.0
 
         return {
             "time/wall_clock_s": wall_s,
@@ -961,9 +999,27 @@ class RuntimeTelemetry:
             "promotion/latest_promoted": (
                 1.0 if self.latest_promotion_promoted else 0.0
             ),
+            "promotion/published_policy_updates": float(
+                self.published_policy_updates
+            ),
+            "promotion/published_policy_improvement": (
+                self.published_policy_improvement
+            ),
+            "promotion/published_policy_reward_improving_experience": (
+                self.published_policy_reward_improving_experience
+            ),
+            "promotion/latest_published_policy_score": (
+                self.latest_published_policy_score
+            ),
             "north_star/reward_improving_experience_per_dollar_second": reward_experience,
             "north_star/accounted_reward_improving_experience_per_dollar_second": (
                 accounted_reward_experience
+            ),
+            "north_star/published_policy_reward_improving_experience_per_dollar_second": (
+                published_reward_experience
+            ),
+            "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second": (
+                accounted_published_reward_experience
             ),
         }
 
@@ -1114,7 +1170,7 @@ class ControlPlane:
                     duration_s=train_duration_s,
                     dollar_seconds=train_dollar_seconds,
                 )
-                telemetry.record_promotion(promotion)
+                telemetry.record_promotion(promotion, groups=batch.groups)
                 if scheduler is not None:
                     scheduler.observe_train(
                         groups=batch.groups,
@@ -1728,6 +1784,14 @@ class ControlPlane:
 
 def trajectory_semantic_bandwidth(trajectory: Trajectory) -> float:
     return semantic_bandwidth(trajectory.actions)
+
+
+def _useful_experience_count(groups: Sequence[TrajectoryGroup]) -> float:
+    return sum(
+        action_quality(trajectory)
+        for group in groups
+        for trajectory in group.trajectories
+    )
 
 
 def train_result_dollar_seconds(

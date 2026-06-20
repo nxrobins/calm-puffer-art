@@ -432,6 +432,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(summary.metrics["promotion/evaluations"], 2.0)
         self.assertEqual(summary.metrics["promotion/promoted"], 1.0)
         self.assertEqual(summary.metrics["promotion/rejected"], 1.0)
+        self.assertEqual(summary.metrics["promotion/published_policy_updates"], 1.0)
+        self.assertEqual(
+            summary.metrics["promotion/published_policy_improvement"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/published_policy_reward_improving_experience"
+            ],
+            1.0,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "north_star/published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
         self.assertEqual(summary.metrics["weights/broadcasts"], 1.0)
         self.assertEqual(summary.latest_step, 1)
         self.assertEqual(len(summary.checkpoints), 2)
@@ -525,6 +548,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(second.metrics["promotion/evaluations"], 2.0)
         self.assertEqual(second.metrics["promotion/rejected"], 2.0)
         self.assertEqual(second.metrics["promotion/promoted"], 0.0)
+        self.assertEqual(second.metrics["promotion/published_policy_updates"], 0.0)
+        self.assertEqual(
+            second.metrics["promotion/published_policy_reward_improving_experience"],
+            0.0,
+        )
+        self.assertEqual(
+            second.metrics[
+                "north_star/published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
         self.assertEqual(second.metrics["promotion/latest_baseline_score"], 1.0)
         self.assertEqual(second.metrics["promotion/latest_score"], 1.2)
 

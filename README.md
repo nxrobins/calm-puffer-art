@@ -6,7 +6,7 @@ This repo is a runnable scaffold for an ART-shaped RL execution model:
 - Sample production becomes Puffer-like: many actors run continuously, push trajectories through bounded queues, and train against batches as soon as enough groups are ready.
 - Action bandwidth becomes CALM-like: policies can emit action units above single tokens, including chunks, latent patches, command units, or reasoning-step units.
 
-The north-star metric exposed by the runtime is `reward_improving_experience_per_dollar_second`, computed from reward improvement, accepted trainable trajectories, wall-clock time, and configured runtime cost. The run summary also reports rollout, trainer, trainer-wait, actor-admission, queue-wait, wall-clock, and accounted dollar-second attribution so scheduler decisions can be audited by where the spend went.
+The north-star metric exposed by the runtime is `reward_improving_experience_per_dollar_second`, computed from reward improvement, accepted trainable trajectories, wall-clock time, and configured runtime cost. When checkpoint promotion is enabled, the summary also reports `published_policy_reward_improving_experience_per_dollar_second`, which counts only score improvements that actually produced a published checkpoint; rejected candidates remain in the cost denominator but not the useful policy-improvement numerator. The run summary also reports rollout, trainer, trainer-wait, actor-admission, queue-wait, wall-clock, and accounted dollar-second attribution so scheduler decisions can be audited by where the spend went.
 
 ## Why this shape
 
@@ -125,7 +125,7 @@ promotion_evaluator = RolloutPromotionEvaluator(
 )
 ```
 
-It runs the candidate policy through the same ART-style rollout contract before publication, scores quality-adjusted reward, records evaluation failures, action units, source tokens, duration, and dollar-seconds, and promotes only when the held-out score improves enough. Held-out evaluation trajectories are also tagged with normal scheduler arm metadata and fed back through `observe_rollout()`, so eval successes, failures, action quality, and explicit `eval/dollar_seconds` costs can update future rollout/action choices.
+It runs the candidate policy through the same ART-style rollout contract before publication, scores quality-adjusted reward, records evaluation failures, action units, source tokens, duration, and dollar-seconds, and promotes only when the held-out score improves enough. Held-out evaluation trajectories are also tagged with normal scheduler arm metadata and fed back through `observe_rollout()`, so eval successes, failures, action quality, and explicit `eval/dollar_seconds` costs can update future rollout/action choices. Runtime telemetry separately reports published-policy reward-improving experience, so rejected candidates count as spend without pretending to improve the served policy.
 
 Use `ObjectiveScheduler.state_dict()` and `ObjectiveScheduler.load_state_dict()` to persist the controller's learned arm statistics, runtime-control scores, budget counters, configuration, and scalar last-decision metadata alongside ART checkpoints. `ControlPlane` and `AsyncArtBackend` attach that snapshot under `scheduler/state` after train feedback is observed and before the checkpoint update is published. The snapshot intentionally excludes live `Scenario` and `ActionCodec` objects, so resumed runs should reconstruct those from user code and reload only the scheduler's numeric control memory.
 
