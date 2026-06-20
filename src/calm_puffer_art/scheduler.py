@@ -577,6 +577,16 @@ class ObjectiveScheduler:
             min(1.0, trajectory_queue_pressure),
             min(1.0, train_queue_pressure),
         )
+        if (
+            self._total_pulls > 0
+            and not self._has_positive_objective_signal()
+            and self._low_roi_train_steps > 0
+        ):
+            preferred = self.min_actor_count
+            return self._record_control_decision(
+                self._actor_count_controls,
+                preferred,
+            )
         if pressure >= 0.75 and not self._has_positive_objective_signal():
             preferred = self.min_actor_count
             return self._record_control_decision(

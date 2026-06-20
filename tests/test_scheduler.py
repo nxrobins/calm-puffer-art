@@ -1145,6 +1145,70 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_actor_count_backs_off_after_zero_roi_train_updates(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+            ema_alpha=1.0,
+            min_train_objective=0.0,
+        )
+
+        first_count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="roi",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={"scheduler/arm_id": "roi|token"},
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_train(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="roi",
+                    trajectories=(
+                        Trajectory(
+                            scenario_id="roi",
+                            policy_step=0,
+                            messages=[],
+                            actions=[],
+                            reward=0.0,
+                            metadata={"scheduler/arm_id": "roi|token"},
+                        ),
+                    ),
+                )
+            ],
+            result=TrainResult(metrics={"train/reward": 0.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+
+        second_count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(first_count, 4)
+        self.assertEqual(second_count, 1)
+        self.assertEqual(
+            metrics["scheduler/control/actor_count_1/decisions"],
+            1.0,
+        )
+
     def test_train_objective_tightens_cadence_and_lag_under_pressure(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,
