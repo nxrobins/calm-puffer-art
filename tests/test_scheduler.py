@@ -1613,6 +1613,68 @@ class ObjectiveSchedulerTests(unittest.TestCase):
 
         self.assertGreater(high_score, low_score)
 
+    def test_train_group_scoring_normalizes_queued_batch_by_sample_cost(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        history = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+        cheap = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metrics={"cost/dollar_seconds": 1.0},
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+        expensive = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metrics={"cost/dollar_seconds": 20.0},
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+
+        scheduler.observe_rollout(history, accepted=True, dollar_seconds=1.0)
+        cheap_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="costed", trajectories=(cheap,))],
+            policy_step=0,
+        )
+        cheap_metrics = scheduler.metrics()
+        expensive_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="costed", trajectories=(expensive,))],
+            policy_step=0,
+        )
+        expensive_metrics = scheduler.metrics()
+
+        self.assertGreater(cheap_score, expensive_score)
+        self.assertEqual(
+            cheap_metrics["scheduler/last_train_batch_sample_dollar_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            cheap_metrics["scheduler/last_train_batch_cost_normalized_priority"],
+            cheap_score,
+        )
+        self.assertEqual(
+            expensive_metrics["scheduler/last_train_batch_sample_dollar_seconds"],
+            20.0,
+        )
+        self.assertAlmostEqual(
+            expensive_metrics[
+                "scheduler/last_train_batch_cost_normalized_priority"
+            ],
+            expensive_score,
+        )
+        self.assertAlmostEqual(expensive_score, cheap_score / 20.0)
+
     def test_train_group_scoring_boosts_useful_near_stale_batches(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,
@@ -2442,6 +2504,9 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_train_batch_lag_limit",
             "scheduler/last_train_batch_staleness_urgency",
             "scheduler/last_train_batch_staleness_bonus",
+            "scheduler/last_train_batch_reward_improving_experience",
+            "scheduler/last_train_batch_sample_dollar_seconds",
+            "scheduler/last_train_batch_cost_normalized_priority",
             "scheduler/last_arm/cheap_token",
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",

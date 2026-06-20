@@ -45,7 +45,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can enforce an opt-in `min_rollout_coverage_fraction` after the initial sweep, temporarily selecting the most under-covered arm so diagnostic workflows and action granularities keep receiving bounded live evidence.
 - It gates the static actor pool with a learned active actor cap, so actor count becomes a runtime control without changing the user-facing rollout API.
 - It can delay actor admission before rollout under downstream queue saturation, then explore and reuse millisecond delay values based on rollout, train, and stale objective feedback.
-- It scores candidate train batches so ready samples with higher estimated objective value train first, while applying current trajectory quality so unsafe batches from historically good arms lose priority before training.
+- It scores candidate train batches so ready samples with higher estimated objective value train first, cost-normalizing queued batches by explicit sample/API/tool dollar-seconds when present, while applying current trajectory quality so unsafe batches from historically good arms lose priority before training.
 - It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale useful-experience waste before it happens.
 - It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.

@@ -381,6 +381,9 @@ class ObjectiveScheduler:
         self._last_train_batch_lag_limit = -1
         self._last_train_batch_staleness_urgency = 0.0
         self._last_train_batch_staleness_bonus = 0.0
+        self._last_train_batch_reward_improving_experience = 0.0
+        self._last_train_batch_sample_dollar_seconds = 0.0
+        self._last_train_batch_cost_normalized_priority = 0.0
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -941,8 +944,20 @@ class ObjectiveScheduler:
             ),
         )
         arm_component = mean(arm_values)
-        base_priority = (
+        uncosted_base_priority = (
             arm_component + self.reward_efficiency_weight * raw_reward_component
+        )
+        experience_count = _useful_experience_count(groups)
+        batch_reward_improving_experience = (
+            uncosted_base_priority * max(experience_count, 1.0)
+            if groups
+            else 0.0
+        )
+        sample_dollar_seconds = _groups_sample_dollar_seconds(groups)
+        base_priority = (
+            batch_reward_improving_experience / sample_dollar_seconds
+            if sample_dollar_seconds > 0.0
+            else uncosted_base_priority
         )
         policy_lag, lag_limit, staleness_urgency = _batch_staleness_state(
             groups,
@@ -962,6 +977,11 @@ class ObjectiveScheduler:
         )
         self._last_train_batch_staleness_urgency = staleness_urgency
         self._last_train_batch_staleness_bonus = staleness_bonus
+        self._last_train_batch_reward_improving_experience = (
+            batch_reward_improving_experience
+        )
+        self._last_train_batch_sample_dollar_seconds = sample_dollar_seconds
+        self._last_train_batch_cost_normalized_priority = base_priority
         return priority
 
     def should_continue_training(
@@ -1077,6 +1097,15 @@ class ObjectiveScheduler:
                 ),
                 "last_train_batch_staleness_bonus": (
                     self._last_train_batch_staleness_bonus
+                ),
+                "last_train_batch_reward_improving_experience": (
+                    self._last_train_batch_reward_improving_experience
+                ),
+                "last_train_batch_sample_dollar_seconds": (
+                    self._last_train_batch_sample_dollar_seconds
+                ),
+                "last_train_batch_cost_normalized_priority": (
+                    self._last_train_batch_cost_normalized_priority
                 ),
                 "coverage_forced_decisions": self._coverage_forced_decisions,
                 "last_rollout_coverage_target": (
@@ -1430,6 +1459,18 @@ class ObjectiveScheduler:
             learning_state.get("last_train_batch_staleness_bonus"),
             self._last_train_batch_staleness_bonus,
         )
+        self._last_train_batch_reward_improving_experience = _state_float(
+            learning_state.get("last_train_batch_reward_improving_experience"),
+            self._last_train_batch_reward_improving_experience,
+        )
+        self._last_train_batch_sample_dollar_seconds = _state_float(
+            learning_state.get("last_train_batch_sample_dollar_seconds"),
+            self._last_train_batch_sample_dollar_seconds,
+        )
+        self._last_train_batch_cost_normalized_priority = _state_float(
+            learning_state.get("last_train_batch_cost_normalized_priority"),
+            self._last_train_batch_cost_normalized_priority,
+        )
         self._coverage_forced_decisions = _state_int(
             learning_state.get("coverage_forced_decisions"),
             self._coverage_forced_decisions,
@@ -1578,6 +1619,15 @@ class ObjectiveScheduler:
             ),
             "scheduler/last_train_batch_staleness_bonus": (
                 self._last_train_batch_staleness_bonus
+            ),
+            "scheduler/last_train_batch_reward_improving_experience": (
+                self._last_train_batch_reward_improving_experience
+            ),
+            "scheduler/last_train_batch_sample_dollar_seconds": (
+                self._last_train_batch_sample_dollar_seconds
+            ),
+            "scheduler/last_train_batch_cost_normalized_priority": (
+                self._last_train_batch_cost_normalized_priority
             ),
             "scheduler/low_roi_train_steps": float(self._low_roi_train_steps),
             "scheduler/stop_recommended": 1.0 if self._stop_recommended else 0.0,
