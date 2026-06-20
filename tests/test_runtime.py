@@ -17,6 +17,7 @@ from calm_puffer_art import (
     ObjectiveScheduler,
     PolicySnapshot,
     RolloutContext,
+    RolloutPromotionEvaluator,
     SCHEDULER_STATE_KEY,
     Scenario,
     TokenActionCodec,
@@ -368,6 +369,80 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             summary.checkpoints[-1].metadata["promotion/reason"],
             "metric_improved",
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/train_last_reward_improvement"],
+            1.0,
+        )
+
+    def test_control_plane_rollout_promotion_evaluator_scores_heldout_workflow(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            trainer = SequencedMetricTrainer([0.0, 0.0])
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="train-flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=trainer,
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                weight_channel=channel,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldout", payload={"target": 2})],
+                    workflow=counting_rollout,
+                    action_codec=TokenActionCodec(),
+                    min_delta=0.75,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(summary.metrics["data/train_steps"], 2.0)
+        self.assertEqual(summary.metrics["data/checkpoints_promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(summary.metrics["promotion/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/rejected"], 1.0)
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(len(summary.checkpoints), 2)
+        self.assertEqual([update.step for update in emitted], [1])
+        self.assertEqual(summary.checkpoints[-1].checkpoint_id, "candidate-2")
+        self.assertEqual(
+            summary.checkpoints[-1].metrics["promotion/eval/reward_mean"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.checkpoints[-1].metadata["promotion/reason"],
+            "eval_improved",
+        )
+        self.assertGreater(
+            summary.metrics["costs/promotion_eval_dollar_seconds"],
+            0.0,
         )
         self.assertEqual(
             summary.metrics["scheduler/train_last_reward_improvement"],

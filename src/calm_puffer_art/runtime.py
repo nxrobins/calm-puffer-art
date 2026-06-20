@@ -122,6 +122,124 @@ class MetricPromotionEvaluator:
         )
 
 
+@dataclass
+class RolloutPromotionEvaluator:
+    """Promotes candidates using held-out rollout workflow scores."""
+
+    scenarios: Sequence[Scenario]
+    workflow: RolloutWorkflow
+    action_codec: ActionCodec
+    min_delta: float = 0.0
+    initial_score: float = 0.0
+    cost_per_second_usd: float = 1.0
+    actor_id: int = -1
+    best_score: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not self.scenarios:
+            raise ValueError("at least one evaluation scenario is required")
+        if self.min_delta < 0:
+            raise ValueError("min_delta must be non-negative")
+        if self.cost_per_second_usd < 0:
+            raise ValueError("cost_per_second_usd must be non-negative")
+        self.scenarios = tuple(self.scenarios)
+        self.best_score = self.initial_score
+
+    async def __call__(
+        self,
+        *,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        candidate_policy = (
+            result.policy
+            if result.policy is not None
+            else current.policy
+        )
+        started = time.perf_counter()
+        rewards: list[float] = []
+        dollar_seconds = 0.0
+        action_units = 0
+        source_tokens = 0
+        failures = 0
+
+        for index, scenario in enumerate(self.scenarios):
+            trajectory_started = time.perf_counter()
+            context = RolloutContext(
+                actor_id=self.actor_id,
+                policy_step=current.step + 1,
+                action_codec=self.action_codec,
+                scheduler_arm_id=f"{scenario.id}|promotion_eval",
+                decision_metadata={
+                    "promotion/eval": True,
+                    "promotion/eval_index": index,
+                },
+            )
+            try:
+                trajectory = await self.workflow(
+                    candidate_policy,
+                    scenario,
+                    context,
+                )
+                trajectory.duration_s = time.perf_counter() - trajectory_started
+            except Exception as exc:
+                failures += 1
+                trajectory = Trajectory(
+                    scenario_id=scenario.id,
+                    policy_step=current.step + 1,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                    duration_s=time.perf_counter() - trajectory_started,
+                    exception=f"{type(exc).__name__}: {exc}",
+                    metadata={
+                        "promotion/eval": True,
+                        "promotion/eval_index": index,
+                    },
+                )
+
+            quality = action_quality(trajectory)
+            rewards.append(trajectory.reward * quality)
+            action_units += trajectory.action_units
+            source_tokens += trajectory.token_count
+            dollar_seconds += _trajectory_eval_dollar_seconds(
+                trajectory,
+                cost_per_second_usd=self.cost_per_second_usd,
+            )
+
+        score = mean(rewards)
+        baseline = self.best_score
+        improvement = score - baseline
+        promoted = improvement >= self.min_delta
+        if promoted:
+            self.best_score = score
+        duration_s = time.perf_counter() - started
+        if dollar_seconds <= 0.0:
+            dollar_seconds = duration_s * self.cost_per_second_usd
+        return PromotionDecision(
+            promoted=promoted,
+            score=score,
+            baseline_score=baseline,
+            improvement=improvement,
+            dollar_seconds=dollar_seconds,
+            reason=(
+                "eval_improved"
+                if promoted
+                else "eval_below_promotion_threshold"
+            ),
+            metrics={
+                "promotion/eval/reward_mean": score,
+                "promotion/eval/trajectories": float(len(self.scenarios)),
+                "promotion/eval/failures": float(failures),
+                "promotion/eval/action_units": float(action_units),
+                "promotion/eval/source_tokens": float(source_tokens),
+                "promotion/eval/duration_s": duration_s,
+                "promotion/eval/dollar_seconds": dollar_seconds,
+            },
+        )
+
+
 @dataclass(frozen=True)
 class RolloutContext:
     """Runtime metadata passed to user-defined rollout workflows."""
@@ -1320,6 +1438,29 @@ def train_result_dollar_seconds(
     if explicit_cost is not None:
         return explicit_cost
     return max(0.0, duration_s) * cost_per_second_usd
+
+
+def _trajectory_eval_dollar_seconds(
+    trajectory: Trajectory,
+    *,
+    cost_per_second_usd: float,
+) -> float:
+    explicit_cost = _first_nonnegative_float(
+        trajectory.metrics,
+        ("cost/dollar_seconds", "eval/dollar_seconds", "rollout/dollar_seconds"),
+    )
+    if explicit_cost is None:
+        explicit_cost = _first_nonnegative_float(
+            trajectory.metadata,
+            (
+                "cost/dollar_seconds",
+                "eval/dollar_seconds",
+                "rollout/dollar_seconds",
+            ),
+        )
+    if explicit_cost is not None:
+        return explicit_cost
+    return max(0.0, trajectory.duration_s) * cost_per_second_usd
 
 
 def _with_promotion_metadata(

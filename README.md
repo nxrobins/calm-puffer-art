@@ -110,6 +110,21 @@ summary = await ControlPlane(config).run(
 
 Without a `promotion_evaluator`, every train result is promoted, preserving the simple default. With one, each train result becomes a candidate: rejected candidates still count as train spend, but they do not advance the served policy step, do not append a checkpoint, and do not broadcast weights. `PromotionDecision` metadata records candidate score, baseline score, improvement, cost, and reason. Scheduler train credit uses the promotion-effective score under `promotion/score`, so rejected candidates do not create false positive policy-improvement credit merely because their trainer-local reward looked high.
 
+For held-out workflow evaluation, use `RolloutPromotionEvaluator`:
+
+```python
+promotion_evaluator = RolloutPromotionEvaluator(
+    scenarios=heldout_scenarios,
+    workflow=rollout,
+    action_codec=TokenActionCodec(),
+    min_delta=0.05,
+    initial_score=baseline_eval_reward,
+    cost_per_second_usd=runtime_cost_per_second,
+)
+```
+
+It runs the candidate policy through the same ART-style rollout contract before publication, scores quality-adjusted reward, records evaluation failures, action units, source tokens, duration, and dollar-seconds, and promotes only when the held-out score improves enough.
+
 Use `ObjectiveScheduler.state_dict()` and `ObjectiveScheduler.load_state_dict()` to persist the controller's learned arm statistics, runtime-control credit, budget counters, configuration, and scalar last-decision metadata alongside ART checkpoints. `ControlPlane` and `AsyncArtBackend` attach that snapshot under `scheduler/state` after train feedback is observed and before the checkpoint update is published. The snapshot intentionally excludes live `Scenario` and `ActionCodec` objects, so resumed runs should reconstruct those from user code and reload only the scheduler's numeric control memory.
 
 To resume local control state, pass a `PolicySnapshot` as `initial_policy` and include the saved checkpoint metadata:
