@@ -377,6 +377,45 @@ class ActionCodecTests(unittest.TestCase):
             1.0,
         )
 
+    def test_adaptive_action_space_demotes_dependent_latent_patch_with_chunk(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            promote_latent_patches=True,
+            latent_patch_latent_size=3,
+        )
+        action_space.add_codec(ChunkActionCodec(chunk_size=4))
+        action_space.add_codec(
+            LatentPatchActionCodec(patch_size=4, latent_size=3)
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 1.0,
+                "scheduler/arm/task_latent_patch_latent_size_3_patch_size_4/pulls": 0.0,
+            }
+        )
+
+        codec_keys = [action_codec_key(codec) for codec in action_space.codecs]
+        metrics = action_space.metrics()
+
+        self.assertNotIn("chunk(chunk_size=4)", codec_keys)
+        self.assertNotIn("latent_patch(latent_size=3,patch_size=4)", codec_keys)
+        self.assertEqual(metrics["action_space/demotions"], 2.0)
+        self.assertEqual(
+            metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[
+                "action_space/codec/latent_patch_latent_size_3_patch_size_4/disabled"
+            ],
+            1.0,
+        )
+
     def test_adaptive_action_space_does_not_repromote_demoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
         action_space.add_codec(ChunkActionCodec(chunk_size=4))

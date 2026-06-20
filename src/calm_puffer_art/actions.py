@@ -438,10 +438,13 @@ class AdaptiveActionSpace:
             return False
         if action_codec_key(candidate) == action_codec_key(demoted_codec):
             return True
+        if not isinstance(demoted_codec, ChunkActionCodec):
+            return False
+        if isinstance(candidate, ChunkActionCodec):
+            return candidate.chunk_size >= demoted_codec.chunk_size
         return (
-            isinstance(demoted_codec, ChunkActionCodec)
-            and isinstance(candidate, ChunkActionCodec)
-            and candidate.chunk_size >= demoted_codec.chunk_size
+            isinstance(candidate, LatentPatchActionCodec)
+            and candidate.patch_size >= demoted_codec.chunk_size
         )
 
     def _parent_codec(self, codec: ActionCodec) -> ActionCodec | None:
