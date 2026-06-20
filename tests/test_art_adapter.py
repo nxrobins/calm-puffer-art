@@ -667,6 +667,110 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(scheduler.observed_batches, [2])
         self.assertEqual(stats["art_backend/submitted_batches"], 1.0)
 
+    def test_async_art_backend_cadence_batch_credits_accounted_sample_cost(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=2,
+                max_train_batch_groups=2,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=3,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1000.0,
+                ),
+                scheduler=scheduler,
+            )
+            first = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=0.8,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 5.0},
+                        metadata={"scenario_id": "external-art"},
+                    )
+                ],
+                metadata={"scenario_id": "external-art"},
+            )
+            second = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=0.6,
+                        initial_policy_version=0,
+                        metrics={
+                            "rollout/dollar_seconds": 4.0,
+                            "queue_wait/dollar_seconds": 2.0,
+                            "admission/dollar_seconds": 1.0,
+                        },
+                        metadata={"scenario_id": "external-art"},
+                    )
+                ],
+                metadata={"scenario_id": "external-art"},
+            )
+
+            await async_backend.register("art-model")
+            first_future = await async_backend.submit_group("art-model", first)
+            before = async_backend.stats()
+            second_future = await async_backend.submit_group("art-model", second)
+            first_result = await first_future
+            second_result = await second_future
+            stats = async_backend.stats()
+            metrics = scheduler.metrics()
+            await async_backend.close()
+            return backend, before, stats, metrics, first_result, second_result
+
+        (
+            backend,
+            before,
+            stats,
+            metrics,
+            first_result,
+            second_result,
+        ) = asyncio.run(run())
+
+        expected_sample_cost = 12.0
+        expected_train_cost = (
+            17.0
+            + stats["art_backend/trainer_wait_dollar_seconds"]
+            + expected_sample_cost
+        )
+        self.assertEqual(first_result, second_result)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(len(backend.calls[0][1]), 2)
+        self.assertEqual(before["art_backend/pending_groups"], 1.0)
+        self.assertEqual(before["art_backend/submitted_batches"], 0.0)
+        self.assertEqual(stats["art_backend/submitted_groups"], 2.0)
+        self.assertEqual(stats["art_backend/submitted_batches"], 1.0)
+        self.assertEqual(stats["art_backend/completed_batches"], 1.0)
+        self.assertEqual(
+            stats["art_backend/sample_dollar_seconds"],
+            expected_sample_cost,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/costs/train_dollar_seconds"],
+            expected_train_cost,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/accounted_last_dollar_seconds"],
+            expected_train_cost,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/train_objective_accounted"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/cadence_2/train_updates"],
+            1.0,
+        )
+        self.assertGreater(metrics["scheduler/control/cadence_2/objective_ema"], 0.0)
+
     def test_async_art_backend_scheduler_controls_policy_lag_staleness(self):
         async def run():
             backend = FakeArtBackend()
