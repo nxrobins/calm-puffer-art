@@ -276,10 +276,14 @@ class ArtAdapterTests(unittest.TestCase):
             metrics["scheduler/control/cadence_1/train_updates"],
             1.0,
         )
-        self.assertEqual(
-            metrics["scheduler/control/policy_lag_2/train_updates"],
-            1.0,
-        )
+        credited_lag_updates = [
+            value
+            for key, value in metrics.items()
+            if key.startswith("scheduler/control/policy_lag_")
+            and key.endswith("/train_updates")
+            and value > 0.0
+        ]
+        self.assertEqual(credited_lag_updates, [1.0])
         self.assertTrue(backend.closed)
 
     def test_async_art_backend_synchronous_fallback_calls_backend_directly(self):

@@ -554,6 +554,105 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(positive_signal_delay, 0.05)
         self.assertLess(positive_signal_delay, no_signal_delay)
 
+    def test_rollout_admission_delay_explores_and_reuses_objective_controls(self):
+        scheduler = ObjectiveScheduler(
+            max_rollout_admission_delay_s=0.2,
+            rollout_admission_pressure_threshold=0.5,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.1,
+        )
+
+        first_delay = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        first_delay_ms = int(round(first_delay * 1000.0))
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="admission",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={
+                    "scheduler/arm_id": "admission|token",
+                    "scheduler/active_rollout_admission_delay_ms": first_delay_ms,
+                },
+                metrics={
+                    "cost/actor_admission_dollar_seconds": first_delay,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        second_delay = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        second_delay_ms = int(round(second_delay * 1000.0))
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="admission",
+                policy_step=1,
+                messages=[],
+                actions=[],
+                reward=5.0,
+                metadata={
+                    "scheduler/arm_id": "admission|token",
+                    "scheduler/active_rollout_admission_delay_ms": second_delay_ms,
+                },
+                metrics={
+                    "cost/actor_admission_dollar_seconds": second_delay,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        third_delay = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertAlmostEqual(first_delay, 0.2)
+        self.assertNotEqual(second_delay_ms, first_delay_ms)
+        self.assertAlmostEqual(third_delay, second_delay)
+        self.assertEqual(
+            metrics[
+                f"scheduler/control/admission_delay_ms_{first_delay_ms}/rollout_updates"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[
+                f"scheduler/control/admission_delay_ms_{second_delay_ms}/rollout_updates"
+            ],
+            1.0,
+        )
+        self.assertGreater(
+            metrics[f"scheduler/control/admission_delay_ms_{second_delay_ms}/score"],
+            metrics[f"scheduler/control/admission_delay_ms_{first_delay_ms}/score"],
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/admission_token/admission_dollar_seconds"],
+            first_delay + second_delay,
+        )
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+        self.assertAlmostEqual(
+            restored_metrics[
+                f"scheduler/control/admission_delay_ms_{second_delay_ms}/score"
+            ],
+            metrics[f"scheduler/control/admission_delay_ms_{second_delay_ms}/score"],
+        )
+
     def test_rollout_failure_modes_track_reconstruction_drift(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,
@@ -680,6 +779,238 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(target, 4)
+
+    def test_control_selection_explores_untried_runtime_values(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+        )
+
+        first_target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        second_target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        first_lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        second_lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(first_target, 3)
+        self.assertIn(second_target, {1, 2, 4})
+        self.assertNotEqual(second_target, first_target)
+        self.assertEqual(first_lag, 2)
+        self.assertIn(second_lag, {0, 1, 3})
+        self.assertNotEqual(second_lag, first_lag)
+        self.assertEqual(
+            metrics[f"scheduler/control/cadence_{second_target}/decisions"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/policy_lag_{second_lag}/decisions"],
+            1.0,
+        )
+        self.assertGreater(metrics["scheduler/weights/control_exploration"], 0.0)
+
+    def test_control_selection_reuses_higher_objective_runtime_values(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+        )
+        fast = Trajectory(
+            scenario_id="fast",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "fast|token",
+                "scheduler/active_target_train_batch_groups": 2,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        slow = Trajectory(
+            scenario_id="slow",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "slow|token",
+                "scheduler/active_target_train_batch_groups": 4,
+                "scheduler/active_max_policy_lag": 3,
+            },
+        )
+
+        scheduler.observe_rollout(fast, accepted=True, dollar_seconds=1.0)
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="fast", trajectories=(fast,))],
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout(slow, accepted=True, dollar_seconds=1.0)
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="slow", trajectories=(slow,))],
+            result=TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=1.0,
+            dollar_seconds=10.0,
+            policy_step=1,
+        )
+
+        target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(target, 2)
+        self.assertEqual(lag, 1)
+        self.assertGreater(
+            metrics["scheduler/control/cadence_2/objective_ema"],
+            metrics["scheduler/control/cadence_4/objective_ema"],
+        )
+        self.assertGreater(
+            metrics["scheduler/control/policy_lag_1/objective_ema"],
+            metrics["scheduler/control/policy_lag_3/objective_ema"],
+        )
+        self.assertGreater(
+            metrics["scheduler/control/cadence_2/score"],
+            metrics["scheduler/control/cadence_4/score"],
+        )
+
+    def test_actor_count_control_explores_and_reuses_objective_values(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.1,
+        )
+
+        first_count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="actors",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={
+                    "scheduler/arm_id": "actors|token",
+                    "scheduler/active_actor_count": first_count,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        second_count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="actors",
+                policy_step=1,
+                messages=[],
+                actions=[],
+                reward=5.0,
+                metadata={
+                    "scheduler/arm_id": "actors|token",
+                    "scheduler/active_actor_count": second_count,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        third_count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(first_count, 4)
+        self.assertNotEqual(second_count, first_count)
+        self.assertEqual(third_count, second_count)
+        self.assertEqual(
+            metrics[f"scheduler/control/actor_count_{first_count}/rollout_updates"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/actor_count_{second_count}/rollout_updates"],
+            1.0,
+        )
+        self.assertGreater(
+            metrics[f"scheduler/control/actor_count_{second_count}/score"],
+            metrics[f"scheduler/control/actor_count_{first_count}/score"],
+        )
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+        self.assertAlmostEqual(
+            restored_metrics[f"scheduler/control/actor_count_{second_count}/score"],
+            metrics[f"scheduler/control/actor_count_{second_count}/score"],
+        )
+
+    def test_actor_count_control_backs_off_saturated_low_signal_sampling(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+        )
+
+        count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            metrics["scheduler/control/actor_count_1/decisions"],
+            1.0,
+        )
 
     def test_train_objective_tightens_cadence_and_lag_under_pressure(self):
         scheduler = ObjectiveScheduler(
@@ -1520,11 +1851,15 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             max_train_batch_groups=4,
             min_policy_lag=0,
             max_policy_lag=3,
+            min_actor_count=1,
+            max_actor_count=4,
             ema_alpha=0.5,
             exploration_bonus=0.0,
             reward_efficiency_weight=0.25,
             staleness_priority_weight=0.5,
             confidence_penalty_weight=0.25,
+            control_exploration_bonus=0.15,
+            max_control_candidate_values=5,
             roi_patience=3,
             min_train_objective=0.01,
             continuation_objective="accounted",
@@ -1582,6 +1917,10 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.reward_efficiency_weight, 0.25)
         self.assertEqual(restored.staleness_priority_weight, 0.5)
         self.assertEqual(restored.confidence_penalty_weight, 0.25)
+        self.assertEqual(restored.control_exploration_bonus, 0.15)
+        self.assertEqual(restored.max_control_candidate_values, 5)
+        self.assertEqual(restored.min_actor_count, 1)
+        self.assertEqual(restored.max_actor_count_limit, 4)
         self.assertEqual(restored.continuation_objective, "accounted")
         self.assertEqual(restored.roi_patience, 3)
         for key in (
@@ -1594,7 +1933,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/arm/cheap_token/last_train_reward",
             "scheduler/arm/cheap_token/total_reward_improving_experience",
             "scheduler/control/cadence_1/train_updates",
+            "scheduler/control/cadence_1/score",
+            "scheduler/control/cadence_1/exploration_score",
             "scheduler/control/policy_lag_0/train_updates",
+            "scheduler/control/policy_lag_0/score",
+            "scheduler/control/policy_lag_0/exploration_score",
             "scheduler/costs/rollout_dollar_seconds",
             "scheduler/costs/train_dollar_seconds",
             "scheduler/accounted_objective_ema",
@@ -1612,6 +1955,8 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_arm/cheap_token",
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",
+            "scheduler/weights/control_exploration",
+            "scheduler/max_control_candidate_values",
         ):
             self.assertAlmostEqual(restored_metrics[key], before_metrics[key])
 

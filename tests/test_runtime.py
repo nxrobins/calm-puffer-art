@@ -164,6 +164,16 @@ class FixedCostPromotionEvaluator:
         )
 
 
+class ActorCapScheduler:
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.calls = []
+
+    def active_actor_count(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.cap
+
+
 async def counting_rollout(
     policy: CountingPolicy,
     scenario: Scenario,
@@ -349,8 +359,15 @@ class RuntimeTests(unittest.TestCase):
             if key.startswith("scheduler/control/policy_lag_")
             and key.endswith("/train_updates")
         ]
+        actor_count_credit = [
+            value
+            for key, value in summary.metrics.items()
+            if key.startswith("scheduler/control/actor_count_")
+            and key.endswith("/rollout_updates")
+        ]
         self.assertTrue(any(value > 0.0 for value in cadence_credit))
         self.assertTrue(any(value > 0.0 for value in lag_credit))
+        self.assertTrue(any(value > 0.0 for value in actor_count_credit))
         scheduler_state = summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY]
         self.assertEqual(scheduler_state["version"], 1)
         self.assertIn("easy|chunk(chunk_size=2)", scheduler_state["arms"])
@@ -1148,6 +1165,42 @@ class RuntimeTests(unittest.TestCase):
             ],
             0.0,
         )
+
+    def test_runtime_clamps_scheduler_active_actor_count(self):
+        runtime = ControlPlane(ControlPlaneConfig(num_actors=4))
+        trajectory_queue: asyncio.Queue[Trajectory] = asyncio.Queue(maxsize=2)
+        trajectory_queue.put_nowait(
+            Trajectory(
+                scenario_id="queued",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+            )
+        )
+        train_ring = TrajectoryRingBuffer(capacity=2, max_policy_lag=1)
+
+        low_scheduler = ActorCapScheduler(cap=0)
+        high_scheduler = ActorCapScheduler(cap=99)
+
+        low_count = runtime._active_actor_count(
+            scheduler=low_scheduler,
+            trajectory_queue=trajectory_queue,
+            train_ring=train_ring,
+            policy_step=3,
+        )
+        high_count = runtime._active_actor_count(
+            scheduler=high_scheduler,
+            trajectory_queue=trajectory_queue,
+            train_ring=train_ring,
+            policy_step=4,
+        )
+
+        self.assertEqual(low_count, 1)
+        self.assertEqual(high_count, 4)
+        self.assertEqual(low_scheduler.calls[0]["configured"], 4)
+        self.assertEqual(low_scheduler.calls[0]["policy_step"], 3)
+        self.assertGreater(low_scheduler.calls[0]["trajectory_queue_pressure"], 0.0)
 
     def test_runtime_telemetry_accepts_explicit_train_dollar_seconds(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)

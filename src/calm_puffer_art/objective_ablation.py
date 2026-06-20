@@ -88,6 +88,8 @@ async def run_objective_ablation() -> RunSummary:
         max_train_batch_groups=2,
         min_policy_lag=1,
         max_policy_lag=2,
+        min_actor_count=1,
+        max_actor_count=2,
         exploration_bonus=0.0,
     )
     return await _run(scheduler=scheduler)
@@ -113,7 +115,7 @@ async def run_ablation() -> dict[str, Any]:
 async def _run(scheduler: ObjectiveScheduler | None) -> RunSummary:
     runtime = ControlPlane(
         ControlPlaneConfig(
-            num_actors=1,
+            num_actors=2,
             group_size=1,
             train_batch_groups=2,
             max_train_steps=8,
@@ -159,6 +161,10 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "scheduler/arm/bandwidth_token/total_improvement_per_dollar_second",
         "scheduler/control/cadence_1/train_updates",
         "scheduler/control/policy_lag_2/train_updates",
+        "scheduler/control/actor_count_1/rollout_updates",
+        "scheduler/control/actor_count_2/rollout_updates",
+        "scheduler/control/actor_count_1/score",
+        "scheduler/control/actor_count_2/score",
     ]
     return {
         key: float(summary.metrics[key])

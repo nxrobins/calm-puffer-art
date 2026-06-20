@@ -57,6 +57,18 @@ class ObjectiveAblationTests(unittest.TestCase):
             objective["scheduler/control/policy_lag_2/train_updates"],
             0.0,
         )
+        self.assertGreater(
+            objective["scheduler/control/actor_count_1/rollout_updates"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/control/actor_count_2/rollout_updates"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/control/actor_count_1/score"],
+            objective["scheduler/control/actor_count_2/score"],
+        )
 
 
 if __name__ == "__main__":

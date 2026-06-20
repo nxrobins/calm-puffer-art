@@ -1321,6 +1321,15 @@ class ControlPlane:
     ) -> None:
         while not stop.is_set():
             snapshot = await registry.snapshot()
+            active_actor_count = self._active_actor_count(
+                scheduler=scheduler,
+                trajectory_queue=trajectory_queue,
+                train_ring=train_ring,
+                policy_step=snapshot.step,
+            )
+            if actor_id >= active_actor_count:
+                await asyncio.sleep(0.001)
+                continue
             admission_delay_s = await self._apply_rollout_admission_delay(
                 scheduler=scheduler,
                 trajectory_queue=trajectory_queue,
@@ -1379,6 +1388,26 @@ class ControlPlane:
                 "scheduler/max_policy_lag",
                 decision.max_policy_lag,
             )
+            trajectory.metadata.setdefault(
+                "scheduler/active_actor_count",
+                active_actor_count,
+            )
+            admission_delay_ms = max(0, int(round(admission_delay_s * 1000.0)))
+            trajectory.metadata.setdefault(
+                "scheduler/active_rollout_admission_delay_ms",
+                admission_delay_ms,
+            )
+            trajectory.metadata.setdefault(
+                "scheduler/active_rollout_admission_delay_s",
+                admission_delay_s,
+            )
+            admission_dollar_seconds = (
+                admission_delay_s * self.config.cost_per_second_usd
+            )
+            if admission_dollar_seconds > 0.0:
+                trajectory.metrics["cost/actor_admission_dollar_seconds"] = (
+                    admission_dollar_seconds
+                )
 
             queue_started = time.perf_counter()
             queue_wait_s = await self._put_trajectory_with_queue_cost(
@@ -1387,6 +1416,36 @@ class ControlPlane:
                 started_at=queue_started,
             )
             telemetry.record_actor_queue_wait(queue_wait_s)
+
+    def _active_actor_count(
+        self,
+        *,
+        scheduler: AdaptiveScheduler | None,
+        trajectory_queue: asyncio.Queue[Trajectory],
+        train_ring: TrajectoryRingBuffer,
+        policy_step: int,
+    ) -> int:
+        if scheduler is None:
+            return self.config.num_actors
+        controller = getattr(scheduler, "active_actor_count", None)
+        if controller is None:
+            return self.config.num_actors
+        return min(
+            self.config.num_actors,
+            max(
+                1,
+                int(
+                    controller(
+                        configured=self.config.num_actors,
+                        trajectory_queue_pressure=self._queue_pressure(
+                            trajectory_queue
+                        ),
+                        train_queue_pressure=self._train_queue_pressure(train_ring),
+                        policy_step=policy_step,
+                    )
+                ),
+            ),
+        )
 
     async def _apply_rollout_admission_delay(
         self,

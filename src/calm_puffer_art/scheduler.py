@@ -68,6 +68,16 @@ class AdaptiveScheduler(Protocol):
     ) -> float:
         ...
 
+    def active_actor_count(
+        self,
+        *,
+        configured: int,
+        trajectory_queue_pressure: float,
+        train_queue_pressure: float,
+        policy_step: int,
+    ) -> int:
+        ...
+
     def observe_rollout_admission_delay(
         self,
         *,
@@ -162,6 +172,7 @@ class ArmStats:
     total_dollar_seconds: float = 0.0
     rollout_dollar_seconds: float = 0.0
     queue_wait_dollar_seconds: float = 0.0
+    admission_dollar_seconds: float = 0.0
     action_units: int = 0
     source_tokens: int = 0
     stale_experience: float = 0.0
@@ -170,6 +181,7 @@ class ArmStats:
 @dataclass
 class ControlStats:
     decisions: int = 0
+    rollout_updates: int = 0
     train_updates: int = 0
     stale_updates: int = 0
     objective_ema: float = 0.0
@@ -195,6 +207,8 @@ class ObjectiveScheduler:
         max_train_batch_groups: int | None = None,
         min_policy_lag: int = 1,
         max_policy_lag: int | None = None,
+        min_actor_count: int = 1,
+        max_actor_count: int | None = None,
         ema_alpha: float = 0.25,
         exploration_bonus: float = 0.2,
         objective_threshold: float = 1e-6,
@@ -205,6 +219,8 @@ class ObjectiveScheduler:
         stale_penalty_weight: float = 1.0,
         staleness_priority_weight: float = 1.0,
         confidence_penalty_weight: float = 0.0,
+        control_exploration_bonus: float = 0.1,
+        max_control_candidate_values: int = 8,
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
@@ -218,6 +234,10 @@ class ObjectiveScheduler:
             raise ValueError("min_train_batch_groups must be positive")
         if min_policy_lag < 0:
             raise ValueError("min_policy_lag must be non-negative")
+        if min_actor_count <= 0:
+            raise ValueError("min_actor_count must be positive")
+        if max_actor_count is not None and max_actor_count < min_actor_count:
+            raise ValueError("max_actor_count must be >= min_actor_count")
         if not 0 < ema_alpha <= 1:
             raise ValueError("ema_alpha must be in (0, 1]")
         if exploration_bonus < 0:
@@ -236,6 +256,10 @@ class ObjectiveScheduler:
             raise ValueError("staleness_priority_weight must be non-negative")
         if confidence_penalty_weight < 0:
             raise ValueError("confidence_penalty_weight must be non-negative")
+        if control_exploration_bonus < 0:
+            raise ValueError("control_exploration_bonus must be non-negative")
+        if max_control_candidate_values <= 0:
+            raise ValueError("max_control_candidate_values must be positive")
         if min_train_steps < 0:
             raise ValueError("min_train_steps must be non-negative")
         if roi_patience is not None and roi_patience <= 0:
@@ -258,6 +282,8 @@ class ObjectiveScheduler:
         self.max_train_batch_groups = max_train_batch_groups
         self.min_policy_lag = min_policy_lag
         self.max_policy_lag_limit = max_policy_lag
+        self.min_actor_count = min_actor_count
+        self.max_actor_count_limit = max_actor_count
         self.ema_alpha = ema_alpha
         self.exploration_bonus = exploration_bonus
         self.objective_threshold = objective_threshold
@@ -268,6 +294,8 @@ class ObjectiveScheduler:
         self.stale_penalty_weight = stale_penalty_weight
         self.staleness_priority_weight = staleness_priority_weight
         self.confidence_penalty_weight = confidence_penalty_weight
+        self.control_exploration_bonus = control_exploration_bonus
+        self.max_control_candidate_values = max_control_candidate_values
         self.min_train_steps = min_train_steps
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
@@ -325,6 +353,8 @@ class ObjectiveScheduler:
         self._stale_experience = 0.0
         self._cadence_controls: dict[int, ControlStats] = {}
         self._lag_controls: dict[int, ControlStats] = {}
+        self._admission_controls: dict[int, ControlStats] = {}
+        self._actor_count_controls: dict[int, ControlStats] = {}
 
     def select_rollout(
         self,
@@ -401,25 +431,25 @@ class ObjectiveScheduler:
             configured=configured,
             upper=upper,
         )
-        feedback_target = self._best_control_value(
-            self._cadence_controls,
-            candidates,
-        )
-        if self._has_positive_objective_signal() and feedback_target is not None:
-            return self._record_control_decision(
-                self._cadence_controls,
-                feedback_target,
-            )
         if self._has_positive_objective_signal():
-            return self._record_control_decision(
+            preferred = self.min_train_batch_groups
+        elif train_queue_pressure >= 0.75 or pending_groups >= upper:
+            preferred = upper
+        else:
+            preferred = configured
+        if (
+            preferred == upper
+            and not self._has_positive_objective_signal()
+        ):
+            return self._record_control_decision(self._cadence_controls, upper)
+        return self._record_control_decision(
+            self._cadence_controls,
+            self._select_control_value(
                 self._cadence_controls,
-                self.min_train_batch_groups,
-            )
-        if train_queue_pressure >= 0.75:
-            return self._record_control_decision(self._cadence_controls, upper)
-        if pending_groups >= upper:
-            return self._record_control_decision(self._cadence_controls, upper)
-        return self._record_control_decision(self._cadence_controls, configured)
+                candidates,
+                preferred=preferred,
+            ),
+        )
 
     def max_policy_lag(
         self,
@@ -440,23 +470,59 @@ class ObjectiveScheduler:
         )
         if self._has_unaccepted_known_arm():
             return self._record_control_decision(self._lag_controls, configured)
-        feedback_lag = self._best_control_value(self._lag_controls, candidates)
-        if self._has_positive_objective_signal() and feedback_lag is not None:
-            return self._record_control_decision(
-                self._lag_controls,
-                feedback_lag,
-            )
         if train_queue_pressure >= 0.75:
-            return self._record_control_decision(
+            preferred = self.min_policy_lag
+        elif self._has_positive_objective_signal():
+            preferred = self.min_policy_lag
+        else:
+            preferred = configured
+        return self._record_control_decision(
+            self._lag_controls,
+            self._select_control_value(
                 self._lag_controls,
-                self.min_policy_lag,
-            )
-        if self._has_positive_objective_signal():
+                candidates,
+                preferred=preferred,
+            ),
+        )
+
+    def active_actor_count(
+        self,
+        *,
+        configured: int,
+        trajectory_queue_pressure: float,
+        train_queue_pressure: float,
+        policy_step: int,
+    ) -> int:
+        upper = self.max_actor_count_limit
+        if upper is None:
+            upper = configured
+        upper = max(self.min_actor_count, upper)
+        configured = min(max(configured, self.min_actor_count), upper)
+        candidates = self._control_candidates(
+            min_value=self.min_actor_count,
+            configured=configured,
+            upper=upper,
+        )
+        pressure = max(
+            0.0,
+            min(1.0, trajectory_queue_pressure),
+            min(1.0, train_queue_pressure),
+        )
+        if pressure >= 0.75 and not self._has_positive_objective_signal():
+            preferred = self.min_actor_count
             return self._record_control_decision(
-                self._lag_controls,
-                self.min_policy_lag,
+                self._actor_count_controls,
+                preferred,
             )
-        return self._record_control_decision(self._lag_controls, configured)
+        preferred = configured
+        return self._record_control_decision(
+            self._actor_count_controls,
+            self._select_control_value(
+                self._actor_count_controls,
+                candidates,
+                preferred=preferred,
+            ),
+        )
 
     def observe_rollout(
         self,
@@ -472,7 +538,8 @@ class ObjectiveScheduler:
             stats.inflight -= 1
         rollout_cost = max(dollar_seconds, 1e-12)
         queue_wait_cost = max(0.0, queue_wait_dollar_seconds)
-        cost = max(rollout_cost + queue_wait_cost, 1e-12)
+        admission_cost = _trajectory_admission_dollar_seconds(trajectory)
+        cost = max(rollout_cost + queue_wait_cost + admission_cost, 1e-12)
         self._rollout_dollar_seconds += rollout_cost
         self._queue_wait_dollar_seconds += queue_wait_cost
         quality = action_quality(trajectory)
@@ -503,6 +570,7 @@ class ObjectiveScheduler:
         stats.total_dollar_seconds += cost
         stats.rollout_dollar_seconds += rollout_cost
         stats.queue_wait_dollar_seconds += queue_wait_cost
+        stats.admission_dollar_seconds += admission_cost
         stats.action_units += trajectory.action_units
         stats.source_tokens += trajectory.token_count
         stats.dollar_seconds_ema = self._ema(
@@ -531,6 +599,14 @@ class ObjectiveScheduler:
             stats.reward_efficiency_ema,
             reward_efficiency,
             stats.pulls,
+        )
+        self._credit_rollout_objective_to_admission_control(
+            trajectory,
+            marginal_objective,
+        )
+        self._credit_rollout_objective_to_actor_count_control(
+            trajectory,
+            marginal_objective,
         )
         self._global_objective_ema = self._ema(
             self._global_objective_ema,
@@ -564,6 +640,7 @@ class ObjectiveScheduler:
             or pressure <= self.rollout_admission_pressure_threshold
         ):
             self._last_rollout_admission_delay_s = 0.0
+            self._record_control_decision(self._admission_controls, 0)
             return 0.0
 
         span = max(1e-12, 1.0 - self.rollout_admission_pressure_threshold)
@@ -573,7 +650,23 @@ class ObjectiveScheduler:
         )
         if self._has_positive_objective_signal():
             delay_fraction *= self.rollout_admission_positive_signal_scale
-        delay = self.max_rollout_admission_delay_s * delay_fraction
+        preferred_ms = _seconds_to_milliseconds(
+            self.max_rollout_admission_delay_s * delay_fraction
+        )
+        max_delay_ms = _seconds_to_milliseconds(
+            self.max_rollout_admission_delay_s
+        )
+        selected_ms = self._select_control_value(
+            self._admission_controls,
+            self._control_candidates(
+                min_value=0,
+                configured=preferred_ms,
+                upper=max_delay_ms,
+            ),
+            preferred=preferred_ms,
+        )
+        self._record_control_decision(self._admission_controls, selected_ms)
+        delay = selected_ms / 1000.0
         self._last_rollout_admission_delay_s = delay
         return delay
 
@@ -790,6 +883,8 @@ class ObjectiveScheduler:
                 "max_train_batch_groups": self.max_train_batch_groups,
                 "min_policy_lag": self.min_policy_lag,
                 "max_policy_lag": self.max_policy_lag_limit,
+                "min_actor_count": self.min_actor_count,
+                "max_actor_count": self.max_actor_count_limit,
                 "ema_alpha": self.ema_alpha,
                 "exploration_bonus": self.exploration_bonus,
                 "objective_threshold": self.objective_threshold,
@@ -800,6 +895,10 @@ class ObjectiveScheduler:
                 "stale_penalty_weight": self.stale_penalty_weight,
                 "staleness_priority_weight": self.staleness_priority_weight,
                 "confidence_penalty_weight": self.confidence_penalty_weight,
+                "control_exploration_bonus": self.control_exploration_bonus,
+                "max_control_candidate_values": (
+                    self.max_control_candidate_values
+                ),
                 "min_train_steps": self.min_train_steps,
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
@@ -897,6 +996,14 @@ class ObjectiveScheduler:
                 str(value): _dataclass_state(stats)
                 for value, stats in self._lag_controls.items()
             },
+            "admission_controls": {
+                str(value): _dataclass_state(stats)
+                for value, stats in self._admission_controls.items()
+            },
+            "actor_count_controls": {
+                str(value): _dataclass_state(stats)
+                for value, stats in self._actor_count_controls.items()
+            },
             "last_decision": (
                 dict(self._last_decision_snapshot)
                 if self._last_decision_snapshot is not None
@@ -928,6 +1035,20 @@ class ObjectiveScheduler:
             config.get("max_policy_lag"),
             self.max_policy_lag_limit,
         )
+        self.min_actor_count = max(
+            1,
+            _state_int(config.get("min_actor_count"), self.min_actor_count),
+        )
+        restored_max_actor_count = _state_optional_int(
+            config.get("max_actor_count"),
+            self.max_actor_count_limit,
+        )
+        if (
+            restored_max_actor_count is not None
+            and restored_max_actor_count < self.min_actor_count
+        ):
+            restored_max_actor_count = self.min_actor_count
+        self.max_actor_count_limit = restored_max_actor_count
         self.ema_alpha = _state_float(config.get("ema_alpha"), self.ema_alpha)
         self.exploration_bonus = _state_float(
             config.get("exploration_bonus"),
@@ -969,6 +1090,20 @@ class ObjectiveScheduler:
             _state_float(
                 config.get("confidence_penalty_weight"),
                 self.confidence_penalty_weight,
+            ),
+        )
+        self.control_exploration_bonus = max(
+            0.0,
+            _state_float(
+                config.get("control_exploration_bonus"),
+                self.control_exploration_bonus,
+            ),
+        )
+        self.max_control_candidate_values = max(
+            1,
+            _state_int(
+                config.get("max_control_candidate_values"),
+                self.max_control_candidate_values,
             ),
         )
         self.min_train_steps = _state_int(
@@ -1033,6 +1168,12 @@ class ObjectiveScheduler:
             state.get("cadence_controls")
         )
         self._lag_controls = _control_family_from_state(state.get("lag_controls"))
+        self._admission_controls = _control_family_from_state(
+            state.get("admission_controls")
+        )
+        self._actor_count_controls = _control_family_from_state(
+            state.get("actor_count_controls")
+        )
 
         learning_state = _mapping_state(state.get("learning_state"))
         total_pulls_default = sum(stats.pulls for stats in self._arms.values())
@@ -1286,6 +1427,12 @@ class ObjectiveScheduler:
             "scheduler/weights/confidence_penalty": (
                 self.confidence_penalty_weight
             ),
+            "scheduler/weights/control_exploration": (
+                self.control_exploration_bonus
+            ),
+            "scheduler/max_control_candidate_values": float(
+                self.max_control_candidate_values
+            ),
             "scheduler/weights/unsafe_penalty": self.unsafe_penalty,
             "scheduler/reconstruction_drift_threshold": (
                 self.reconstruction_drift_threshold
@@ -1391,6 +1538,9 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/queue_wait_dollar_seconds"] = (
                 stats.queue_wait_dollar_seconds
             )
+            metrics[f"{prefix}/admission_dollar_seconds"] = (
+                stats.admission_dollar_seconds
+            )
             metrics[f"{prefix}/sample_dollar_seconds_ema"] = (
                 stats.dollar_seconds_ema
             )
@@ -1405,6 +1555,11 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/mean_queue_wait_dollar_seconds"] = (
                 stats.queue_wait_dollar_seconds / stats.pulls
+                if stats.pulls
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_admission_dollar_seconds"] = (
+                stats.admission_dollar_seconds / stats.pulls
                 if stats.pulls
                 else 0.0
             )
@@ -1445,12 +1600,20 @@ class ObjectiveScheduler:
         for value, stats in sorted(self._cadence_controls.items()):
             prefix = f"scheduler/control/cadence_{value}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
             metrics[f"{prefix}/feedback_updates"] = float(
                 _control_feedback_updates(stats)
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._cadence_controls,
+                value,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(self._cadence_controls, stats)
+            )
             metrics[f"{prefix}/total_objective"] = stats.total_objective
             metrics[f"{prefix}/total_stale_penalty_objective"] = (
                 stats.total_stale_penalty_objective
@@ -1459,12 +1622,70 @@ class ObjectiveScheduler:
         for value, stats in sorted(self._lag_controls.items()):
             prefix = f"scheduler/control/policy_lag_{value}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
             metrics[f"{prefix}/feedback_updates"] = float(
                 _control_feedback_updates(stats)
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._lag_controls,
+                value,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(self._lag_controls, stats)
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        for value, stats in sorted(self._admission_controls.items()):
+            prefix = f"scheduler/control/admission_delay_ms_{value}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(
+                _control_feedback_updates(stats)
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._admission_controls,
+                value,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._admission_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        for value, stats in sorted(self._actor_count_controls.items()):
+            prefix = f"scheduler/control/actor_count_{value}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(
+                _control_feedback_updates(stats)
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._actor_count_controls,
+                value,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._actor_count_controls,
+                    stats,
+                )
+            )
             metrics[f"{prefix}/total_objective"] = stats.total_objective
             metrics[f"{prefix}/total_stale_penalty_objective"] = (
                 stats.total_stale_penalty_objective
@@ -1674,6 +1895,26 @@ class ObjectiveScheduler:
                 "scheduler/max_policy_lag",
             ),
         )
+        self._credit_train_objective_to_control_family(
+            self._admission_controls,
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+            keys=(
+                "scheduler/active_rollout_admission_delay_ms",
+                "scheduler/rollout_admission_delay_ms",
+            ),
+        )
+        self._credit_train_objective_to_control_family(
+            self._actor_count_controls,
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+            keys=(
+                "scheduler/active_actor_count",
+                "scheduler/actor_count",
+            ),
+        )
 
     def _credit_train_objective_to_control_family(
         self,
@@ -1744,6 +1985,74 @@ class ObjectiveScheduler:
                 "scheduler/max_policy_lag",
             ),
         )
+        self._credit_objective_to_control_family(
+            self._admission_controls,
+            groups,
+            objective,
+            stale_feedback=stale_feedback,
+            stale_experience=stale_experience,
+            keys=(
+                "scheduler/active_rollout_admission_delay_ms",
+                "scheduler/rollout_admission_delay_ms",
+            ),
+        )
+        self._credit_objective_to_control_family(
+            self._actor_count_controls,
+            groups,
+            objective,
+            stale_feedback=stale_feedback,
+            stale_experience=stale_experience,
+            keys=(
+                "scheduler/active_actor_count",
+                "scheduler/actor_count",
+            ),
+        )
+
+    def _credit_rollout_objective_to_admission_control(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        value = _first_int_metadata(
+            trajectory.metadata,
+            (
+                "scheduler/active_rollout_admission_delay_ms",
+                "scheduler/rollout_admission_delay_ms",
+            ),
+        )
+        if value is None:
+            return
+        stats = self._admission_controls.setdefault(value, ControlStats())
+        stats.rollout_updates += 1
+        stats.total_objective += objective
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _control_feedback_updates(stats),
+        )
+
+    def _credit_rollout_objective_to_actor_count_control(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        value = _first_int_metadata(
+            trajectory.metadata,
+            (
+                "scheduler/active_actor_count",
+                "scheduler/actor_count",
+            ),
+        )
+        if value is None:
+            return
+        stats = self._actor_count_controls.setdefault(value, ControlStats())
+        stats.rollout_updates += 1
+        stats.total_objective += objective
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _control_feedback_updates(stats),
+        )
 
     def _credit_objective_to_control_family(
         self,
@@ -1797,26 +2106,86 @@ class ObjectiveScheduler:
         configured: int,
         upper: int,
     ) -> tuple[int, ...]:
-        return tuple(sorted({min_value, configured, upper}))
+        values = {
+            min_value,
+            min(max(configured, min_value), upper),
+            upper,
+        }
+        span = upper - min_value + 1
+        if span <= self.max_control_candidate_values:
+            values.update(range(min_value, upper + 1))
+        elif self.max_control_candidate_values > 1:
+            for index in range(self.max_control_candidate_values):
+                fraction = index / (self.max_control_candidate_values - 1)
+                values.add(round(min_value + (upper - min_value) * fraction))
+        return tuple(sorted(value for value in values if min_value <= value <= upper))
 
-    def _best_control_value(
+    def _select_control_value(
         self,
         controls: dict[int, ControlStats],
         candidates: Sequence[int],
-    ) -> int | None:
-        observed = [
-            (value, controls[value])
-            for value in candidates
-            if value in controls
-            and _control_feedback_updates(controls[value]) > 0
-            and controls[value].objective_ema > self.objective_threshold
-        ]
-        if not observed:
-            return None
+        *,
+        preferred: int,
+    ) -> int:
+        if not candidates:
+            return preferred
+        candidate_values = tuple(candidates)
+        if preferred not in candidate_values:
+            preferred = candidate_values[0]
+        if all(
+            controls.get(value) is None
+            or (
+                controls[value].decisions == 0
+                and _control_feedback_updates(controls[value]) == 0
+            )
+            for value in candidate_values
+        ):
+            return preferred
         return max(
-            observed,
-            key=lambda item: (item[1].objective_ema, item[1].total_objective),
-        )[0]
+            candidate_values,
+            key=lambda value: (
+                self._score_control_value(controls, value),
+                1 if value == preferred else 0,
+                -abs(value - preferred),
+                -value,
+            ),
+        )
+
+    def _score_control_value(
+        self,
+        controls: Mapping[int, ControlStats],
+        value: int,
+    ) -> float:
+        stats = controls.get(value)
+        if stats is None:
+            return 2.0 * self.control_exploration_bonus
+        feedback_updates = _control_feedback_updates(stats)
+        if feedback_updates <= 0:
+            return self.control_exploration_bonus / math.sqrt(stats.decisions + 1)
+        return stats.objective_ema + self._control_exploration_value(
+            controls,
+            stats,
+        )
+
+    def _control_exploration_value(
+        self,
+        controls: Mapping[int, ControlStats],
+        stats: ControlStats,
+    ) -> float:
+        if self.control_exploration_bonus <= 0.0:
+            return 0.0
+        feedback_updates = _control_feedback_updates(stats)
+        if feedback_updates <= 0:
+            return self.control_exploration_bonus / math.sqrt(stats.decisions + 1)
+        total_updates = sum(
+            _control_feedback_updates(candidate)
+            for candidate in controls.values()
+        )
+        total_decisions = sum(candidate.decisions for candidate in controls.values())
+        evidence = total_updates + total_decisions + 1
+        return self.control_exploration_bonus * math.sqrt(
+            math.log(evidence + 1) / feedback_updates
+        )
 
     def _record_control_decision(
         self,
@@ -1902,7 +2271,13 @@ def _arm_feedback_updates(stats: ArmStats) -> int:
 
 
 def _control_feedback_updates(stats: ControlStats) -> int:
-    return stats.train_updates + stats.stale_updates
+    return stats.rollout_updates + stats.train_updates + stats.stale_updates
+
+
+def _seconds_to_milliseconds(seconds: float) -> int:
+    if not math.isfinite(seconds):
+        return 0
+    return max(0, int(round(max(0.0, seconds) * 1000.0)))
 
 
 def _objective_stddev(stats: ArmStats) -> float:
@@ -2166,6 +2541,10 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("queue_wait_dollar_seconds"),
             default.queue_wait_dollar_seconds,
         ),
+        admission_dollar_seconds=_state_float(
+            state.get("admission_dollar_seconds"),
+            default.admission_dollar_seconds,
+        ),
         action_units=_state_int(
             state.get("action_units"),
             default.action_units,
@@ -2186,6 +2565,10 @@ def _control_stats_from_state(value: Any) -> ControlStats:
     default = ControlStats()
     return ControlStats(
         decisions=_state_int(state.get("decisions"), default.decisions),
+        rollout_updates=_state_int(
+            state.get("rollout_updates"),
+            default.rollout_updates,
+        ),
         train_updates=_state_int(
             state.get("train_updates"),
             default.train_updates,
@@ -2358,7 +2741,21 @@ def _trajectory_sample_dollar_seconds(trajectory: Trajectory) -> float:
             trajectory.metadata,
             ("cost/actor_queue_wait_dollar_seconds", "queue_wait/dollar_seconds"),
         )
-    return (rollout_cost or 0.0) + (queue_cost or 0.0)
+    admission_cost = _trajectory_admission_dollar_seconds(trajectory)
+    return (rollout_cost or 0.0) + (queue_cost or 0.0) + admission_cost
+
+
+def _trajectory_admission_dollar_seconds(trajectory: Trajectory) -> float:
+    explicit_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+    )
+    if explicit_cost is None:
+        explicit_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+        )
+    return explicit_cost or 0.0
 
 
 def _first_nonnegative_mapping_float(
