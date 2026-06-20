@@ -108,7 +108,7 @@ summary = await ControlPlane(config).run(
 )
 ```
 
-Without a `promotion_evaluator`, every train result is promoted, preserving the simple default. With one, each train result becomes a candidate: rejected candidates still count as train spend, but they do not advance the served policy step, do not append a checkpoint, and do not broadcast weights. `PromotionDecision` metadata records candidate score, baseline score, improvement, cost, and reason. Scheduler train credit uses the promotion-effective score under `promotion/score`, so rejected candidates do not create false positive policy-improvement credit merely because their trainer-local reward looked high.
+Without a `promotion_evaluator`, every train result is promoted, preserving the simple default. With one, each train result becomes a candidate: rejected candidates still count as train spend, but they do not advance the served policy step, do not append a checkpoint, and do not broadcast weights. `PromotionDecision` metadata records candidate score, baseline score, improvement, cost, and reason. Scheduler train credit uses the promotion-effective score under `promotion/score`, so rejected candidates do not create false positive policy-improvement credit merely because their trainer-local reward looked high. Built-in promotion evaluators snapshot their learned baseline under `promotion/state`, so resumed runs keep the same publish gate instead of resetting the acceptance threshold.
 
 For held-out workflow evaluation, use `RolloutPromotionEvaluator`:
 
@@ -148,7 +148,7 @@ summary = await ControlPlane(config).run(
 )
 ```
 
-`ControlPlane` calls `restore_control_state()` before actors start, restoring `scheduler/state` and `action_space/state` when compatible objects are provided. The initial checkpoint keeps its original step, so policy-lag checks continue from the resumed version instead of restarting at step 0.
+`ControlPlane` calls `restore_control_state()` before actors start, restoring `scheduler/state`, `action_space/state`, and `promotion/state` when compatible objects are provided. The initial checkpoint keeps its original step, so policy-lag checks continue from the resumed version instead of restarting at step 0. Promotion resume restores the evaluator's numeric control memory, such as best accepted score and threshold configuration; live rollout scenarios, workflows, and custom action codecs remain user-code objects supplied by the new run.
 
 Let the action space promote larger chunks online:
 

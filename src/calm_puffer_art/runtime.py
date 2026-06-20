@@ -41,6 +41,9 @@ from .types import (
 )
 
 
+PROMOTION_STATE_KEY = "promotion/state"
+
+
 class AgentPolicy(Protocol):
     """Policy object used by user-defined workflows."""
 
@@ -91,6 +94,36 @@ class MetricPromotionEvaluator:
         if self.min_delta < 0:
             raise ValueError("min_delta must be non-negative")
         self.best_score = self.initial_score
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "kind": "metric",
+            "config": {
+                "metric_key": self.metric_key,
+                "min_delta": self.min_delta,
+                "initial_score": self.initial_score,
+            },
+            "learning_state": {
+                "best_score": self.best_score,
+            },
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        config = _mapping_state(state.get("config"))
+        learning_state = _mapping_state(state.get("learning_state"))
+        metric_key = config.get("metric_key")
+        if isinstance(metric_key, str) and metric_key:
+            self.metric_key = metric_key
+        self.min_delta = _state_float(config.get("min_delta"), self.min_delta)
+        self.initial_score = _state_float(
+            config.get("initial_score"),
+            self.initial_score,
+        )
+        self.best_score = _state_float(
+            learning_state.get("best_score"),
+            self.best_score,
+        )
 
     async def __call__(
         self,
@@ -145,6 +178,41 @@ class RolloutPromotionEvaluator:
             raise ValueError("cost_per_second_usd must be non-negative")
         self.scenarios = tuple(self.scenarios)
         self.best_score = self.initial_score
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "kind": "rollout",
+            "config": {
+                "scenario_ids": [scenario.id for scenario in self.scenarios],
+                "action_codec": action_codec_key(self.action_codec),
+                "min_delta": self.min_delta,
+                "initial_score": self.initial_score,
+                "cost_per_second_usd": self.cost_per_second_usd,
+                "actor_id": self.actor_id,
+            },
+            "learning_state": {
+                "best_score": self.best_score,
+            },
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        config = _mapping_state(state.get("config"))
+        learning_state = _mapping_state(state.get("learning_state"))
+        self.min_delta = _state_float(config.get("min_delta"), self.min_delta)
+        self.initial_score = _state_float(
+            config.get("initial_score"),
+            self.initial_score,
+        )
+        self.cost_per_second_usd = _state_float(
+            config.get("cost_per_second_usd"),
+            self.cost_per_second_usd,
+        )
+        self.actor_id = _state_int(config.get("actor_id"), self.actor_id)
+        self.best_score = _state_float(
+            learning_state.get("best_score"),
+            self.best_score,
+        )
 
     async def __call__(
         self,
@@ -866,6 +934,7 @@ class ControlPlane:
             initial_policy,
             scheduler=scheduler,
             action_space=action_space,
+            promotion_evaluator=promotion_evaluator,
         )
         if action_space is not None and action_codec is None and action_codecs is None:
             codecs = action_space.codecs
@@ -983,6 +1052,7 @@ class ControlPlane:
                             result,
                             scheduler=scheduler,
                             action_space=action_space,
+                            promotion_evaluator=promotion_evaluator,
                         )
                     )
                     train_ring.current_policy_step = latest.step
@@ -1579,15 +1649,33 @@ def _first_nonnegative_float(
     return None
 
 
+def promotion_checkpoint_metadata(
+    promotion_evaluator: Any | None,
+) -> dict[str, Any]:
+    """Return checkpoint metadata for promotion evaluators with state support."""
+
+    if promotion_evaluator is None:
+        return {}
+    state_dict = getattr(promotion_evaluator, "state_dict", None)
+    if state_dict is None:
+        return {}
+    state = state_dict()
+    if not isinstance(state, Mapping):
+        return {}
+    return {PROMOTION_STATE_KEY: state}
+
+
 def _with_control_checkpoint_metadata(
     result: TrainResult,
     *,
     scheduler: AdaptiveScheduler | None,
     action_space: AdaptiveActionSpace | None,
+    promotion_evaluator: PromotionEvaluator | None,
 ) -> TrainResult:
     control_metadata = {
         **scheduler_checkpoint_metadata(scheduler),
         **action_space_checkpoint_metadata(action_space),
+        **promotion_checkpoint_metadata(promotion_evaluator),
     }
     if not control_metadata:
         return result
@@ -1601,16 +1689,55 @@ def _with_control_checkpoint_metadata(
     )
 
 
+def _mapping_state(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _state_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)) and isfinite(float(value)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return default
+        if isfinite(parsed):
+            return parsed
+    return default
+
+
+def _state_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
 def restore_control_state(
     source: Mapping[str, Any] | PolicySnapshot | Checkpoint | None,
     *,
     scheduler: AdaptiveScheduler | None = None,
     action_space: AdaptiveActionSpace | None = None,
+    promotion_evaluator: PromotionEvaluator | None = None,
 ) -> dict[str, bool]:
-    """Restore scheduler/action-space state from checkpoint-style metadata."""
+    """Restore checkpointed control state from checkpoint-style metadata."""
 
     metadata = _checkpoint_metadata(source)
-    restored = {"scheduler": False, "action_space": False}
+    restored = {
+        "scheduler": False,
+        "action_space": False,
+        "promotion": False,
+    }
     scheduler_state = metadata.get(SCHEDULER_STATE_KEY)
     scheduler_loader = getattr(scheduler, "load_state_dict", None)
     if isinstance(scheduler_state, Mapping) and scheduler_loader is not None:
@@ -1622,6 +1749,12 @@ def restore_control_state(
     if isinstance(action_space_state, Mapping) and action_space_loader is not None:
         action_space_loader(action_space_state)
         restored["action_space"] = True
+
+    promotion_state = metadata.get(PROMOTION_STATE_KEY)
+    promotion_loader = getattr(promotion_evaluator, "load_state_dict", None)
+    if isinstance(promotion_state, Mapping) and promotion_loader is not None:
+        promotion_loader(promotion_state)
+        restored["promotion"] = True
     return restored
 
 

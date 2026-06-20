@@ -16,6 +16,7 @@ from calm_puffer_art import (
     Message,
     ObjectiveScheduler,
     PolicySnapshot,
+    PROMOTION_STATE_KEY,
     RolloutContext,
     RolloutPromotionEvaluator,
     SCHEDULER_STATE_KEY,
@@ -28,6 +29,7 @@ from calm_puffer_art import (
     VersionedTrajectoryBatch,
     WeightBroadcastChannel,
     action_space_checkpoint_metadata,
+    promotion_checkpoint_metadata,
     restore_control_state,
     scheduler_checkpoint_metadata,
     train_result_dollar_seconds,
@@ -385,6 +387,87 @@ class RuntimeTests(unittest.TestCase):
             1.0,
         )
 
+    def test_control_plane_resumes_promotion_evaluator_state(self):
+        async def first_run():
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=SequencedMetricTrainer([1.0]),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+
+        async def second_run(snapshot):
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=snapshot,
+                trainer=SequencedMetricTrainer([1.2]),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                weight_channel=channel,
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        first = asyncio.run(first_run())
+        promotion_state = first.checkpoints[-1].metadata[PROMOTION_STATE_KEY]
+        snapshot = PolicySnapshot(
+            step=first.latest_step,
+            policy=CountingPolicy(level=1),
+            checkpoint_id=first.checkpoints[-1].checkpoint_id,
+            created_at=first.checkpoints[-1].created_at,
+            metadata=first.checkpoints[-1].metadata,
+        )
+        second, emitted = asyncio.run(second_run(snapshot))
+
+        self.assertEqual(promotion_state["learning_state"]["best_score"], 1.0)
+        self.assertEqual(second.latest_step, 1)
+        self.assertEqual(len(second.checkpoints), 1)
+        self.assertEqual(emitted, [])
+        self.assertEqual(second.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(second.metrics["promotion/rejected"], 2.0)
+        self.assertEqual(second.metrics["promotion/promoted"], 0.0)
+        self.assertEqual(second.metrics["promotion/latest_baseline_score"], 1.0)
+        self.assertEqual(second.metrics["promotion/latest_score"], 1.2)
+
     def test_control_plane_rollout_promotion_evaluator_scores_heldout_workflow(self):
         async def run():
             scheduler = ObjectiveScheduler(
@@ -547,20 +630,36 @@ class RuntimeTests(unittest.TestCase):
             max_chunk_size=4,
             include_token=False,
         )
+        source_promotion = MetricPromotionEvaluator(
+            metric_key="eval/reward",
+            min_delta=0.5,
+            initial_score=0.0,
+        )
+        source_promotion.best_score = 2.0
         metadata = {
             **scheduler_checkpoint_metadata(source_scheduler),
             **action_space_checkpoint_metadata(source_action_space),
+            **promotion_checkpoint_metadata(source_promotion),
         }
         restored_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         restored_action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+        restored_promotion = MetricPromotionEvaluator(
+            metric_key="train/reward",
+            min_delta=0.0,
+            initial_score=0.0,
+        )
 
         restored = restore_control_state(
             {"metadata": metadata},
             scheduler=restored_scheduler,
             action_space=restored_action_space,
+            promotion_evaluator=restored_promotion,
         )
 
-        self.assertEqual(restored, {"scheduler": True, "action_space": True})
+        self.assertEqual(
+            restored,
+            {"scheduler": True, "action_space": True, "promotion": True},
+        )
         self.assertEqual(
             restored_scheduler.metrics()["scheduler/total_rollout_decisions"],
             1.0,
@@ -570,6 +669,9 @@ class RuntimeTests(unittest.TestCase):
             [action_codec_key(codec) for codec in restored_action_space.codecs],
             ["chunk(chunk_size=4)"],
         )
+        self.assertEqual(restored_promotion.metric_key, "eval/reward")
+        self.assertEqual(restored_promotion.min_delta, 0.5)
+        self.assertEqual(restored_promotion.best_score, 2.0)
 
     def test_control_plane_resumes_from_policy_snapshot_control_state(self):
         async def run():

@@ -27,6 +27,7 @@ user rollout workflow
   -> TrainerBackend.train(snapshot, groups)
   -> ObjectiveScheduler train update
   -> AdaptiveActionSpace promotion update
+  -> optional PromotionEvaluator publish gate
   -> PolicySnapshot checkpoint
   -> WeightBroadcastChannel update
 ```
@@ -51,8 +52,9 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can stop training early when `roi_patience` is configured and train-step objective stays below threshold.
 - It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective and quality signals make higher semantic bandwidth worth trying, retires promoted chunks after enough bad objective, quality, or safety evidence, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
-- It snapshots and restores numeric control memory through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
-- It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space control state before actor rollout begins and preserving the resumed policy step for staleness checks.
+- It snapshots and restores scheduler numeric control memory through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
+- It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
+- It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space/promotion control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward.
