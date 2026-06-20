@@ -456,7 +456,15 @@ class TrajectoryRingBuffer:
             self.total_produced += 1
             self._condition.notify_all()
 
-    async def get(self, *, current_policy_step: int) -> VersionedTrajectoryBatch:
+    async def get(
+        self,
+        *,
+        current_policy_step: int,
+        priority_scorer: Callable[
+            [VersionedTrajectoryBatch, int],
+            float,
+        ] | None = None,
+    ) -> VersionedTrajectoryBatch:
         async with self._condition:
             self.current_policy_step = current_policy_step
             while True:
@@ -469,10 +477,13 @@ class TrajectoryRingBuffer:
                     if not self._batches:
                         continue
 
-                batch = self._pop_highest_priority_locked()
+                batch, priority = self._pop_highest_priority_locked(
+                    current_policy_step,
+                    priority_scorer=priority_scorer,
+                )
 
                 self.total_consumed += 1
-                self.consumed_priority_total += batch.priority_score
+                self.consumed_priority_total += priority
                 self._condition.notify_all()
                 return batch
 
@@ -519,23 +530,58 @@ class TrajectoryRingBuffer:
         self.total_discarded += stale_count
         return stale_count
 
-    def _pop_highest_priority_locked(self) -> VersionedTrajectoryBatch:
+    def _pop_highest_priority_locked(
+        self,
+        current_policy_step: int,
+        *,
+        priority_scorer: Callable[
+            [VersionedTrajectoryBatch, int],
+            float,
+        ] | None,
+    ) -> tuple[VersionedTrajectoryBatch, float]:
         best_index = 0
         best_batch = self._batches[0]
-        for index, batch in enumerate(self._batches):
+        best_priority = self._batch_priority(
+            best_batch,
+            current_policy_step,
+            priority_scorer=priority_scorer,
+        )
+        for index in range(1, len(self._batches)):
+            batch = self._batches[index]
+            priority = self._batch_priority(
+                batch,
+                current_policy_step,
+                priority_scorer=priority_scorer,
+            )
             if (
-                batch.priority_score > best_batch.priority_score
+                priority > best_priority
                 or (
-                    batch.priority_score == best_batch.priority_score
+                    priority == best_priority
                     and batch.created_at < best_batch.created_at
                 )
             ):
                 best_index = index
                 best_batch = batch
+                best_priority = priority
         if best_index != 0:
             self.priority_consumptions += 1
         del self._batches[best_index]
-        return best_batch
+        return best_batch, best_priority
+
+    @staticmethod
+    def _batch_priority(
+        batch: VersionedTrajectoryBatch,
+        current_policy_step: int,
+        *,
+        priority_scorer: Callable[
+            [VersionedTrajectoryBatch, int],
+            float,
+        ] | None,
+    ) -> float:
+        if priority_scorer is None:
+            return batch.priority_score
+        priority = float(priority_scorer(batch, current_policy_step))
+        return priority if isfinite(priority) else batch.priority_score
 
 
 @dataclass(frozen=True)
@@ -1025,7 +1071,10 @@ class ControlPlane:
                     policy_step=current.step,
                 )
                 train_wait_started = time.perf_counter()
-                batch = await train_ring.get(current_policy_step=current.step)
+                batch = await train_ring.get(
+                    current_policy_step=current.step,
+                    priority_scorer=self._batch_priority_scorer(scheduler),
+                )
                 train_wait_s = time.perf_counter() - train_wait_started
                 train_wait_dollar_seconds = (
                     train_wait_s * self.config.cost_per_second_usd
@@ -1226,11 +1275,17 @@ class ControlPlane:
                     ready_groups.popleft()
                     for _ in range(target_batch_groups)
                 )
+                latest = await registry.snapshot()
+                active_max_policy_lag = self._max_policy_lag(
+                    scheduler=scheduler,
+                    train_ring=train_ring,
+                    policy_step=latest.step,
+                )
                 self._tag_batch_control_metadata(
                     groups,
                     target_train_batch_groups=target_batch_groups,
+                    max_policy_lag=active_max_policy_lag,
                 )
-                latest = await registry.snapshot()
                 await train_ring.put(
                     VersionedTrajectoryBatch(
                         groups=groups,
@@ -1470,6 +1525,24 @@ class ControlPlane:
         if scheduler is None:
             return 0.0
         return scheduler.score_train_groups(groups, policy_step=policy_step)
+
+    @staticmethod
+    def _batch_priority_scorer(
+        scheduler: AdaptiveScheduler | None,
+    ) -> Callable[[VersionedTrajectoryBatch, int], float] | None:
+        if scheduler is None:
+            return None
+
+        def score_batch(
+            batch: VersionedTrajectoryBatch,
+            policy_step: int,
+        ) -> float:
+            return scheduler.score_train_groups(
+                batch.groups,
+                policy_step=policy_step,
+            )
+
+        return score_batch
 
     @staticmethod
     def _stale_batch_callback(

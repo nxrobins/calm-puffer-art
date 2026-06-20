@@ -1236,6 +1236,53 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(ring.priority_consumptions, 1)
         self.assertEqual(ring.pending_batches, 1)
 
+    def test_ring_buffer_rescores_priority_at_consume_time(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                exploration_bonus=0.0,
+                staleness_priority_weight=1.0,
+            )
+            ring = TrajectoryRingBuffer(capacity=3, max_policy_lag=10)
+            fresh = make_batch(
+                policy_step=4,
+                scenario_id="fresh",
+                priority_score=10.0,
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "fresh|token",
+                    "scheduler/active_max_policy_lag": 4,
+                },
+            )
+            near_stale = make_batch(
+                policy_step=0,
+                scenario_id="near-stale",
+                priority_score=1.0,
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "near-stale|token",
+                    "scheduler/active_max_policy_lag": 4,
+                },
+            )
+
+            await ring.put(fresh)
+            await ring.put(near_stale)
+            received = await ring.get(
+                current_policy_step=4,
+                priority_scorer=lambda batch, policy_step: (
+                    scheduler.score_train_groups(
+                        batch.groups,
+                        policy_step=policy_step,
+                    )
+                ),
+            )
+            return ring, received
+
+        ring, received = asyncio.run(run())
+
+        self.assertEqual(received.groups[0].scenario_id, "near-stale")
+        self.assertEqual(ring.priority_consumptions, 1)
+        self.assertEqual(ring.consumed_priority_total, 2.0)
+
     def test_weight_broadcast_channel_replays_latest_and_waits(self):
         async def run():
             channel = WeightBroadcastChannel()
@@ -1272,6 +1319,8 @@ def make_batch(
     policy_step: int,
     scenario_id: str,
     priority_score: float = 0.0,
+    reward: float | None = None,
+    metadata: dict | None = None,
     on_discard=None,
 ) -> VersionedTrajectoryBatch:
     trajectory = Trajectory(
@@ -1279,7 +1328,8 @@ def make_batch(
         policy_step=policy_step,
         messages=[],
         actions=[],
-        reward=float(policy_step),
+        reward=float(policy_step) if reward is None else reward,
+        metadata=dict(metadata or {}),
     )
     group = TrajectoryGroup(scenario_id=scenario_id, trajectories=(trajectory,))
     return VersionedTrajectoryBatch(

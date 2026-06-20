@@ -241,9 +241,11 @@ class AdaptiveActionSpace:
     max_chunk_size: int = 8
     promotion_objective_threshold: float = 0.0
     promotion_quality_threshold: float = 0.95
+    promotion_semantic_bandwidth_threshold: float = 1.0
     unsafe_rate_threshold: float = 0.0
     demotion_objective_threshold: float = 0.0
     demotion_quality_threshold: float = 0.5
+    demotion_semantic_bandwidth_threshold: float = 1.0
     demotion_min_pulls: int = 2
     include_token: bool = True
     seed_codecs: Sequence[ActionCodec] = field(default_factory=tuple)
@@ -259,10 +261,18 @@ class AdaptiveActionSpace:
             raise ValueError("max_chunk_size must be >= min_chunk_size")
         if self.promotion_quality_threshold < 0:
             raise ValueError("promotion_quality_threshold must be non-negative")
+        if self.promotion_semantic_bandwidth_threshold < 0:
+            raise ValueError(
+                "promotion_semantic_bandwidth_threshold must be non-negative"
+            )
         if self.unsafe_rate_threshold < 0:
             raise ValueError("unsafe_rate_threshold must be non-negative")
         if self.demotion_quality_threshold < 0:
             raise ValueError("demotion_quality_threshold must be non-negative")
+        if self.demotion_semantic_bandwidth_threshold < 0:
+            raise ValueError(
+                "demotion_semantic_bandwidth_threshold must be non-negative"
+            )
         if self.demotion_min_pulls < 0:
             raise ValueError("demotion_min_pulls must be non-negative")
         if self.include_token:
@@ -294,6 +304,11 @@ class AdaptiveActionSpace:
             if signal.objective <= self.promotion_objective_threshold:
                 continue
             if signal.quality < self.promotion_quality_threshold:
+                continue
+            if (
+                signal.semantic_bandwidth
+                < self.promotion_semantic_bandwidth_threshold
+            ):
                 continue
             if signal.unsafe_rate > self.unsafe_rate_threshold:
                 continue
@@ -338,6 +353,8 @@ class AdaptiveActionSpace:
             return True
         if signal.quality < self.demotion_quality_threshold:
             return True
+        if signal.semantic_bandwidth < self.demotion_semantic_bandwidth_threshold:
+            return True
         return signal.objective <= self.demotion_objective_threshold
 
     def state_dict(self) -> dict[str, Any]:
@@ -352,9 +369,15 @@ class AdaptiveActionSpace:
                     self.promotion_objective_threshold
                 ),
                 "promotion_quality_threshold": self.promotion_quality_threshold,
+                "promotion_semantic_bandwidth_threshold": (
+                    self.promotion_semantic_bandwidth_threshold
+                ),
                 "unsafe_rate_threshold": self.unsafe_rate_threshold,
                 "demotion_objective_threshold": self.demotion_objective_threshold,
                 "demotion_quality_threshold": self.demotion_quality_threshold,
+                "demotion_semantic_bandwidth_threshold": (
+                    self.demotion_semantic_bandwidth_threshold
+                ),
                 "demotion_min_pulls": self.demotion_min_pulls,
                 "include_token": self.include_token,
             },
@@ -391,6 +414,10 @@ class AdaptiveActionSpace:
             config.get("promotion_quality_threshold"),
             self.promotion_quality_threshold,
         )
+        self.promotion_semantic_bandwidth_threshold = _state_float(
+            config.get("promotion_semantic_bandwidth_threshold"),
+            self.promotion_semantic_bandwidth_threshold,
+        )
         self.unsafe_rate_threshold = _state_float(
             config.get("unsafe_rate_threshold"),
             self.unsafe_rate_threshold,
@@ -403,6 +430,10 @@ class AdaptiveActionSpace:
             config.get("demotion_quality_threshold"),
             self.demotion_quality_threshold,
         )
+        self.demotion_semantic_bandwidth_threshold = _state_float(
+            config.get("demotion_semantic_bandwidth_threshold"),
+            self.demotion_semantic_bandwidth_threshold,
+        )
         self.demotion_min_pulls = _state_int(
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
@@ -413,6 +444,14 @@ class AdaptiveActionSpace:
         )
         self.min_chunk_size = max(1, self.min_chunk_size)
         self.max_chunk_size = max(self.min_chunk_size, self.max_chunk_size)
+        self.promotion_semantic_bandwidth_threshold = max(
+            0.0,
+            self.promotion_semantic_bandwidth_threshold,
+        )
+        self.demotion_semantic_bandwidth_threshold = max(
+            0.0,
+            self.demotion_semantic_bandwidth_threshold,
+        )
 
         active_codec_states = state.get("active_codecs")
         if isinstance(active_codec_states, (list, tuple)) and not isinstance(
@@ -483,6 +522,7 @@ class AdaptiveActionSpace:
         unsafe_values: list[float] = []
         failure_values: list[float] = []
         pull_values: list[float] = []
+        semantic_bandwidth_values: list[float] = []
         for key, value in metrics.items():
             if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
                 continue
@@ -500,6 +540,8 @@ class AdaptiveActionSpace:
                 failure_values.append(float(value))
             elif key.endswith("/pulls"):
                 pull_values.append(float(value))
+            elif key.endswith("/semantic_bandwidth_tokens_per_decision"):
+                semantic_bandwidth_values.append(float(value))
         return _CodecSignal(
             objective=max(objective_values) if objective_values else 0.0,
             quality=min(quality_values) if quality_values else 0.0,
@@ -507,6 +549,11 @@ class AdaptiveActionSpace:
             if unsafe_values or failure_values
             else 0.0,
             pulls=sum(pull_values),
+            semantic_bandwidth=(
+                max(semantic_bandwidth_values)
+                if semantic_bandwidth_values
+                else 0.0
+            ),
         )
 
 
@@ -516,6 +563,7 @@ class _CodecSignal:
     quality: float
     unsafe_rate: float
     pulls: float
+    semantic_bandwidth: float
 
 
 def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:

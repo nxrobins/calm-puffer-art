@@ -147,6 +147,9 @@ class ArmStats:
     reward_efficiency_ema: float = 0.0
     marginal_objective_ema: float = 0.0
     policy_improvement_objective_ema: float = 0.0
+    objective_observations: int = 0
+    objective_mean: float = 0.0
+    objective_m2: float = 0.0
     dollar_seconds_ema: float = 0.0
     last_train_reward: float = 0.0
     last_train_reward_improvement: float = 0.0
@@ -159,6 +162,8 @@ class ArmStats:
     total_dollar_seconds: float = 0.0
     rollout_dollar_seconds: float = 0.0
     queue_wait_dollar_seconds: float = 0.0
+    action_units: int = 0
+    source_tokens: int = 0
     stale_experience: float = 0.0
 
 
@@ -198,9 +203,12 @@ class ObjectiveScheduler:
         train_objective_weight: float = 1.0,
         reward_efficiency_weight: float = 0.0,
         stale_penalty_weight: float = 1.0,
+        staleness_priority_weight: float = 1.0,
+        confidence_penalty_weight: float = 0.0,
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
+        continuation_objective: str = "train",
         max_rollout_admission_delay_s: float = 0.0,
         rollout_admission_pressure_threshold: float = 0.75,
         rollout_admission_positive_signal_scale: float = 0.25,
@@ -224,10 +232,16 @@ class ObjectiveScheduler:
             raise ValueError("reward_efficiency_weight must be non-negative")
         if stale_penalty_weight < 0:
             raise ValueError("stale_penalty_weight must be non-negative")
+        if staleness_priority_weight < 0:
+            raise ValueError("staleness_priority_weight must be non-negative")
+        if confidence_penalty_weight < 0:
+            raise ValueError("confidence_penalty_weight must be non-negative")
         if min_train_steps < 0:
             raise ValueError("min_train_steps must be non-negative")
         if roi_patience is not None and roi_patience <= 0:
             raise ValueError("roi_patience must be positive when set")
+        if continuation_objective not in {"train", "accounted"}:
+            raise ValueError("continuation_objective must be 'train' or 'accounted'")
         if max_rollout_admission_delay_s < 0:
             raise ValueError("max_rollout_admission_delay_s must be non-negative")
         if not 0 <= rollout_admission_pressure_threshold < 1:
@@ -252,9 +266,12 @@ class ObjectiveScheduler:
         self.train_objective_weight = train_objective_weight
         self.reward_efficiency_weight = reward_efficiency_weight
         self.stale_penalty_weight = stale_penalty_weight
+        self.staleness_priority_weight = staleness_priority_weight
+        self.confidence_penalty_weight = confidence_penalty_weight
         self.min_train_steps = min_train_steps
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
+        self.continuation_objective = continuation_objective
         self.max_rollout_admission_delay_s = max_rollout_admission_delay_s
         self.rollout_admission_pressure_threshold = (
             rollout_admission_pressure_threshold
@@ -269,11 +286,18 @@ class ObjectiveScheduler:
         self._global_objective_ema = 0.0
         self._train_reward_ema = 0.0
         self._train_objective_ema = 0.0
+        self._train_observations = 0
         self._last_train_reward = 0.0
         self._last_train_objective = 0.0
         self._last_train_reward_improvement = 0.0
         self._last_train_experience_count = 0.0
         self._last_train_reward_improving_experience = 0.0
+        self._accounted_objective_ema = 0.0
+        self._last_accounted_objective = 0.0
+        self._last_accounted_reward_improving_experience = 0.0
+        self._last_accounted_dollar_seconds = 0.0
+        self._last_continuation_objective = 0.0
+        self._previous_accounted_dollar_seconds = 0.0
         self._last_stale_penalty_objective = 0.0
         self._last_stale_experience_count = 0.0
         self._last_stale_policy_step = -1
@@ -281,6 +305,10 @@ class ObjectiveScheduler:
         self._last_decision: SchedulerDecision | None = None
         self._last_decision_snapshot: dict[str, Any] | None = None
         self._last_train_batch_priority = 0.0
+        self._last_train_batch_policy_lag = 0
+        self._last_train_batch_lag_limit = -1
+        self._last_train_batch_staleness_urgency = 0.0
+        self._last_train_batch_staleness_bonus = 0.0
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -475,6 +503,8 @@ class ObjectiveScheduler:
         stats.total_dollar_seconds += cost
         stats.rollout_dollar_seconds += rollout_cost
         stats.queue_wait_dollar_seconds += queue_wait_cost
+        stats.action_units += trajectory.action_units
+        stats.source_tokens += trajectory.token_count
         stats.dollar_seconds_ema = self._ema(
             stats.dollar_seconds_ema,
             cost,
@@ -496,6 +526,7 @@ class ObjectiveScheduler:
             marginal_objective,
             stats.pulls,
         )
+        self._observe_objective_sample(stats, marginal_objective)
         stats.reward_efficiency_ema = self._ema(
             stats.reward_efficiency_ema,
             reward_efficiency,
@@ -576,6 +607,7 @@ class ObjectiveScheduler:
         )
         cost = max(dollar_seconds, 1e-12)
         self._train_dollar_seconds += cost
+        self._train_observations += 1
         (
             objective,
             experience_count,
@@ -597,12 +629,21 @@ class ObjectiveScheduler:
         self._last_train_reward_improvement = improvement
         self._last_train_experience_count = experience_count
         self._last_train_reward_improving_experience = reward_improving_experience
+        accounted_objective = self._observe_accounted_train_objective(
+            reward_improving_experience
+        )
+        continuation_objective = (
+            accounted_objective
+            if self.continuation_objective == "accounted"
+            else objective
+        )
+        self._last_continuation_objective = continuation_objective
         self._credit_train_objective_to_controls(
             groups,
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
-        if objective <= self.min_train_objective:
+        if continuation_objective <= self.min_train_objective:
             self._low_roi_train_steps += 1
         else:
             self._low_roi_train_steps = 0
@@ -694,10 +735,27 @@ class ObjectiveScheduler:
             ),
         )
         arm_component = mean(arm_values)
-        priority = (
+        base_priority = (
             arm_component + self.reward_efficiency_weight * raw_reward_component
         )
+        policy_lag, lag_limit, staleness_urgency = _batch_staleness_state(
+            groups,
+            policy_step=policy_step,
+            fallback_lag_limit=self.max_policy_lag_limit,
+        )
+        staleness_bonus = (
+            max(0.0, base_priority)
+            * self.staleness_priority_weight
+            * staleness_urgency
+        )
+        priority = base_priority + staleness_bonus
         self._last_train_batch_priority = priority
+        self._last_train_batch_policy_lag = policy_lag
+        self._last_train_batch_lag_limit = (
+            lag_limit if lag_limit is not None else -1
+        )
+        self._last_train_batch_staleness_urgency = staleness_urgency
+        self._last_train_batch_staleness_bonus = staleness_bonus
         return priority
 
     def should_continue_training(
@@ -740,9 +798,12 @@ class ObjectiveScheduler:
                 "train_objective_weight": self.train_objective_weight,
                 "reward_efficiency_weight": self.reward_efficiency_weight,
                 "stale_penalty_weight": self.stale_penalty_weight,
+                "staleness_priority_weight": self.staleness_priority_weight,
+                "confidence_penalty_weight": self.confidence_penalty_weight,
                 "min_train_steps": self.min_train_steps,
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
+                "continuation_objective": self.continuation_objective,
                 "max_rollout_admission_delay_s": (
                     self.max_rollout_admission_delay_s
                 ),
@@ -760,6 +821,7 @@ class ObjectiveScheduler:
                 "total_decisions": self._total_decisions,
                 "total_pulls": self._total_pulls,
                 "global_objective_ema": self._global_objective_ema,
+                "train_observations": self._train_observations,
                 "train_reward_ema": self._train_reward_ema,
                 "train_objective_ema": self._train_objective_ema,
                 "last_train_reward": self._last_train_reward,
@@ -771,6 +833,18 @@ class ObjectiveScheduler:
                 "last_train_reward_improving_experience": (
                     self._last_train_reward_improving_experience
                 ),
+                "accounted_objective_ema": self._accounted_objective_ema,
+                "last_accounted_objective": self._last_accounted_objective,
+                "last_accounted_reward_improving_experience": (
+                    self._last_accounted_reward_improving_experience
+                ),
+                "last_accounted_dollar_seconds": (
+                    self._last_accounted_dollar_seconds
+                ),
+                "last_continuation_objective": self._last_continuation_objective,
+                "previous_accounted_dollar_seconds": (
+                    self._previous_accounted_dollar_seconds
+                ),
                 "last_stale_penalty_objective": (
                     self._last_stale_penalty_objective
                 ),
@@ -778,6 +852,16 @@ class ObjectiveScheduler:
                 "last_stale_policy_step": self._last_stale_policy_step,
                 "last_stale_reason": self._last_stale_reason,
                 "last_train_batch_priority": self._last_train_batch_priority,
+                "last_train_batch_policy_lag": (
+                    self._last_train_batch_policy_lag
+                ),
+                "last_train_batch_lag_limit": self._last_train_batch_lag_limit,
+                "last_train_batch_staleness_urgency": (
+                    self._last_train_batch_staleness_urgency
+                ),
+                "last_train_batch_staleness_bonus": (
+                    self._last_train_batch_staleness_bonus
+                ),
                 "global_action_quality_ema": self._global_action_quality_ema,
                 "low_roi_train_steps": self._low_roi_train_steps,
                 "stop_recommended": self._stop_recommended,
@@ -873,6 +957,20 @@ class ObjectiveScheduler:
             config.get("stale_penalty_weight"),
             self.stale_penalty_weight,
         )
+        self.staleness_priority_weight = max(
+            0.0,
+            _state_float(
+                config.get("staleness_priority_weight"),
+                self.staleness_priority_weight,
+            ),
+        )
+        self.confidence_penalty_weight = max(
+            0.0,
+            _state_float(
+                config.get("confidence_penalty_weight"),
+                self.confidence_penalty_weight,
+            ),
+        )
         self.min_train_steps = _state_int(
             config.get("min_train_steps"),
             self.min_train_steps,
@@ -885,6 +983,11 @@ class ObjectiveScheduler:
             config.get("min_train_objective"),
             self.min_train_objective,
         )
+        continuation_objective = str(
+            config.get("continuation_objective", self.continuation_objective)
+        )
+        if continuation_objective in {"train", "accounted"}:
+            self.continuation_objective = continuation_objective
         self.max_rollout_admission_delay_s = _state_float(
             config.get("max_rollout_admission_delay_s"),
             self.max_rollout_admission_delay_s,
@@ -950,6 +1053,10 @@ class ObjectiveScheduler:
             learning_state.get("global_objective_ema"),
             self._global_objective_ema,
         )
+        self._train_observations = _state_int(
+            learning_state.get("train_observations"),
+            self._train_observations,
+        )
         self._train_reward_ema = _state_float(
             learning_state.get("train_reward_ema"),
             self._train_reward_ema,
@@ -978,6 +1085,30 @@ class ObjectiveScheduler:
             learning_state.get("last_train_reward_improving_experience"),
             self._last_train_reward_improving_experience,
         )
+        self._accounted_objective_ema = _state_float(
+            learning_state.get("accounted_objective_ema"),
+            self._accounted_objective_ema,
+        )
+        self._last_accounted_objective = _state_float(
+            learning_state.get("last_accounted_objective"),
+            self._last_accounted_objective,
+        )
+        self._last_accounted_reward_improving_experience = _state_float(
+            learning_state.get("last_accounted_reward_improving_experience"),
+            self._last_accounted_reward_improving_experience,
+        )
+        self._last_accounted_dollar_seconds = _state_float(
+            learning_state.get("last_accounted_dollar_seconds"),
+            self._last_accounted_dollar_seconds,
+        )
+        self._last_continuation_objective = _state_float(
+            learning_state.get("last_continuation_objective"),
+            self._last_continuation_objective,
+        )
+        self._previous_accounted_dollar_seconds = _state_float(
+            learning_state.get("previous_accounted_dollar_seconds"),
+            self._previous_accounted_dollar_seconds,
+        )
         self._last_stale_penalty_objective = _state_float(
             learning_state.get("last_stale_penalty_objective"),
             self._last_stale_penalty_objective,
@@ -996,6 +1127,22 @@ class ObjectiveScheduler:
         self._last_train_batch_priority = _state_float(
             learning_state.get("last_train_batch_priority"),
             self._last_train_batch_priority,
+        )
+        self._last_train_batch_policy_lag = _state_int(
+            learning_state.get("last_train_batch_policy_lag"),
+            self._last_train_batch_policy_lag,
+        )
+        self._last_train_batch_lag_limit = _state_int(
+            learning_state.get("last_train_batch_lag_limit"),
+            self._last_train_batch_lag_limit,
+        )
+        self._last_train_batch_staleness_urgency = _state_float(
+            learning_state.get("last_train_batch_staleness_urgency"),
+            self._last_train_batch_staleness_urgency,
+        )
+        self._last_train_batch_staleness_bonus = _state_float(
+            learning_state.get("last_train_batch_staleness_bonus"),
+            self._last_train_batch_staleness_bonus,
         )
         self._global_action_quality_ema = _state_float(
             learning_state.get("global_action_quality_ema"),
@@ -1079,6 +1226,7 @@ class ObjectiveScheduler:
             ),
             "scheduler/global_marginal_objective_ema": self._global_objective_ema,
             "scheduler/global_action_quality_ema": self._global_action_quality_ema,
+            "scheduler/train_observations": float(self._train_observations),
             "scheduler/train_reward_ema": self._train_reward_ema,
             "scheduler/train_marginal_objective_ema": self._train_objective_ema,
             "scheduler/train_last_objective": self._last_train_objective,
@@ -1088,6 +1236,20 @@ class ObjectiveScheduler:
             "scheduler/train_last_experience_count": self._last_train_experience_count,
             "scheduler/train_last_reward_improving_experience": (
                 self._last_train_reward_improving_experience
+            ),
+            "scheduler/accounted_objective_ema": self._accounted_objective_ema,
+            "scheduler/accounted_last_objective": self._last_accounted_objective,
+            "scheduler/accounted_last_reward_improving_experience": (
+                self._last_accounted_reward_improving_experience
+            ),
+            "scheduler/accounted_last_dollar_seconds": (
+                self._last_accounted_dollar_seconds
+            ),
+            "scheduler/continuation_last_objective": (
+                self._last_continuation_objective
+            ),
+            "scheduler/continuation/objective_accounted": (
+                1.0 if self.continuation_objective == "accounted" else 0.0
             ),
             "scheduler/stale_batches": float(self._stale_batches),
             "scheduler/stale_trajectories": float(self._stale_trajectories),
@@ -1100,12 +1262,30 @@ class ObjectiveScheduler:
             ),
             "scheduler/stale_last_policy_step": float(self._last_stale_policy_step),
             "scheduler/last_train_batch_priority": self._last_train_batch_priority,
+            "scheduler/last_train_batch_policy_lag": float(
+                self._last_train_batch_policy_lag
+            ),
+            "scheduler/last_train_batch_lag_limit": float(
+                self._last_train_batch_lag_limit
+            ),
+            "scheduler/last_train_batch_staleness_urgency": (
+                self._last_train_batch_staleness_urgency
+            ),
+            "scheduler/last_train_batch_staleness_bonus": (
+                self._last_train_batch_staleness_bonus
+            ),
             "scheduler/low_roi_train_steps": float(self._low_roi_train_steps),
             "scheduler/stop_recommended": 1.0 if self._stop_recommended else 0.0,
             "scheduler/weights/rollout_objective": self.rollout_objective_weight,
             "scheduler/weights/train_objective": self.train_objective_weight,
             "scheduler/weights/reward_efficiency": self.reward_efficiency_weight,
             "scheduler/weights/stale_penalty": self.stale_penalty_weight,
+            "scheduler/weights/staleness_priority": (
+                self.staleness_priority_weight
+            ),
+            "scheduler/weights/confidence_penalty": (
+                self.confidence_penalty_weight
+            ),
             "scheduler/weights/unsafe_penalty": self.unsafe_penalty,
             "scheduler/reconstruction_drift_threshold": (
                 self.reconstruction_drift_threshold
@@ -1189,6 +1369,13 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/reward_efficiency_ema"] = stats.reward_efficiency_ema
             metrics[f"{prefix}/objective_score"] = self._arm_value(stats)
+            metrics[f"{prefix}/raw_objective_score"] = self._raw_arm_value(stats)
+            metrics[f"{prefix}/confidence_penalty"] = self._confidence_penalty(stats)
+            metrics[f"{prefix}/objective_observations"] = float(
+                stats.objective_observations
+            )
+            metrics[f"{prefix}/objective_mean"] = stats.objective_mean
+            metrics[f"{prefix}/objective_stddev"] = _objective_stddev(stats)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
             metrics[f"{prefix}/feedback_updates"] = float(
@@ -1219,6 +1406,23 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/mean_queue_wait_dollar_seconds"] = (
                 stats.queue_wait_dollar_seconds / stats.pulls
                 if stats.pulls
+                else 0.0
+            )
+            metrics[f"{prefix}/action_units"] = float(stats.action_units)
+            metrics[f"{prefix}/source_tokens"] = float(stats.source_tokens)
+            metrics[f"{prefix}/semantic_bandwidth_tokens_per_decision"] = (
+                stats.source_tokens / stats.action_units
+                if stats.action_units
+                else 0.0
+            )
+            metrics[f"{prefix}/action_units_per_dollar_second"] = (
+                stats.action_units / stats.total_dollar_seconds
+                if stats.total_dollar_seconds > 0.0
+                else 0.0
+            )
+            metrics[f"{prefix}/source_tokens_per_dollar_second"] = (
+                stats.source_tokens / stats.total_dollar_seconds
+                if stats.total_dollar_seconds > 0.0
                 else 0.0
             )
             metrics[f"{prefix}/total_positive_improvement"] = (
@@ -1307,6 +1511,9 @@ class ObjectiveScheduler:
         )
 
     def _arm_value(self, stats: ArmStats) -> float:
+        return self._raw_arm_value(stats) - self._confidence_penalty(stats)
+
+    def _raw_arm_value(self, stats: ArmStats) -> float:
         unsafe_rate = stats.unsafe / stats.pulls if stats.pulls else 0.0
         objective = (
             self.train_objective_weight * stats.policy_improvement_objective_ema
@@ -1316,6 +1523,33 @@ class ObjectiveScheduler:
         return max(0.0, stats.action_quality_ema) * (
             objective - self.unsafe_penalty * unsafe_rate
         )
+
+    def _confidence_penalty(self, stats: ArmStats) -> float:
+        if self.confidence_penalty_weight <= 0.0:
+            return 0.0
+        observations = stats.objective_observations
+        if observations <= 0:
+            return 0.0
+        if observations == 1:
+            uncertainty = abs(stats.objective_mean)
+        else:
+            variance = max(0.0, stats.objective_m2 / (observations - 1))
+            uncertainty = math.sqrt(variance)
+        return (
+            self.confidence_penalty_weight
+            * uncertainty
+            / math.sqrt(observations)
+        )
+
+    @staticmethod
+    def _observe_objective_sample(stats: ArmStats, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        stats.objective_observations += 1
+        delta = value - stats.objective_mean
+        stats.objective_mean += delta / stats.objective_observations
+        delta2 = value - stats.objective_mean
+        stats.objective_m2 += delta * delta2
 
     def _credit_objective_to_arms(
         self,
@@ -1361,6 +1595,7 @@ class ObjectiveScheduler:
                 credit,
                 _arm_feedback_updates(stats),
             )
+            self._observe_objective_sample(stats, credit)
 
     def _credit_train_objective_to_arms(
         self,
@@ -1399,6 +1634,7 @@ class ObjectiveScheduler:
                 credit,
                 _arm_feedback_updates(stats),
             )
+            self._observe_objective_sample(stats, credit)
             arm_objectives[arm_id] = credit
             total_reward_improving_experience += reward_improving_experience
 
@@ -1598,6 +1834,41 @@ class ObjectiveScheduler:
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
 
+    def _observe_accounted_train_objective(
+        self,
+        reward_improving_experience: float,
+    ) -> float:
+        accounted_dollar_seconds = self._accounted_dollar_seconds()
+        interval_cost = max(
+            0.0,
+            accounted_dollar_seconds - self._previous_accounted_dollar_seconds,
+        )
+        self._previous_accounted_dollar_seconds = accounted_dollar_seconds
+        objective = (
+            reward_improving_experience / max(interval_cost, 1e-12)
+            if interval_cost > 0.0
+            else 0.0
+        )
+        self._last_accounted_objective = objective
+        self._last_accounted_reward_improving_experience = (
+            reward_improving_experience
+        )
+        self._last_accounted_dollar_seconds = interval_cost
+        self._accounted_objective_ema = self._ema(
+            self._accounted_objective_ema,
+            objective,
+            self._train_observations,
+        )
+        return objective
+
+    def _accounted_dollar_seconds(self) -> float:
+        return (
+            self._rollout_dollar_seconds
+            + self._queue_wait_dollar_seconds
+            + self._rollout_admission_dollar_seconds
+            + self._train_dollar_seconds
+        )
+
     def _ema(self, current: float, value: float, count: int) -> float:
         if count <= 1:
             return value
@@ -1632,6 +1903,14 @@ def _arm_feedback_updates(stats: ArmStats) -> int:
 
 def _control_feedback_updates(stats: ControlStats) -> int:
     return stats.train_updates + stats.stale_updates
+
+
+def _objective_stddev(stats: ArmStats) -> float:
+    if stats.objective_observations <= 1:
+        return 0.0
+    return math.sqrt(
+        max(0.0, stats.objective_m2 / (stats.objective_observations - 1))
+    )
 
 
 def scheduler_checkpoint_metadata(scheduler: Any | None) -> dict[str, Any]:
@@ -1684,6 +1963,45 @@ def _first_int_metadata(
             except ValueError:
                 continue
     return None
+
+
+def _batch_staleness_state(
+    groups: Sequence[TrajectoryGroup],
+    *,
+    policy_step: int,
+    fallback_lag_limit: int | None,
+) -> tuple[int, int | None, float]:
+    trajectories = [
+        trajectory
+        for group in groups
+        for trajectory in group.trajectories
+    ]
+    if not trajectories:
+        return 0, fallback_lag_limit, 0.0
+
+    policy_lag = max(
+        0,
+        max(policy_step - trajectory.policy_step for trajectory in trajectories),
+    )
+    limits: list[int] = []
+    for trajectory in trajectories:
+        limit = _first_int_metadata(
+            trajectory.metadata,
+            (
+                "scheduler/active_max_policy_lag",
+                "scheduler/max_policy_lag",
+            ),
+        )
+        if limit is not None and limit >= 0:
+            limits.append(limit)
+    if fallback_lag_limit is not None and fallback_lag_limit >= 0:
+        limits.append(fallback_lag_limit)
+    lag_limit = min(limits) if limits else None
+    if lag_limit is None:
+        return policy_lag, None, 0.0
+    if lag_limit <= 0:
+        return policy_lag, lag_limit, 1.0
+    return policy_lag, lag_limit, min(1.0, policy_lag / lag_limit)
 
 
 def _dataclass_state(value: Any) -> dict[str, Any]:
@@ -1781,6 +2099,18 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("policy_improvement_objective_ema"),
             default.policy_improvement_objective_ema,
         ),
+        objective_observations=_state_int(
+            state.get("objective_observations"),
+            default.objective_observations,
+        ),
+        objective_mean=_state_float(
+            state.get("objective_mean"),
+            default.objective_mean,
+        ),
+        objective_m2=_state_float(
+            state.get("objective_m2"),
+            default.objective_m2,
+        ),
         dollar_seconds_ema=_state_float(
             state.get("dollar_seconds_ema"),
             default.dollar_seconds_ema,
@@ -1835,6 +2165,14 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
         queue_wait_dollar_seconds=_state_float(
             state.get("queue_wait_dollar_seconds"),
             default.queue_wait_dollar_seconds,
+        ),
+        action_units=_state_int(
+            state.get("action_units"),
+            default.action_units,
+        ),
+        source_tokens=_state_int(
+            state.get("source_tokens"),
+            default.source_tokens,
         ),
         stale_experience=_state_float(
             state.get("stale_experience"),

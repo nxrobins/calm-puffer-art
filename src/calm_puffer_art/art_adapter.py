@@ -429,7 +429,10 @@ class AsyncArtBackend:
         while not self._closed:
             self.ring.max_policy_lag = self._max_policy_lag()
             train_wait_started = time.perf_counter()
-            batch = await self.ring.get(current_policy_step=self._current_step)
+            batch = await self.ring.get(
+                current_policy_step=self._current_step,
+                priority_scorer=self._batch_priority_scorer(),
+            )
             train_wait_s = time.perf_counter() - train_wait_started
             train_wait_dollar_seconds = (
                 train_wait_s * self.config.cost_per_second_usd
@@ -508,6 +511,18 @@ class AsyncArtBackend:
             return 0.0
         return self.scheduler.score_train_groups(groups, policy_step=self._current_step)
 
+    def _batch_priority_scorer(self):
+        if self.scheduler is None:
+            return None
+
+        def score_batch(batch: VersionedTrajectoryBatch, policy_step: int) -> float:
+            return self.scheduler.score_train_groups(
+                batch.groups,
+                policy_step=policy_step,
+            )
+
+        return score_batch
+
     async def _submit_local_batch(
         self,
         *,
@@ -516,9 +531,11 @@ class AsyncArtBackend:
         futures: Sequence[asyncio.Future[Any]],
         kwargs: Mapping[str, Any],
     ) -> None:
+        active_max_policy_lag = self._max_policy_lag()
         self._tag_batch_control_metadata(
             groups,
             target_train_batch_groups=len(groups),
+            max_policy_lag=active_max_policy_lag,
         )
         batch = VersionedTrajectoryBatch(
             groups=tuple(groups),

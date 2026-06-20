@@ -44,6 +44,8 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It reserves in-flight rollout decisions so concurrent actors explore distinct untried arms before feedback arrives.
 - It can delay actor admission before rollout under downstream queue saturation, scaling the delay down when positive objective signal says useful sampling should keep flowing.
 - It scores candidate train batches so ready samples with higher estimated objective value train first.
+- It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale useful-experience waste before it happens.
+- It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
 - It credits train-step reward improvement back to active cadence and policy-lag values from the same arm-local credit map, reported under `scheduler/control/*`.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
@@ -52,8 +54,8 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It widens train-batch cadence under trainer saturation when there is no positive objective signal, reducing low-ROI tiny-batch churn.
 - It tightens policy lag after positive objective signal so high-value samples stay closer to the active checkpoint.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
-- It can stop training early when `roi_patience` is configured and train-step objective stays below threshold.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective and quality signals make higher semantic bandwidth worth trying, retires promoted chunks after enough bad objective, quality, failure-rate, or safety evidence, and snapshots that action-space state under `action_space/state`.
+- It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective, quality, and observed semantic-bandwidth signals make higher-bandwidth actions worth trying, retires promoted chunks after enough bad objective, bandwidth, quality, failure-rate, or safety evidence, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
@@ -63,8 +65,9 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
 - It reports actor admission-delay cost separately, so pre-rollout backpressure avoidance is visible in accounted dollar-seconds instead of disappearing from the control audit.
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation dollar-seconds are included in the train-objective denominator for the candidate.
+- It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 
-This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reward variance, reconstruction-drift distributions, and per-actor causal cost attribution.
+This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reconstruction-drift distributions, per-actor causal cost attribution, and explicit actor-count control.
 
 ## Bounded Staleness
 
@@ -76,6 +79,8 @@ The runtime applies two filters:
 - `TrajectoryRingBuffer` drops whole `VersionedTrajectoryBatch` objects if their oldest trajectory exceeds `max_policy_lag` by the time the trainer consumes them.
 
 Dropped train batches also call a synchronous discard hook. Schedulers that implement `observe_stale_batch()` receive the discarded groups, policy step, and reason, so stale useful experience becomes negative control feedback instead of only a counter.
+
+Before that drop path fires, the train ring can ask the scheduler to rescore queued non-stale batches at the current policy step. `ObjectiveScheduler` uses the active lag limit stamped onto each batch to add stale-risk priority only to batches with positive estimated objective value, so near-stale useful experience can train ahead of lower-risk work without rewarding low-value stale churn.
 
 This mirrors the useful part of the Puffer bridge sketch without making the current scaffold depend on ART internals or GPU resources.
 
@@ -132,7 +137,7 @@ Phase 1: Runtime bridge
 - Feed stale train-batch drops back into scheduler arm, cadence, and policy-lag objective memory as negative experience.
 - Gate checkpoint publication on programmable promotion decisions and feed the promotion-effective score into scheduler train credit.
 - Make cadence pressure-aware so saturated trainers receive larger batches unless the objective signal justifies tighter updates.
-- Promote larger chunk codecs online when smaller chunks show positive objective signal and acceptable quality.
+- Promote larger chunk codecs online when smaller chunks show positive objective signal, observed semantic bandwidth, and acceptable quality.
 - Add ROI patience so the runtime stops spending after repeated low-value training steps instead of blindly exhausting `max_train_steps`.
 
 Phase 2: ART adapter

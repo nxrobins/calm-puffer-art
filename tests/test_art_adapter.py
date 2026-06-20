@@ -560,7 +560,7 @@ class ArtAdapterTests(unittest.TestCase):
 
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(len(backend.calls[0][1]), 2)
-        self.assertEqual(scheduler.scored_batches, [2])
+        self.assertEqual(scheduler.scored_batches, [2, 2])
         self.assertEqual(scheduler.observed_batches, [2])
         self.assertEqual(stats["art_backend/submitted_batches"], 1.0)
 

@@ -56,6 +56,7 @@ class ActionCodecTests(unittest.TestCase):
                 "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
             }
         )
 
@@ -64,6 +65,23 @@ class ActionCodecTests(unittest.TestCase):
             [action_codec_key(codec) for codec in action_space.codecs],
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
+
+    def test_adaptive_action_space_requires_observed_semantic_bandwidth(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
 
     def test_adaptive_action_space_does_not_promote_unsafe_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
@@ -108,6 +126,7 @@ class ActionCodecTests(unittest.TestCase):
                 "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
             }
         )
         self.assertIn(
@@ -149,6 +168,7 @@ class ActionCodecTests(unittest.TestCase):
                 "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
             }
         )
 
@@ -224,6 +244,7 @@ class ActionCodecTests(unittest.TestCase):
                 "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
             }
         )
         action_space.update_from_metrics(
@@ -241,6 +262,8 @@ class ActionCodecTests(unittest.TestCase):
 
         self.assertEqual(restored.min_chunk_size, 2)
         self.assertEqual(restored.max_chunk_size, 8)
+        self.assertEqual(restored.promotion_semantic_bandwidth_threshold, 1.0)
+        self.assertEqual(restored.demotion_semantic_bandwidth_threshold, 1.0)
         self.assertEqual(metrics["action_space/promotions"], 1.0)
         self.assertEqual(metrics["action_space/demotions"], 1.0)
         self.assertEqual(metrics["action_space/disabled_codecs"], 1.0)

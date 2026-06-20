@@ -268,6 +268,123 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             ],
         )
 
+    def test_confidence_penalty_prefers_steadier_objective_gain(self):
+        scenarios = [Scenario(id="spiky"), Scenario(id="steady")]
+        codecs = [TokenActionCodec()]
+        unpenalized = ObjectiveScheduler(exploration_bonus=0.0, ema_alpha=0.5)
+        penalized = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            ema_alpha=0.5,
+            confidence_penalty_weight=2.0,
+        )
+
+        for scheduler in (unpenalized, penalized):
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="spiky",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                    metadata={"scheduler/arm_id": "spiky|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="steady",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                    metadata={"scheduler/arm_id": "steady|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            for policy_step, train_reward in ((0, 10.0), (1, 10.0)):
+                scheduler.observe_train(
+                    groups=[
+                        TrajectoryGroup(
+                            scenario_id="spiky",
+                            trajectories=(
+                                Trajectory(
+                                    scenario_id="spiky",
+                                    policy_step=0,
+                                    messages=[],
+                                    actions=[],
+                                    reward=1.0,
+                                    metadata={"scheduler/arm_id": "spiky|token"},
+                                ),
+                            ),
+                        )
+                    ],
+                    result=TrainResult(metrics={"train/reward": train_reward}),
+                    duration_s=1.0,
+                    dollar_seconds=1.0,
+                    policy_step=policy_step,
+                )
+            for policy_step, train_reward in ((0, 1.0), (1, 2.0)):
+                scheduler.observe_train(
+                    groups=[
+                        TrajectoryGroup(
+                            scenario_id="steady",
+                            trajectories=(
+                                Trajectory(
+                                    scenario_id="steady",
+                                    policy_step=0,
+                                    messages=[],
+                                    actions=[],
+                                    reward=1.0,
+                                    metadata={"scheduler/arm_id": "steady|token"},
+                                ),
+                            ),
+                        )
+                    ],
+                    result=TrainResult(metrics={"train/reward": train_reward}),
+                    duration_s=1.0,
+                    dollar_seconds=1.0,
+                    policy_step=policy_step,
+                )
+
+        raw_decision = unpenalized.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=2,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        penalized_decision = penalized.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=2,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        metrics = penalized.metrics()
+
+        self.assertEqual(raw_decision.arm_id, "spiky|token")
+        self.assertEqual(penalized_decision.arm_id, "steady|token")
+        self.assertGreater(
+            metrics["scheduler/arm/spiky_token/raw_objective_score"],
+            metrics["scheduler/arm/steady_token/raw_objective_score"],
+        )
+        self.assertLess(
+            metrics["scheduler/arm/spiky_token/objective_score"],
+            metrics["scheduler/arm/steady_token/objective_score"],
+        )
+        self.assertGreater(
+            metrics["scheduler/arm/spiky_token/confidence_penalty"],
+            metrics["scheduler/arm/steady_token/confidence_penalty"],
+        )
+
     def test_rollout_objective_includes_queue_wait_cost(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         no_wait = Trajectory(
@@ -312,6 +429,47 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertGreater(
             metrics["scheduler/arm/no_wait_token/objective_score"],
             metrics["scheduler/arm/waited_token/objective_score"],
+        )
+
+    def test_rollout_metrics_expose_arm_semantic_bandwidth(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        actions = ChunkActionCodec(chunk_size=2).encode("alpha beta gamma delta")
+
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="bandwidth",
+                policy_step=0,
+                messages=[],
+                actions=actions,
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "bandwidth|chunk(chunk_size=2)",
+                },
+            ),
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(
+            metrics["scheduler/arm/bandwidth_chunk_chunk_size_2/action_units"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/bandwidth_chunk_chunk_size_2/source_tokens"],
+            4.0,
+        )
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/bandwidth_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision"
+            ],
+            2.0,
+        )
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/bandwidth_chunk_chunk_size_2/source_tokens_per_dollar_second"
+            ],
+            2.0,
         )
 
     def test_rollout_admission_delay_backs_off_saturated_low_signal_sampling(self):
@@ -840,6 +998,61 @@ class ObjectiveSchedulerTests(unittest.TestCase):
 
         self.assertGreater(high_score, low_score)
 
+    def test_train_group_scoring_boosts_useful_near_stale_batches(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            staleness_priority_weight=1.0,
+        )
+        fresh = Trajectory(
+            scenario_id="fresh",
+            policy_step=8,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "fresh|token",
+                "scheduler/active_max_policy_lag": 4,
+            },
+        )
+        near_stale = Trajectory(
+            scenario_id="near-stale",
+            policy_step=6,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "near-stale|token",
+                "scheduler/active_max_policy_lag": 4,
+            },
+        )
+
+        fresh_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="fresh", trajectories=(fresh,))],
+            policy_step=10,
+        )
+        near_stale_score = scheduler.score_train_groups(
+            [
+                TrajectoryGroup(
+                    scenario_id="near-stale",
+                    trajectories=(near_stale,),
+                )
+            ],
+            policy_step=10,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertGreater(near_stale_score, fresh_score)
+        self.assertEqual(metrics["scheduler/last_train_batch_policy_lag"], 4.0)
+        self.assertEqual(metrics["scheduler/last_train_batch_lag_limit"], 4.0)
+        self.assertEqual(
+            metrics["scheduler/last_train_batch_staleness_urgency"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/last_train_batch_staleness_bonus"],
+            1.0,
+        )
+
     def test_unsafe_high_reward_action_granularity_is_penalized(self):
         scenarios = [Scenario(id="task")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
@@ -1193,6 +1406,72 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(scheduler.metrics()["scheduler/stop_recommended"], 1.0)
 
+    def test_accounted_continuation_roi_counts_sample_cost(self):
+        train_only = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_train_steps=1,
+            roi_patience=1,
+            min_train_objective=0.5,
+        )
+        accounted = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_train_steps=1,
+            roi_patience=1,
+            min_train_objective=0.5,
+            continuation_objective="accounted",
+        )
+
+        for scheduler in (train_only, accounted):
+            trajectory = Trajectory(
+                scenario_id="expensive-sample",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={"scheduler/arm_id": "expensive-sample|token"},
+            )
+            group = TrajectoryGroup(
+                scenario_id="expensive-sample",
+                trajectories=(trajectory,),
+            )
+            scheduler.observe_rollout(
+                trajectory,
+                accepted=True,
+                dollar_seconds=99.0,
+            )
+            scheduler.observe_train(
+                groups=[group],
+                result=TrainResult(metrics={"train/reward": 1.0}),
+                duration_s=1.0,
+                dollar_seconds=1.0,
+                policy_step=0,
+            )
+
+        self.assertTrue(
+            train_only.should_continue_training(
+                policy_step=1,
+                max_train_steps=10,
+                pending_train_batches=0,
+                train_queue_pressure=0.0,
+            )
+        )
+        self.assertFalse(
+            accounted.should_continue_training(
+                policy_step=1,
+                max_train_steps=10,
+                pending_train_batches=0,
+                train_queue_pressure=0.0,
+            )
+        )
+        metrics = accounted.metrics()
+
+        self.assertEqual(metrics["scheduler/train_last_objective"], 1.0)
+        self.assertEqual(metrics["scheduler/accounted_last_objective"], 0.01)
+        self.assertEqual(metrics["scheduler/continuation_last_objective"], 0.01)
+        self.assertEqual(metrics["scheduler/accounted_last_dollar_seconds"], 100.0)
+        self.assertEqual(metrics["scheduler/continuation/objective_accounted"], 1.0)
+        self.assertEqual(metrics["scheduler/stop_recommended"], 1.0)
+
     def test_positive_train_objective_resets_roi_patience(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,
@@ -1244,8 +1523,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             ema_alpha=0.5,
             exploration_bonus=0.0,
             reward_efficiency_weight=0.25,
+            staleness_priority_weight=0.5,
+            confidence_penalty_weight=0.25,
             roi_patience=3,
             min_train_objective=0.01,
+            continuation_objective="accounted",
         )
         cheap = Trajectory(
             scenario_id="cheap",
@@ -1298,18 +1580,35 @@ class ObjectiveSchedulerTests(unittest.TestCase):
 
         self.assertEqual(decision.arm_id, "cheap|token")
         self.assertEqual(restored.reward_efficiency_weight, 0.25)
+        self.assertEqual(restored.staleness_priority_weight, 0.5)
+        self.assertEqual(restored.confidence_penalty_weight, 0.25)
+        self.assertEqual(restored.continuation_objective, "accounted")
         self.assertEqual(restored.roi_patience, 3)
         for key in (
             "scheduler/arm/cheap_token/pulls",
             "scheduler/arm/cheap_token/policy_improvement_objective_ema",
+            "scheduler/arm/cheap_token/objective_observations",
+            "scheduler/arm/cheap_token/objective_mean",
+            "scheduler/arm/cheap_token/objective_stddev",
+            "scheduler/arm/cheap_token/confidence_penalty",
             "scheduler/arm/cheap_token/last_train_reward",
             "scheduler/arm/cheap_token/total_reward_improving_experience",
             "scheduler/control/cadence_1/train_updates",
             "scheduler/control/policy_lag_0/train_updates",
             "scheduler/costs/rollout_dollar_seconds",
             "scheduler/costs/train_dollar_seconds",
+            "scheduler/accounted_objective_ema",
+            "scheduler/accounted_last_objective",
+            "scheduler/accounted_last_reward_improving_experience",
+            "scheduler/accounted_last_dollar_seconds",
+            "scheduler/continuation_last_objective",
+            "scheduler/continuation/objective_accounted",
             "scheduler/train_last_experience_count",
             "scheduler/train_last_reward_improving_experience",
+            "scheduler/last_train_batch_policy_lag",
+            "scheduler/last_train_batch_lag_limit",
+            "scheduler/last_train_batch_staleness_urgency",
+            "scheduler/last_train_batch_staleness_bonus",
             "scheduler/last_arm/cheap_token",
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",
