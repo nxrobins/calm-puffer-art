@@ -42,13 +42,15 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It estimates marginal reward improvement per dollar-second for each arm.
 - It explores untried arms, then prefers arms with better objective estimates.
 - It reserves in-flight rollout decisions so concurrent actors explore distinct untried arms before feedback arrives.
+- It can enforce an opt-in `min_rollout_coverage_fraction` after the initial sweep, temporarily selecting the most under-covered arm so diagnostic workflows and action granularities keep receiving bounded live evidence.
 - It gates the static actor pool with a learned active actor cap, so actor count becomes a runtime control without changing the user-facing rollout API.
 - It can delay actor admission before rollout under downstream queue saturation, then explore and reuse millisecond delay values based on rollout, train, and stale objective feedback.
-- It scores candidate train batches so ready samples with higher estimated objective value train first.
+- It scores candidate train batches so ready samples with higher estimated objective value train first, while applying current trajectory quality so unsafe batches from historically good arms lose priority before training.
 - It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale useful-experience waste before it happens.
 - It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
 - It credits reward improvement back to active actor-count, cadence, policy-lag, and actor-admission delay values, reports their objective/exploration scores under `scheduler/control/*`, and reuses the higher-value runtime controls.
+- It attributes rollout, train, stale, queue-wait, admission cost, semantic bandwidth, and objective back to individual actor slots under `scheduler/actor/*`, so actor-count control can be audited by marginal actor-slot contribution.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
 - It records verifier failures, reconstruction safety failures, and reconstruction drift as checkpointed scheduler failure modes.
 - It explores train-batch cadence candidates after the configured default, then tightens or widens cadence according to reward-improving experience per dollar-second.
@@ -68,7 +70,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation dollar-seconds are included in the train-objective denominator for the candidate.
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 
-This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reconstruction-drift distributions, per-actor causal cost attribution, and multi-objective safeguards for fairness and coverage.
+This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reconstruction-drift distributions and stronger multi-objective safeguards for fairness beyond a simple coverage floor.
 
 ## Bounded Staleness
 
