@@ -297,7 +297,6 @@ class ArtAdapterTests(unittest.TestCase):
                 max_chunk_size=2,
                 promote_latent_patches=True,
                 latent_patch_latent_size=3,
-                promotion_semantic_bandwidth_threshold=0.0,
             )
             channel = WeightBroadcastChannel()
             updates = channel.subscribe()
@@ -310,7 +309,14 @@ class ArtAdapterTests(unittest.TestCase):
             art_group = FakeArtGroup(
                 trajectories=[
                     FakeArtTrajectory(
-                        messages_and_choices=[],
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta gamma delta",
+                                )
+                            )
+                        ],
                         reward=1.0,
                         initial_policy_version=0,
                         metadata={
@@ -327,9 +333,9 @@ class ArtAdapterTests(unittest.TestCase):
             update = updates.get_nowait()
             stats = async_backend.stats()
             await async_backend.close()
-            return update, stats
+            return update, stats, scheduler.metrics()
 
-        update, stats = asyncio.run(run())
+        update, stats, metrics = asyncio.run(run())
 
         action_space_state = update.metadata[ACTION_SPACE_STATE_KEY]
         self.assertIn(
@@ -341,6 +347,17 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(
             stats["action_space/codec/latent_patch_latent_size_3_patch_size_2/active"],
             1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/art_task_chunk_chunk_size_2/pulls"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/art_task_chunk_chunk_size_2/"
+                "semantic_bandwidth_tokens_per_decision"
+            ],
+            4.0,
         )
 
     def test_async_art_backend_synchronous_fallback_calls_backend_directly(self):
@@ -401,7 +418,7 @@ class ArtAdapterTests(unittest.TestCase):
             17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
         )
 
-    def test_async_art_backend_charges_successful_art_sample_cost_to_scheduler(self):
+    def test_async_art_backend_observes_art_sample_cost_before_train_feedback(self):
         async def run():
             backend = CostedFakeArtBackend()
             scheduler = ObjectiveScheduler(exploration_bonus=0.0)
@@ -434,9 +451,21 @@ class ArtAdapterTests(unittest.TestCase):
 
         self.assertEqual(result.step, 1)
         self.assertEqual(stats["art_backend/sample_dollar_seconds"], 11.0)
+        self.assertEqual(
+            metrics["scheduler/arm/sample_cost_art_art/pulls"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/sample_cost_art_art/mean_rollout_dollar_seconds"],
+            11.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/costs/rollout_dollar_seconds"],
+            11.0,
+        )
         self.assertAlmostEqual(
             metrics["scheduler/costs/train_dollar_seconds"],
-            28.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+            17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
         )
         self.assertAlmostEqual(
             metrics["scheduler/accounted_last_dollar_seconds"],
@@ -739,8 +768,8 @@ class ArtAdapterTests(unittest.TestCase):
         expected_train_cost = (
             17.0
             + stats["art_backend/trainer_wait_dollar_seconds"]
-            + expected_sample_cost
         )
+        expected_accounted_cost = expected_train_cost + expected_sample_cost
         self.assertEqual(first_result, second_result)
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(len(backend.calls[0][1]), 2)
@@ -753,13 +782,24 @@ class ArtAdapterTests(unittest.TestCase):
             stats["art_backend/sample_dollar_seconds"],
             expected_sample_cost,
         )
+        self.assertEqual(metrics["scheduler/costs/rollout_dollar_seconds"], 9.0)
+        self.assertEqual(metrics["scheduler/costs/queue_wait_dollar_seconds"], 2.0)
+        self.assertEqual(
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+            1.0,
+        )
         self.assertAlmostEqual(
             metrics["scheduler/costs/train_dollar_seconds"],
             expected_train_cost,
         )
         self.assertAlmostEqual(
             metrics["scheduler/accounted_last_dollar_seconds"],
-            expected_train_cost,
+            expected_accounted_cost,
+        )
+        self.assertEqual(metrics["scheduler/arm/external_art_art/pulls"], 2.0)
+        self.assertEqual(
+            metrics["scheduler/arm/external_art_art/mean_sample_dollar_seconds"],
+            expected_sample_cost / 2.0,
         )
         self.assertEqual(
             metrics["scheduler/control/train_objective_accounted"],

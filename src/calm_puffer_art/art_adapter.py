@@ -339,6 +339,7 @@ class AsyncArtBackend:
             trajectory_groups,
             config=self.adapter_config,
         )
+        self._observe_submitted_rollouts(local_groups)
         future = asyncio.get_running_loop().create_future()
         await self._submit_local_batch(
             model=model,
@@ -368,6 +369,7 @@ class AsyncArtBackend:
             trajectory_group,
             config=self.adapter_config,
         )
+        self._observe_submitted_rollouts((local_group,))
         future = asyncio.get_running_loop().create_future()
         pending = _PendingArtGroup(
             model=model,
@@ -475,7 +477,6 @@ class AsyncArtBackend:
                     duration_s=duration_s,
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 )
-                sample_dollar_seconds = _groups_sample_dollar_seconds(batch.groups)
                 next_step = _optional_int(local_result.metadata.get("art/step"))
                 self._current_step = (
                     max(self._current_step + 1, next_step)
@@ -490,7 +491,6 @@ class AsyncArtBackend:
                         duration_s=duration_s,
                         dollar_seconds=(
                             train_dollar_seconds + train_wait_dollar_seconds
-                            + sample_dollar_seconds
                         ),
                         policy_step=policy_step,
                     )
@@ -529,6 +529,43 @@ class AsyncArtBackend:
         if self.scheduler is None:
             return 0.0
         return self.scheduler.score_train_groups(groups, policy_step=self._current_step)
+
+    def _observe_submitted_rollouts(
+        self,
+        groups: Sequence[TrajectoryGroup],
+    ) -> None:
+        if self.scheduler is None:
+            return
+        observe_rollout = getattr(self.scheduler, "observe_rollout", None)
+        if observe_rollout is None:
+            return
+        observe_admission_delay = getattr(
+            self.scheduler,
+            "observe_rollout_admission_delay",
+            None,
+        )
+        for group in groups:
+            for trajectory in group.trajectories:
+                rollout_cost, queue_wait_cost = _trajectory_rollout_cost_parts(
+                    trajectory,
+                    cost_per_second_usd=self.config.cost_per_second_usd,
+                )
+                admission_cost = _trajectory_admission_dollar_seconds(trajectory)
+                if admission_cost > 0.0 and observe_admission_delay is not None:
+                    observe_admission_delay(
+                        seconds=_trajectory_admission_seconds(
+                            trajectory,
+                            admission_cost=admission_cost,
+                            cost_per_second_usd=self.config.cost_per_second_usd,
+                        ),
+                        dollar_seconds=admission_cost,
+                    )
+                observe_rollout(
+                    trajectory,
+                    accepted=trajectory.exception is None,
+                    dollar_seconds=rollout_cost,
+                    queue_wait_dollar_seconds=queue_wait_cost,
+                )
 
     def _batch_priority_scorer(self):
         if self.scheduler is None:
@@ -825,6 +862,83 @@ def _trajectory_sample_dollar_seconds(trajectory: Trajectory) -> float:
             ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
         )
     return (rollout_cost or 0.0) + (queue_cost or 0.0) + (admission_cost or 0.0)
+
+
+def _trajectory_rollout_cost_parts(
+    trajectory: Trajectory,
+    *,
+    cost_per_second_usd: float,
+) -> tuple[float, float]:
+    explicit_total = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/dollar_seconds",),
+    )
+    if explicit_total is None:
+        explicit_total = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/dollar_seconds",),
+        )
+    admission_cost = _trajectory_admission_dollar_seconds(trajectory)
+    if explicit_total is not None:
+        return max(0.0, explicit_total - admission_cost), 0.0
+
+    rollout_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("rollout/dollar_seconds",),
+    )
+    if rollout_cost is None:
+        rollout_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("rollout/dollar_seconds",),
+        )
+    if rollout_cost is None:
+        rollout_cost = max(0.0, trajectory.duration_s * cost_per_second_usd)
+
+    queue_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/actor_queue_wait_dollar_seconds", "queue_wait/dollar_seconds"),
+    )
+    if queue_cost is None:
+        queue_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/actor_queue_wait_dollar_seconds", "queue_wait/dollar_seconds"),
+        )
+    return rollout_cost, queue_cost or 0.0
+
+
+def _trajectory_admission_dollar_seconds(trajectory: Trajectory) -> float:
+    admission_cost = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+    )
+    if admission_cost is None:
+        admission_cost = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+        )
+    return admission_cost or 0.0
+
+
+def _trajectory_admission_seconds(
+    trajectory: Trajectory,
+    *,
+    admission_cost: float,
+    cost_per_second_usd: float,
+) -> float:
+    seconds = _first_nonnegative_mapping_float(
+        trajectory.metrics,
+        ("scheduler/active_rollout_admission_delay_s", "admission/s"),
+    )
+    if seconds is None:
+        seconds = _first_nonnegative_mapping_float(
+            trajectory.metadata,
+            ("scheduler/active_rollout_admission_delay_s", "admission/s"),
+        )
+    if seconds is not None:
+        return seconds
+    if cost_per_second_usd > 0.0:
+        return admission_cost / cost_per_second_usd
+    return 0.0
 
 
 def _first_nonnegative_mapping_float(
