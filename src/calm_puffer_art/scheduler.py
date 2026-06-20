@@ -254,6 +254,7 @@ class ObjectiveScheduler:
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
         continuation_objective: str = "train",
+        control_train_objective: str = "accounted",
         max_rollout_admission_delay_s: float = 0.0,
         rollout_admission_pressure_threshold: float = 0.75,
         rollout_admission_positive_signal_scale: float = 0.25,
@@ -299,6 +300,10 @@ class ObjectiveScheduler:
             raise ValueError("roi_patience must be positive when set")
         if continuation_objective not in {"train", "accounted"}:
             raise ValueError("continuation_objective must be 'train' or 'accounted'")
+        if control_train_objective not in {"train", "accounted"}:
+            raise ValueError(
+                "control_train_objective must be 'train' or 'accounted'"
+            )
         if max_rollout_admission_delay_s < 0:
             raise ValueError("max_rollout_admission_delay_s must be non-negative")
         if not 0 <= rollout_admission_pressure_threshold < 1:
@@ -334,6 +339,7 @@ class ObjectiveScheduler:
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
         self.continuation_objective = continuation_objective
+        self.control_train_objective = control_train_objective
         self.max_rollout_admission_delay_s = max_rollout_admission_delay_s
         self.rollout_admission_pressure_threshold = (
             rollout_admission_pressure_threshold
@@ -822,6 +828,11 @@ class ObjectiveScheduler:
         self._last_continuation_objective = continuation_objective
         self._credit_train_objective_to_controls(
             groups,
+            objective=(
+                accounted_objective
+                if self.control_train_objective == "accounted"
+                else None
+            ),
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
@@ -1008,6 +1019,7 @@ class ObjectiveScheduler:
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
                 "continuation_objective": self.continuation_objective,
+                "control_train_objective": self.control_train_objective,
                 "max_rollout_admission_delay_s": (
                     self.max_rollout_admission_delay_s
                 ),
@@ -1250,6 +1262,11 @@ class ObjectiveScheduler:
         )
         if continuation_objective in {"train", "accounted"}:
             self.continuation_objective = continuation_objective
+        control_train_objective = str(
+            config.get("control_train_objective", self.control_train_objective)
+        )
+        if control_train_objective in {"train", "accounted"}:
+            self.control_train_objective = control_train_objective
         self.max_rollout_admission_delay_s = _state_float(
             config.get("max_rollout_admission_delay_s"),
             self.max_rollout_admission_delay_s,
@@ -1535,6 +1552,9 @@ class ObjectiveScheduler:
             ),
             "scheduler/continuation/objective_accounted": (
                 1.0 if self.continuation_objective == "accounted" else 0.0
+            ),
+            "scheduler/control/train_objective_accounted": (
+                1.0 if self.control_train_objective == "accounted" else 0.0
             ),
             "scheduler/stale_batches": float(self._stale_batches),
             "scheduler/stale_trajectories": float(self._stale_trajectories),
@@ -2151,9 +2171,17 @@ class ObjectiveScheduler:
         self,
         groups: Sequence[TrajectoryGroup],
         *,
+        objective: float | None,
         arm_objectives: Mapping[str, float],
         arm_weights: Mapping[str, float],
     ) -> None:
+        if objective is not None:
+            self._credit_objective_to_controls(
+                groups,
+                objective,
+                stale_feedback=False,
+            )
+            return
         self._credit_train_objective_to_control_family(
             self._cadence_controls,
             groups,

@@ -1319,6 +1319,93 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0.0,
         )
 
+    def test_control_train_credit_uses_accounted_interval_objective_by_default(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=2,
+            min_policy_lag=0,
+            max_policy_lag=1,
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.0,
+        )
+        cheap = Trajectory(
+            scenario_id="cheap-control",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "cheap-control|token",
+                "scheduler/active_target_train_batch_groups": 1,
+                "scheduler/active_max_policy_lag": 0,
+            },
+        )
+        expensive = Trajectory(
+            scenario_id="expensive-control",
+            policy_step=1,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "expensive-control|token",
+                "scheduler/active_target_train_batch_groups": 2,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+
+        scheduler.observe_rollout(cheap, accepted=True, dollar_seconds=1.0)
+        scheduler.observe_train(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="cheap-control",
+                    trajectories=(cheap,),
+                )
+            ],
+            result=TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout(expensive, accepted=True, dollar_seconds=99.0)
+        scheduler.observe_train(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="expensive-control",
+                    trajectories=(expensive,),
+                )
+            ],
+            result=TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+
+        target = scheduler.target_train_batch_groups(
+            configured=2,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        lag = scheduler.max_policy_lag(
+            configured=1,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(target, 1)
+        self.assertEqual(lag, 0)
+        self.assertEqual(metrics["scheduler/control/train_objective_accounted"], 1.0)
+        self.assertGreater(
+            metrics["scheduler/control/cadence_1/objective_ema"],
+            metrics["scheduler/control/cadence_2/objective_ema"],
+        )
+        self.assertGreater(
+            metrics["scheduler/control/policy_lag_0/objective_ema"],
+            metrics["scheduler/control/policy_lag_1/objective_ema"],
+        )
+
     def test_stale_batch_feedback_penalizes_arms_and_controls(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,
@@ -2318,6 +2405,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.min_actor_count, 1)
         self.assertEqual(restored.max_actor_count_limit, 4)
         self.assertEqual(restored.continuation_objective, "accounted")
+        self.assertEqual(restored.control_train_objective, "accounted")
         self.assertEqual(restored.roi_patience, 3)
         for key in (
             "scheduler/arm/cheap_token/pulls",
@@ -2347,6 +2435,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/accounted_last_dollar_seconds",
             "scheduler/continuation_last_objective",
             "scheduler/continuation/objective_accounted",
+            "scheduler/control/train_objective_accounted",
             "scheduler/train_last_experience_count",
             "scheduler/train_last_reward_improving_experience",
             "scheduler/last_train_batch_policy_lag",
