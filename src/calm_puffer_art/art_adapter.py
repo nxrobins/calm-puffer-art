@@ -282,12 +282,14 @@ class AsyncArtBackend:
             capacity=self.config.train_queue_capacity,
             max_policy_lag=self.config.max_policy_lag,
         )
+        self._started_at = time.perf_counter()
         self._model: Any | None = None
         self._current_step = 0
         self._worker: asyncio.Task[None] | None = None
         self._closed = False
         self._submitted_batches = 0
         self._submitted_groups = 0
+        self._submitted_train_groups = 0
         self._completed_batches = 0
         self._failed_batches = 0
         self._stale_batches = 0
@@ -546,10 +548,12 @@ class AsyncArtBackend:
 
         if self.config.synchronous_fallback:
             future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            art_groups = list(trajectory_groups)
             self._submitted_batches += 1
+            self._submitted_train_groups += len(art_groups)
             try:
                 result = await _maybe_await(
-                    self.backend.train(model, list(trajectory_groups), **kwargs)
+                    self.backend.train(model, art_groups, **kwargs)
                 )
             except BaseException as exc:
                 self._failed_batches += 1
@@ -643,12 +647,17 @@ class AsyncArtBackend:
             await _maybe_await(delegate())
 
     def stats(self) -> dict[str, float]:
+        wall_s = max(time.perf_counter() - self._started_at, 1e-9)
         stats = self.ring.stats()
+        stats["art_backend/wall_clock_s"] = wall_s
         stats["art_backend/current_step"] = float(self._current_step)
         stats["art_backend/current_max_policy_lag"] = float(self.ring.max_policy_lag)
         stats["art_backend/closed"] = 1.0 if self._closed else 0.0
         stats["art_backend/submitted_batches"] = float(self._submitted_batches)
         stats["art_backend/submitted_groups"] = float(self._submitted_groups)
+        stats["art_backend/submitted_train_groups"] = float(
+            self._submitted_train_groups
+        )
         stats["art_backend/completed_batches"] = float(self._completed_batches)
         stats["art_backend/failed_batches"] = float(self._failed_batches)
         stats["art_backend/stale_batches"] = float(self._stale_batches)
@@ -664,6 +673,20 @@ class AsyncArtBackend:
         )
         stats["art_backend/sample_dollar_seconds"] = self._sample_dollar_seconds
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
+        stats["art_backend/submitted_batches_per_s"] = (
+            self._submitted_batches / wall_s
+        )
+        stats["art_backend/submitted_train_groups_per_s"] = (
+            self._submitted_train_groups / wall_s
+        )
+        stats["art_backend/completed_batches_per_s"] = (
+            self._completed_batches / wall_s
+        )
+        stats["art_backend/sample_dollar_seconds_per_s"] = (
+            self._sample_dollar_seconds / wall_s
+        )
+        if self.scheduler is not None:
+            stats.update(self.scheduler.metrics())
         if self.action_space is not None:
             stats.update(self.action_space.metrics())
         return stats
@@ -847,6 +870,7 @@ class AsyncArtBackend:
             on_discard=self._discard_submitted_batch,
         )
         self._submitted_batches += 1
+        self._submitted_train_groups += len(groups)
         self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
         await self.ring.put(batch)
 

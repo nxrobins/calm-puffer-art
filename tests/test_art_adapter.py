@@ -278,6 +278,15 @@ class ArtAdapterTests(unittest.TestCase):
         )
         self.assertEqual(stats["consumed_batches"], 1.0)
         self.assertEqual(stats["art_backend/current_step"], 1.0)
+        self.assertGreater(stats["art_backend/wall_clock_s"], 0.0)
+        self.assertEqual(stats["art_backend/submitted_train_groups"], 1.0)
+        self.assertGreater(stats["art_backend/submitted_train_groups_per_s"], 0.0)
+        self.assertGreater(stats["art_backend/completed_batches_per_s"], 0.0)
+        self.assertEqual(stats["scheduler/train_reward_ema"], 0.75)
+        self.assertEqual(
+            stats["scheduler/control/cadence_1/train_updates"],
+            1.0,
+        )
         self.assertEqual(metrics["scheduler/train_reward_ema"], 0.75)
         self.assertEqual(
             metrics["scheduler/control/cadence_1/train_updates"],

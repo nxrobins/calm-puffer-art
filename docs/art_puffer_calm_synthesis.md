@@ -64,6 +64,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
 - It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space/promotion control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - The ART bridge can also restore scheduler/action-space control state and the bridge policy step from a saved `PolicySnapshot`, `Checkpoint`, or checkpoint metadata before external rollout producers restart, so the async substrate does not relearn scheduler memory or action-bandwidth promotions after process resume.
+- The ART bridge exposes train-ring stats, wall-clock throughput, submitted train-group cadence, scheduler metrics, and action-space metrics through one `stats()` call, so external ART producers can audit the objective loop without depending on private scheduler state.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
 - It charges trainer wait for a ready batch into the train-objective denominator, so batch cadence pays for idle trainer time.
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
