@@ -195,7 +195,22 @@ await backend.register(art_model)
 result = await backend.train(art_model, art_groups)
 ```
 
-`AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `_get_step()`, and `close()` methods, enqueues converted ART groups through the same fixed-capacity stale-aware train ring, observes submitted ART trajectories as rollout/sample evidence, observes train results through the scheduler, updates an optional adaptive action space from scheduler feedback, and publishes checkpoint updates. The scheduler controls train-batch cadence and the active stale-policy lag limit before each ring consume. Submitted ART trajectories contribute explicit `cost/dollar_seconds`, `rollout/dollar_seconds`, queue-wait, and admission cost to scheduler rollout/accounted-cost telemetry, exposed as `art_backend/sample_dollar_seconds`, so externally produced rollout/API/tool spend is not treated as free. Trainer wait for a ready ART batch is added to the scheduler's train-objective denominator and exposed in backend stats. Stale ART batches fail waiting callers and report lost useful experience back to the scheduler as negative objective feedback. Published backend checkpoints include `scheduler/state` and, when supplied, `action_space/state`. The wrapper delegates the actual ART loss/checkpoint work to the supplied backend.
+`AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `_get_step()`, and `close()` methods, enqueues converted ART groups through the same fixed-capacity stale-aware train ring, lets external ART producers ask the scheduler for rollout/action-codec decisions, observes submitted ART trajectories as rollout/sample evidence, observes train results through the scheduler, updates an optional adaptive action space from scheduler feedback, and publishes checkpoint updates. The scheduler controls train-batch cadence and the active stale-policy lag limit before each ring consume. Submitted ART trajectories contribute explicit `cost/dollar_seconds`, `rollout/dollar_seconds`, queue-wait, and admission cost to scheduler rollout/accounted-cost telemetry, exposed as `art_backend/sample_dollar_seconds`, so externally produced rollout/API/tool spend is not treated as free. Trainer wait for a ready ART batch is added to the scheduler's train-objective denominator and exposed in backend stats. Stale ART batches fail waiting callers and report lost useful experience back to the scheduler as negative objective feedback. Published backend checkpoints include `scheduler/state` and, when supplied, `action_space/state`. The wrapper delegates the actual ART loss/checkpoint work to the supplied backend.
+
+For scheduler-chosen ART rollout work, ask the backend for a decision and merge the metadata into the ART trajectory you produce:
+
+```python
+from calm_puffer_art import Scenario, art_rollout_metadata
+
+decision = backend.select_rollout(
+    scenarios=[Scenario(id="math")],
+    actor_id=0,
+)
+trajectory_metadata = art_rollout_metadata(decision)
+# Put trajectory_metadata into the ART Trajectory metadata before submit_group().
+```
+
+When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
 
 For no-stop-the-world submission, use `submit_train()`:
 

@@ -10,12 +10,17 @@ from calm_puffer_art import (
     ArtBackendTrainer,
     AsyncArtBackend,
     AsyncArtBackendConfig,
+    ChunkActionCodec,
     ObjectiveScheduler,
     PolicySnapshot,
     SCHEDULER_STATE_KEY,
+    Scenario,
     StaleArtBatchError,
+    TokenActionCodec,
     TrajectoryGroup,
     WeightBroadcastChannel,
+    action_codec_key,
+    art_rollout_metadata,
     art_group_to_local,
     local_group_to_art,
     train_result_from_art,
@@ -358,6 +363,137 @@ class ArtAdapterTests(unittest.TestCase):
                 "semantic_bandwidth_tokens_per_decision"
             ],
             4.0,
+        )
+
+    def test_async_art_backend_selects_external_art_rollout_and_metadata(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=2,
+                    max_policy_lag=3,
+                ),
+            )
+            decision = async_backend.select_rollout(
+                scenarios=[Scenario(id="external-select")],
+                action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
+                actor_id=7,
+                trajectory_queue_pressure=0.25,
+            )
+            metadata = art_rollout_metadata(decision)
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta",
+                                )
+                            )
+                        ],
+                        reward=1.0,
+                        initial_policy_version=metadata[
+                            "art/initial_policy_version"
+                        ],
+                        metrics={"cost/dollar_seconds": 3.0},
+                        metadata=metadata,
+                    )
+                ],
+                metadata={"scenario_id": "external-select"},
+            )
+
+            await async_backend.register("art-model")
+            await async_backend.train("art-model", [art_group])
+            metrics = scheduler.metrics()
+            await async_backend.close()
+            return decision, metadata, metrics
+
+        decision, metadata, metrics = asyncio.run(run())
+
+        metric_arm = "scheduler/arm/external_select_token"
+        self.assertEqual(decision.arm_id, "external-select|token")
+        self.assertEqual(metadata["scheduler/arm_id"], decision.arm_id)
+        self.assertEqual(metadata["scheduler/scenario_id"], "external-select")
+        self.assertEqual(metadata["scheduler/action_codec"], "token")
+        self.assertEqual(metadata["actor_id"], 7)
+        self.assertEqual(metadata["scheduler/target_train_batch_groups"], 2)
+        self.assertEqual(metadata["scheduler/max_policy_lag"], 3)
+        self.assertEqual(metrics[f"{metric_arm}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{metric_arm}/pulls"], 1.0)
+        self.assertEqual(metrics[f"{metric_arm}/inflight"], 0.0)
+        self.assertEqual(
+            metrics[f"{metric_arm}/mean_rollout_dollar_seconds"],
+            3.0,
+        )
+
+    def test_async_art_backend_select_rollout_uses_promoted_action_space_codecs(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                action_space=action_space,
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta gamma delta",
+                                )
+                            )
+                        ],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={
+                            "scenario_id": "adapt",
+                            "scheduler/arm_id": "adapt|chunk(chunk_size=2)",
+                        },
+                    )
+                ],
+                metadata={"scenario_id": "adapt"},
+            )
+
+            await async_backend.register("art-model")
+            await async_backend.train("art-model", [art_group])
+            first = async_backend.select_rollout(
+                scenarios=[Scenario(id="adapt")],
+                actor_id=0,
+            )
+            second = async_backend.select_rollout(
+                scenarios=[Scenario(id="adapt")],
+                actor_id=1,
+            )
+            metrics = scheduler.metrics()
+            await async_backend.close()
+            return first, second, metrics, async_backend.stats()
+
+        first, second, metrics, stats = asyncio.run(run())
+
+        selected_codec_keys = {
+            action_codec_key(first.action_codec),
+            action_codec_key(second.action_codec),
+        }
+        self.assertIn("chunk(chunk_size=4)", selected_codec_keys)
+        self.assertEqual(
+            stats["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/adapt_chunk_chunk_size_4/decisions"],
+            1.0,
         )
 
     def test_async_art_backend_synchronous_fallback_calls_backend_directly(self):

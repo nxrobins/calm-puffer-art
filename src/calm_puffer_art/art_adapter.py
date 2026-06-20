@@ -11,6 +11,8 @@ from typing import Any, Awaitable, Iterable, Mapping, Sequence
 
 from .actions import (
     AdaptiveActionSpace,
+    ActionCodec,
+    action_codec_key,
     action_space_checkpoint_metadata,
 )
 from .runtime import (
@@ -21,6 +23,7 @@ from .runtime import (
 )
 from .scheduler import (
     AdaptiveScheduler,
+    SchedulerDecision,
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
 )
@@ -28,6 +31,7 @@ from .types import (
     ActionUnit,
     Message,
     PolicySnapshot,
+    Scenario,
     TrainResult,
     Trajectory,
     TrajectoryGroup,
@@ -301,6 +305,59 @@ class AsyncArtBackend:
             if parsed is not None:
                 self._current_step = parsed
         return self._current_step
+
+    def select_rollout(
+        self,
+        *,
+        scenarios: Sequence[Scenario],
+        action_codec: ActionCodec | None = None,
+        action_codecs: Sequence[ActionCodec] | None = None,
+        actor_id: int = 0,
+        trajectory_queue_pressure: float = 0.0,
+    ) -> SchedulerDecision:
+        """Choose scenario and action granularity for an external ART rollout.
+
+        ART rollout producers can call this before constructing a trajectory,
+        then attach :func:`art_rollout_metadata` to the produced ART trajectory
+        so submitted samples are credited to the chosen scheduler arm.
+        """
+
+        codecs = self._selectable_action_codecs(
+            action_codec=action_codec,
+            action_codecs=action_codecs,
+        )
+        if not scenarios:
+            raise ValueError("at least one scenario is required")
+        if self.scheduler is not None:
+            return self.scheduler.select_rollout(
+                scenarios=scenarios,
+                action_codecs=codecs,
+                actor_id=actor_id,
+                policy_step=self._current_step,
+                trajectory_queue_pressure=max(0.0, trajectory_queue_pressure),
+                train_queue_pressure=self._train_queue_pressure(),
+                configured_train_batch_groups=self.config.train_batch_groups,
+                configured_max_policy_lag=self.config.max_policy_lag,
+            )
+        scenario = scenarios[0]
+        codec = codecs[0]
+        return SchedulerDecision(
+            scenario=scenario,
+            action_codec=codec,
+            arm_id=f"{scenario.id}|{action_codec_key(codec)}",
+            target_train_batch_groups=self.config.train_batch_groups,
+            max_policy_lag=self.config.max_policy_lag,
+            metadata={
+                "actor_id": actor_id,
+                "policy_step": self._current_step,
+                "trajectory_queue_pressure": max(0.0, trajectory_queue_pressure),
+                "train_queue_pressure": self._train_queue_pressure(),
+                "score": 0.0,
+                "objective_score": 0.0,
+                "exploration_score": 0.0,
+                "coverage_forced": False,
+            },
+        )
 
     async def submit_train(
         self,
@@ -656,6 +713,32 @@ class AsyncArtBackend:
     def _train_queue_pressure(self) -> float:
         return min(1.0, self.ring.pending_batches / self.ring.capacity)
 
+    def _selectable_action_codecs(
+        self,
+        *,
+        action_codec: ActionCodec | None,
+        action_codecs: Sequence[ActionCodec] | None,
+    ) -> tuple[ActionCodec, ...]:
+        if (
+            self.action_space is not None
+            and action_codec is None
+            and action_codecs is None
+        ):
+            codecs = self.action_space.codecs
+        elif action_codecs is not None:
+            codecs = tuple(action_codecs)
+        elif action_codec is not None:
+            codecs = (action_codec,)
+        else:
+            codecs = ()
+        if self.action_space is not None:
+            for codec in codecs:
+                self.action_space.add_codec(codec)
+            codecs = self.action_space.codecs
+        if not codecs:
+            raise ValueError("at least one action codec is required")
+        return codecs
+
     @staticmethod
     def _batch_futures(batch: VersionedTrajectoryBatch) -> tuple[asyncio.Future[Any], ...]:
         futures = batch.metadata.get("art/result_futures")
@@ -731,6 +814,60 @@ def train_result_from_art(
         checkpoint_id=checkpoint_id,
         metadata=metadata,
     )
+
+
+def art_rollout_metadata(
+    decision: SchedulerDecision,
+    *,
+    actor_id: int | None = None,
+    policy_step: int | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return ART trajectory metadata that preserves a rollout decision.
+
+    The returned mapping is intentionally plain so it can be merged into ART's
+    own trajectory metadata without importing ART in this package.
+    """
+
+    decision_actor_id = actor_id
+    if decision_actor_id is None:
+        parsed_actor = _optional_int(decision.metadata.get("actor_id"))
+        decision_actor_id = parsed_actor
+    decision_policy_step = policy_step
+    if decision_policy_step is None:
+        parsed_step = _optional_int(decision.metadata.get("policy_step"))
+        decision_policy_step = parsed_step
+
+    metadata: dict[str, Any] = {
+        "scenario_id": decision.scenario.id,
+        "scheduler/arm_id": decision.arm_id,
+        "scheduler/scenario_id": decision.scenario.id,
+        "scheduler/action_codec": action_codec_key(decision.action_codec),
+        "scheduler/target_train_batch_groups": decision.target_train_batch_groups,
+        "scheduler/max_policy_lag": decision.max_policy_lag,
+    }
+    if decision_actor_id is not None:
+        metadata["actor_id"] = decision_actor_id
+    if decision_policy_step is not None:
+        metadata["scheduler/policy_step"] = decision_policy_step
+        metadata.setdefault("art/initial_policy_version", decision_policy_step)
+    for key in (
+        "score",
+        "objective_score",
+        "exploration_score",
+        "coverage_forced",
+        "coverage_target",
+        "coverage_share",
+        "coverage_deficit",
+    ):
+        value = decision.metadata.get(key)
+        if isinstance(value, bool):
+            metadata[f"scheduler/decision/{key}"] = value
+        elif isinstance(value, (int, float)) and isfinite(float(value)):
+            metadata[f"scheduler/decision/{key}"] = float(value)
+    if extra is not None:
+        metadata.update(extra)
+    return metadata
 
 
 def _messages_from_art(messages_and_choices: Sequence[Any]) -> list[Message]:
