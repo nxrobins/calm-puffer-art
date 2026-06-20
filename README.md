@@ -123,7 +123,7 @@ promotion_evaluator = RolloutPromotionEvaluator(
 )
 ```
 
-It runs the candidate policy through the same ART-style rollout contract before publication, scores quality-adjusted reward, records evaluation failures, action units, source tokens, duration, and dollar-seconds, and promotes only when the held-out score improves enough.
+It runs the candidate policy through the same ART-style rollout contract before publication, scores quality-adjusted reward, records evaluation failures, action units, source tokens, duration, and dollar-seconds, and promotes only when the held-out score improves enough. Held-out evaluation trajectories are also tagged with normal scheduler arm metadata and fed back through `observe_rollout()`, so eval successes, failures, action quality, and explicit `eval/dollar_seconds` costs can update future rollout/action choices.
 
 Use `ObjectiveScheduler.state_dict()` and `ObjectiveScheduler.load_state_dict()` to persist the controller's learned arm statistics, runtime-control credit, budget counters, configuration, and scalar last-decision metadata alongside ART checkpoints. `ControlPlane` and `AsyncArtBackend` attach that snapshot under `scheduler/state` after train feedback is observed and before the checkpoint update is published. The snapshot intentionally excludes live `Scenario` and `ActionCodec` objects, so resumed runs should reconstruct those from user code and reload only the scheduler's numeric control memory.
 

@@ -111,6 +111,7 @@ class PromotionDecision:
     dollar_seconds: float = 0.0
     reason: str = ""
     metrics: Mapping[str, float] = field(default_factory=dict)
+    trajectories: tuple[Trajectory, ...] = ()
 
 
 @dataclass(frozen=True)

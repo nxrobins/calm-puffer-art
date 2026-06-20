@@ -15,6 +15,7 @@ from .actions import (
     ACTION_SPACE_STATE_KEY,
     ActionCodec,
     AdaptiveActionSpace,
+    action_codec_key,
     action_space_checkpoint_metadata,
     semantic_bandwidth,
 )
@@ -163,14 +164,16 @@ class RolloutPromotionEvaluator:
         action_units = 0
         source_tokens = 0
         failures = 0
+        trajectories: list[Trajectory] = []
 
         for index, scenario in enumerate(self.scenarios):
             trajectory_started = time.perf_counter()
+            codec_key = action_codec_key(self.action_codec)
             context = RolloutContext(
                 actor_id=self.actor_id,
                 policy_step=current.step + 1,
                 action_codec=self.action_codec,
-                scheduler_arm_id=f"{scenario.id}|promotion_eval",
+                scheduler_arm_id=f"{scenario.id}|{codec_key}",
                 decision_metadata={
                     "promotion/eval": True,
                     "promotion/eval_index": index,
@@ -199,6 +202,12 @@ class RolloutPromotionEvaluator:
                     },
                 )
 
+            trajectory.metadata.setdefault("actor_id", self.actor_id)
+            trajectory.metadata.setdefault("promotion/eval", True)
+            trajectory.metadata.setdefault("promotion/eval_index", index)
+            trajectory.metadata.setdefault("scheduler/arm_id", context.scheduler_arm_id)
+            trajectory.metadata.setdefault("scheduler/scenario_id", scenario.id)
+            trajectory.metadata.setdefault("scheduler/action_codec", codec_key)
             quality = action_quality(trajectory)
             rewards.append(trajectory.reward * quality)
             action_units += trajectory.action_units
@@ -207,6 +216,7 @@ class RolloutPromotionEvaluator:
                 trajectory,
                 cost_per_second_usd=self.cost_per_second_usd,
             )
+            trajectories.append(trajectory)
 
         score = mean(rewards)
         baseline = self.best_score
@@ -237,6 +247,7 @@ class RolloutPromotionEvaluator:
                 "promotion/eval/duration_s": duration_s,
                 "promotion/eval/dollar_seconds": dollar_seconds,
             },
+            trajectories=tuple(trajectories),
         )
 
 
@@ -943,6 +954,11 @@ class ControlPlane:
                     result=result,
                     groups=batch.groups,
                 )
+                if scheduler is not None:
+                    self._observe_promotion_rollouts(
+                        scheduler=scheduler,
+                        promotion=promotion,
+                    )
                 result = _with_promotion_metadata(result, promotion)
                 telemetry.record_train(
                     batch.groups,
@@ -998,6 +1014,22 @@ class ControlPlane:
             + trajectory_queue.qsize(),
             pending_groups=len(ready_groups) + train_ring.pending_groups,
         )
+
+    def _observe_promotion_rollouts(
+        self,
+        *,
+        scheduler: AdaptiveScheduler,
+        promotion: PromotionDecision,
+    ) -> None:
+        for trajectory in promotion.trajectories:
+            scheduler.observe_rollout(
+                trajectory,
+                accepted=trajectory.exception is None,
+                dollar_seconds=_trajectory_eval_dollar_seconds(
+                    trajectory,
+                    cost_per_second_usd=self.config.cost_per_second_usd,
+                ),
+            )
 
     async def _evaluate_promotion(
         self,

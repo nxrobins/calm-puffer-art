@@ -137,6 +137,16 @@ async def counting_rollout(
     )
 
 
+async def costed_counting_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    trajectory = await counting_rollout(policy, scenario, context)
+    trajectory.metrics["eval/dollar_seconds"] = 2.0
+    return trajectory
+
+
 async def adaptive_rollout(
     policy: CountingPolicy,
     scenario: Scenario,
@@ -409,7 +419,7 @@ class RuntimeTests(unittest.TestCase):
                 weight_channel=channel,
                 promotion_evaluator=RolloutPromotionEvaluator(
                     scenarios=[Scenario(id="heldout", payload={"target": 2})],
-                    workflow=counting_rollout,
+                    workflow=costed_counting_rollout,
                     action_codec=TokenActionCodec(),
                     min_delta=0.75,
                     initial_score=0.0,
@@ -443,6 +453,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertGreater(
             summary.metrics["costs/promotion_eval_dollar_seconds"],
             0.0,
+        )
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 4.0)
+        self.assertEqual(summary.metrics["scheduler/arm/heldout_token/pulls"], 2.0)
+        self.assertEqual(summary.metrics["scheduler/arm/heldout_token/accepted"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldout_token/rollout_dollar_seconds"],
+            4.0,
         )
         self.assertEqual(
             summary.metrics["scheduler/train_last_reward_improvement"],
