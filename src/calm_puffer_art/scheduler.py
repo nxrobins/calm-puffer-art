@@ -127,9 +127,12 @@ class ArmStats:
     marginal_objective_ema: float = 0.0
     policy_improvement_objective_ema: float = 0.0
     dollar_seconds_ema: float = 0.0
+    last_train_reward: float = 0.0
+    last_train_reward_improvement: float = 0.0
     total_reward: float = 0.0
     total_effective_reward: float = 0.0
     total_positive_improvement: float = 0.0
+    total_reward_improving_experience: float = 0.0
     total_policy_improvement_objective: float = 0.0
     total_stale_penalty_objective: float = 0.0
     total_dollar_seconds: float = 0.0
@@ -464,17 +467,32 @@ class ObjectiveScheduler:
         )
         cost = max(dollar_seconds, 1e-12)
         self._train_dollar_seconds += cost
-        improvement = max(0.0, reward - self._last_train_reward)
-        experience_count = _useful_experience_count(groups)
-        reward_improving_experience = improvement * experience_count
-        objective = reward_improving_experience / cost
+        (
+            objective,
+            experience_count,
+            reward_improving_experience,
+            arm_objectives,
+            arm_weights,
+        ) = self._credit_train_objective_to_arms(
+            groups,
+            reward=reward,
+            cost=cost,
+        )
+        improvement = (
+            reward_improving_experience / experience_count
+            if experience_count > 0.0
+            else 0.0
+        )
         self._last_train_reward = reward
         self._last_train_objective = objective
         self._last_train_reward_improvement = improvement
         self._last_train_experience_count = experience_count
         self._last_train_reward_improving_experience = reward_improving_experience
-        self._credit_objective_to_arms(groups, objective, stale_feedback=False)
-        self._credit_objective_to_controls(groups, objective, stale_feedback=False)
+        self._credit_train_objective_to_controls(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
         if objective <= self.min_train_objective:
             self._low_roi_train_steps += 1
         else:
@@ -914,6 +932,10 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/policy_improvement_objective_ema"] = (
                 stats.policy_improvement_objective_ema
             )
+            metrics[f"{prefix}/last_train_reward"] = stats.last_train_reward
+            metrics[f"{prefix}/last_train_reward_improvement"] = (
+                stats.last_train_reward_improvement
+            )
             metrics[f"{prefix}/reward_efficiency_ema"] = stats.reward_efficiency_ema
             metrics[f"{prefix}/objective_score"] = self._arm_value(stats)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
@@ -950,6 +972,9 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/total_positive_improvement"] = (
                 stats.total_positive_improvement
+            )
+            metrics[f"{prefix}/total_reward_improving_experience"] = (
+                stats.total_reward_improving_experience
             )
             metrics[f"{prefix}/total_improvement_per_dollar_second"] = (
                 stats.total_positive_improvement / stats.total_dollar_seconds
@@ -1082,6 +1107,122 @@ class ObjectiveScheduler:
                 stats.policy_improvement_objective_ema,
                 credit,
                 _arm_feedback_updates(stats),
+            )
+
+    def _credit_train_objective_to_arms(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        reward: float,
+        cost: float,
+    ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
+        arm_weights = _arm_credit_weights(groups)
+        arm_experience = _arm_useful_experience(groups)
+        total_experience = sum(arm_experience.values())
+        total_reward_improving_experience = 0.0
+        arm_objectives: dict[str, float] = {}
+
+        for arm_id in arm_weights:
+            stats = self._arms.setdefault(arm_id, ArmStats())
+            experience = arm_experience.get(arm_id, 0.0)
+            improvement = (
+                max(0.0, reward - stats.last_train_reward)
+                if experience > 0.0
+                else 0.0
+            )
+            reward_improving_experience = improvement * experience
+            credit = reward_improving_experience / cost
+
+            stats.train_updates += 1
+            if experience > 0.0:
+                stats.last_train_reward = reward
+            stats.last_train_reward_improvement = improvement
+            stats.total_reward_improving_experience += (
+                reward_improving_experience
+            )
+            stats.total_policy_improvement_objective += credit
+            stats.policy_improvement_objective_ema = self._ema(
+                stats.policy_improvement_objective_ema,
+                credit,
+                _arm_feedback_updates(stats),
+            )
+            arm_objectives[arm_id] = credit
+            total_reward_improving_experience += reward_improving_experience
+
+        objective = total_reward_improving_experience / cost
+        return (
+            objective,
+            total_experience,
+            total_reward_improving_experience,
+            arm_objectives,
+            arm_weights,
+        )
+
+    def _credit_train_objective_to_controls(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        self._credit_train_objective_to_control_family(
+            self._cadence_controls,
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+            keys=(
+                "scheduler/active_target_train_batch_groups",
+                "scheduler/target_train_batch_groups",
+            ),
+        )
+        self._credit_train_objective_to_control_family(
+            self._lag_controls,
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+            keys=(
+                "scheduler/active_max_policy_lag",
+                "scheduler/max_policy_lag",
+            ),
+        )
+
+    def _credit_train_objective_to_control_family(
+        self,
+        controls: dict[int, ControlStats],
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+        keys: Sequence[str],
+    ) -> None:
+        value_credit: dict[int, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                value = _first_int_metadata(trajectory.metadata, keys)
+                if value is None:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                value_credit[value] = value_credit.get(value, 0.0) + credit
+
+        for value, credit in value_credit.items():
+            stats = controls.setdefault(value, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
             )
 
     def _credit_objective_to_controls(
@@ -1288,6 +1429,35 @@ def _dataclass_state(value: Any) -> dict[str, Any]:
     return {field.name: getattr(value, field.name) for field in fields(value)}
 
 
+def _arm_credit_weights(groups: Sequence[TrajectoryGroup]) -> dict[str, float]:
+    arm_weights: dict[str, float] = {}
+    for group in groups:
+        for trajectory in group.trajectories:
+            arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+            arm_weights.setdefault(arm_id, 0.0)
+            arm_weights[arm_id] += _trajectory_credit_weight(trajectory)
+    return arm_weights
+
+
+def _arm_useful_experience(groups: Sequence[TrajectoryGroup]) -> dict[str, float]:
+    arm_experience: dict[str, float] = {}
+    for group in groups:
+        for trajectory in group.trajectories:
+            quality = action_quality(trajectory)
+            if quality <= 0.0:
+                continue
+            arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+            arm_experience[arm_id] = arm_experience.get(arm_id, 0.0) + quality
+    return arm_experience
+
+
+def _trajectory_credit_weight(trajectory: Trajectory) -> float:
+    quality = action_quality(trajectory)
+    if quality <= 0.0:
+        return 0.0
+    return max(0.0, trajectory.reward * quality) or quality
+
+
 def _mapping_state(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -1340,6 +1510,14 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("dollar_seconds_ema"),
             default.dollar_seconds_ema,
         ),
+        last_train_reward=_state_float(
+            state.get("last_train_reward"),
+            default.last_train_reward,
+        ),
+        last_train_reward_improvement=_state_float(
+            state.get("last_train_reward_improvement"),
+            default.last_train_reward_improvement,
+        ),
         total_reward=_state_float(state.get("total_reward"), default.total_reward),
         total_effective_reward=_state_float(
             state.get("total_effective_reward"),
@@ -1348,6 +1526,10 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
         total_positive_improvement=_state_float(
             state.get("total_positive_improvement"),
             default.total_positive_improvement,
+        ),
+        total_reward_improving_experience=_state_float(
+            state.get("total_reward_improving_experience"),
+            default.total_reward_improving_experience,
         ),
         total_policy_improvement_objective=_state_float(
             state.get("total_policy_improvement_objective"),

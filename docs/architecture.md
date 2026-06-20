@@ -41,7 +41,7 @@ The trainer consumes the highest-priority non-stale batch from the ring and retu
 
 ## Closed-Loop Objective Scheduler
 
-`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories.
+`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories. Train credit is arm-baseline-aware: a batch only creates reward-improving experience for an arm when the train score improves over that arm's own previous train score, preventing alternating workflows from inheriting each other's baselines.
 
 The scheduler currently controls six things:
 

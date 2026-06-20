@@ -818,6 +818,84 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_train_credit_uses_arm_local_reward_baselines(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0, ema_alpha=1.0)
+        high = Trajectory(
+            scenario_id="high",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "high|token"},
+        )
+        low = Trajectory(
+            scenario_id="low",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "low|token"},
+        )
+
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="high", trajectories=(high,))],
+            result=TrainResult(metrics={"train/reward": 10.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="low", trajectories=(low,))],
+            result=TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+        low_metrics = scheduler.metrics()
+
+        self.assertEqual(low_metrics["scheduler/train_last_objective"], 1.0)
+        self.assertEqual(
+            low_metrics["scheduler/arm/low_token/last_train_reward_improvement"],
+            1.0,
+        )
+        self.assertEqual(
+            low_metrics[
+                "scheduler/arm/low_token/policy_improvement_objective_ema"
+            ],
+            1.0,
+        )
+
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="high", trajectories=(high,))],
+            result=TrainResult(metrics={"train/reward": 9.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=2,
+        )
+        high_metrics = scheduler.metrics()
+
+        self.assertEqual(high_metrics["scheduler/train_last_objective"], 0.0)
+        self.assertEqual(
+            high_metrics["scheduler/arm/high_token/last_train_reward"],
+            9.0,
+        )
+        self.assertEqual(
+            high_metrics["scheduler/arm/high_token/last_train_reward_improvement"],
+            0.0,
+        )
+        self.assertEqual(
+            high_metrics[
+                "scheduler/arm/high_token/policy_improvement_objective_ema"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            high_metrics[
+                "scheduler/arm/high_token/total_reward_improving_experience"
+            ],
+            10.0,
+        )
+
     def test_train_policy_improvement_credit_ignores_unsafe_actions(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         unsafe = Trajectory(
@@ -1019,6 +1097,8 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         for key in (
             "scheduler/arm/cheap_token/pulls",
             "scheduler/arm/cheap_token/policy_improvement_objective_ema",
+            "scheduler/arm/cheap_token/last_train_reward",
+            "scheduler/arm/cheap_token/total_reward_improving_experience",
             "scheduler/control/cadence_1/train_updates",
             "scheduler/control/policy_lag_0/train_updates",
             "scheduler/costs/rollout_dollar_seconds",
