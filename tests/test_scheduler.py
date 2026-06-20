@@ -1,6 +1,7 @@
 import unittest
 
 from calm_puffer_art import (
+    ActionUnit,
     ChunkActionCodec,
     ObjectiveScheduler,
     Scenario,
@@ -991,6 +992,138 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics[f"scheduler/control/actor_count_{second_count}/score"],
         )
 
+    def test_actor_slots_track_rollout_cost_and_objective(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="actors")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=2,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        metrics_after_decision = scheduler.metrics()
+
+        self.assertEqual(
+            metrics_after_decision["scheduler/actor/actor_2/decisions"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics_after_decision["scheduler/actor/actor_2/inflight"],
+            1.0,
+        )
+
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="actors",
+                policy_step=0,
+                messages=[],
+                actions=[
+                    ActionUnit(
+                        kind="token",
+                        payload="alpha",
+                        token_count=3,
+                    )
+                ],
+                reward=2.0,
+                metadata={
+                    "actor_id": 2,
+                    "scheduler/arm_id": decision.arm_id,
+                    "cost/actor_admission_dollar_seconds": 0.25,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+            queue_wait_dollar_seconds=0.5,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/actor/actor_2/inflight"], 0.0)
+        self.assertEqual(metrics["scheduler/actor/actor_2/pulls"], 1.0)
+        self.assertEqual(metrics["scheduler/actor/actor_2/accepted"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/actor/actor_2/sample_dollar_seconds"],
+            1.75,
+        )
+        self.assertEqual(
+            metrics["scheduler/actor/actor_2/queue_wait_dollar_seconds"],
+            0.5,
+        )
+        self.assertEqual(
+            metrics["scheduler/actor/actor_2/admission_dollar_seconds"],
+            0.25,
+        )
+        self.assertEqual(metrics["scheduler/actor/actor_2/action_units"], 1.0)
+        self.assertEqual(metrics["scheduler/actor/actor_2/source_tokens"], 3.0)
+        self.assertGreater(
+            metrics["scheduler/actor/actor_2/rollout_objective_ema"],
+            0.0,
+        )
+
+    def test_actor_slots_receive_train_and_stale_objective_credit(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0, ema_alpha=1.0)
+        actor_0 = Trajectory(
+            scenario_id="actors",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=2.0,
+            metadata={
+                "actor_id": 0,
+                "scheduler/arm_id": "actors|token",
+                "scheduler/active_actor_count": 2,
+            },
+        )
+        actor_1 = Trajectory(
+            scenario_id="actors",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "actor_id": 1,
+                "scheduler/arm_id": "actors|token",
+                "scheduler/active_actor_count": 2,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="actors",
+            trajectories=(actor_0, actor_1),
+        )
+
+        scheduler.observe_train(
+            groups=[group],
+            result=TrainResult(metrics={"train/reward": 3.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+        scheduler.observe_stale_batch(
+            groups=[group],
+            policy_step=2,
+            reason="actor-test",
+        )
+        metrics = scheduler.metrics()
+
+        self.assertGreater(
+            metrics["scheduler/actor/actor_0/total_train_objective"],
+            metrics["scheduler/actor/actor_1/total_train_objective"],
+        )
+        self.assertEqual(metrics["scheduler/actor/actor_0/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/actor/actor_1/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/actor/actor_0/stale_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/actor/actor_1/stale_updates"], 1.0)
+        self.assertLess(
+            metrics["scheduler/actor/actor_0/total_stale_penalty_objective"],
+            0.0,
+        )
+        self.assertGreater(
+            metrics["scheduler/actor/actor_0/stale_experience"],
+            metrics["scheduler/actor/actor_1/stale_experience"],
+        )
+
     def test_actor_count_control_backs_off_saturated_low_signal_sampling(self):
         scheduler = ObjectiveScheduler(
             min_actor_count=1,
@@ -1495,6 +1628,63 @@ class ObjectiveSchedulerTests(unittest.TestCase):
 
         self.assertGreater(safe_score, unsafe_score)
 
+    def test_train_group_scoring_penalizes_current_unsafe_batch_from_good_arm(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0, unsafe_penalty=5.0)
+        good_history = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=2.0,
+            metadata={"scheduler/arm_id": "task|token"},
+        )
+        safe_current = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=2.0,
+            metadata={"scheduler/arm_id": "task|token"},
+        )
+        unsafe_current = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=2.0,
+            metadata={
+                "scheduler/arm_id": "task|token",
+                "verifier/passed": False,
+            },
+        )
+
+        scheduler.observe_rollout(
+            good_history,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        safe_score = scheduler.score_train_groups(
+            [
+                TrajectoryGroup(
+                    scenario_id="task",
+                    trajectories=(safe_current,),
+                )
+            ],
+            policy_step=0,
+        )
+        unsafe_score = scheduler.score_train_groups(
+            [
+                TrajectoryGroup(
+                    scenario_id="task",
+                    trajectories=(unsafe_current,),
+                )
+            ],
+            policy_step=0,
+        )
+
+        self.assertGreater(safe_score, 0.0)
+        self.assertLess(unsafe_score, 0.0)
+
     def test_train_policy_improvement_credit_can_override_rollout_reward(self):
         scenarios = [Scenario(id="sample"), Scenario(id="train")]
         codecs = [TokenActionCodec()]
@@ -1566,6 +1756,145 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             scheduler.metrics()["scheduler/costs/train_dollar_seconds"],
             1.0,
         )
+
+    def test_rollout_coverage_floor_forces_undercovered_arm(self):
+        scenarios = [Scenario(id="task")]
+        codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_rollout_coverage_fraction=0.25,
+        )
+
+        rewards = {
+            "task|token": 1.0,
+            "task|chunk(chunk_size=2)": 0.1,
+        }
+        decisions = []
+        for _ in range(6):
+            decision = scheduler.select_rollout(
+                scenarios=scenarios,
+                action_codecs=codecs,
+                actor_id=0,
+                policy_step=0,
+                trajectory_queue_pressure=0.0,
+                train_queue_pressure=0.0,
+                configured_train_batch_groups=2,
+                configured_max_policy_lag=2,
+            )
+            decisions.append(decision)
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=decision.scenario.id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=rewards[decision.arm_id],
+                    metadata={"scheduler/arm_id": decision.arm_id},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+
+        metrics = scheduler.metrics()
+
+        self.assertEqual(
+            [decision.arm_id for decision in decisions],
+            [
+                "task|token",
+                "task|chunk(chunk_size=2)",
+                "task|token",
+                "task|token",
+                "task|token",
+                "task|chunk(chunk_size=2)",
+            ],
+        )
+        self.assertTrue(decisions[-1].metadata["coverage_forced"])
+        self.assertEqual(metrics["scheduler/coverage/min_fraction"], 0.25)
+        self.assertEqual(metrics["scheduler/coverage/forced_decisions"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/coverage/last_target"],
+            0.25,
+        )
+        self.assertLess(
+            metrics[
+                "scheduler/arm/task_chunk_chunk_size_2/decision_share"
+            ],
+            metrics["scheduler/arm/task_token/decision_share"],
+        )
+
+    def test_rollout_coverage_floor_is_capped_by_arm_count(self):
+        scenarios = [Scenario(id="left"), Scenario(id="right")]
+        codecs = [TokenActionCodec()]
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_rollout_coverage_fraction=0.8,
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+
+        self.assertEqual(decision.metadata["coverage_target"], 0.5)
+
+    def test_rollout_coverage_floor_preserves_new_arm_exploration(self):
+        scenarios = [Scenario(id="task")]
+        codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_rollout_coverage_fraction=0.25,
+        )
+
+        for _ in range(2):
+            decision = scheduler.select_rollout(
+                scenarios=scenarios,
+                action_codecs=codecs,
+                actor_id=0,
+                policy_step=0,
+                trajectory_queue_pressure=0.0,
+                train_queue_pressure=0.0,
+                configured_train_batch_groups=1,
+                configured_max_policy_lag=1,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=decision.scenario.id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": decision.arm_id},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+
+        new_arm_decision = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=[
+                TokenActionCodec(),
+                ChunkActionCodec(chunk_size=2),
+                ChunkActionCodec(chunk_size=4),
+            ],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+
+        self.assertEqual(
+            new_arm_decision.arm_id,
+            "task|chunk(chunk_size=4)",
+        )
+        self.assertFalse(new_arm_decision.metadata["coverage_forced"])
 
     def test_train_credit_uses_arm_local_reward_baselines(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0, ema_alpha=1.0)
@@ -1860,6 +2189,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             confidence_penalty_weight=0.25,
             control_exploration_bonus=0.15,
             max_control_candidate_values=5,
+            min_rollout_coverage_fraction=0.2,
             roi_patience=3,
             min_train_objective=0.01,
             continuation_objective="accounted",
@@ -1871,6 +2201,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             actions=[],
             reward=2.0,
             metadata={
+                "actor_id": 7,
                 "scheduler/arm_id": "cheap|token",
                 "scheduler/active_target_train_batch_groups": 1,
                 "scheduler/active_max_policy_lag": 0,
@@ -1919,6 +2250,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.confidence_penalty_weight, 0.25)
         self.assertEqual(restored.control_exploration_bonus, 0.15)
         self.assertEqual(restored.max_control_candidate_values, 5)
+        self.assertEqual(restored.min_rollout_coverage_fraction, 0.2)
         self.assertEqual(restored.min_actor_count, 1)
         self.assertEqual(restored.max_actor_count_limit, 4)
         self.assertEqual(restored.continuation_objective, "accounted")
@@ -1932,6 +2264,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/arm/cheap_token/confidence_penalty",
             "scheduler/arm/cheap_token/last_train_reward",
             "scheduler/arm/cheap_token/total_reward_improving_experience",
+            "scheduler/actor/actor_7/pulls",
+            "scheduler/actor/actor_7/train_updates",
+            "scheduler/actor/actor_7/rollout_objective_ema",
+            "scheduler/actor/actor_7/train_objective_ema",
+            "scheduler/actor/actor_7/total_objective",
             "scheduler/control/cadence_1/train_updates",
             "scheduler/control/cadence_1/score",
             "scheduler/control/cadence_1/exploration_score",
@@ -1956,6 +2293,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",
             "scheduler/weights/control_exploration",
+            "scheduler/coverage/min_fraction",
+            "scheduler/coverage/forced_decisions",
+            "scheduler/coverage/last_target",
+            "scheduler/coverage/last_share",
+            "scheduler/coverage/last_deficit",
             "scheduler/max_control_candidate_values",
         ):
             self.assertAlmostEqual(restored_metrics[key], before_metrics[key])

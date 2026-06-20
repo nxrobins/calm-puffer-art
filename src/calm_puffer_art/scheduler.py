@@ -190,6 +190,34 @@ class ControlStats:
     stale_experience: float = 0.0
 
 
+@dataclass
+class ActorStats:
+    decisions: int = 0
+    inflight: int = 0
+    pulls: int = 0
+    accepted: int = 0
+    unsafe: int = 0
+    failed_rollouts: int = 0
+    train_updates: int = 0
+    stale_updates: int = 0
+    stale_batches: int = 0
+    stale_trajectories: int = 0
+    objective_ema: float = 0.0
+    rollout_objective_ema: float = 0.0
+    train_objective_ema: float = 0.0
+    total_objective: float = 0.0
+    total_rollout_objective: float = 0.0
+    total_train_objective: float = 0.0
+    total_stale_penalty_objective: float = 0.0
+    total_dollar_seconds: float = 0.0
+    rollout_dollar_seconds: float = 0.0
+    queue_wait_dollar_seconds: float = 0.0
+    admission_dollar_seconds: float = 0.0
+    stale_experience: float = 0.0
+    action_units: int = 0
+    source_tokens: int = 0
+
+
 class ObjectiveScheduler:
     """Bandit-style scheduler for reward improvement per dollar-second.
 
@@ -221,6 +249,7 @@ class ObjectiveScheduler:
         confidence_penalty_weight: float = 0.0,
         control_exploration_bonus: float = 0.1,
         max_control_candidate_values: int = 8,
+        min_rollout_coverage_fraction: float = 0.0,
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
@@ -260,6 +289,10 @@ class ObjectiveScheduler:
             raise ValueError("control_exploration_bonus must be non-negative")
         if max_control_candidate_values <= 0:
             raise ValueError("max_control_candidate_values must be positive")
+        if not 0 <= min_rollout_coverage_fraction <= 1:
+            raise ValueError(
+                "min_rollout_coverage_fraction must be in [0, 1]"
+            )
         if min_train_steps < 0:
             raise ValueError("min_train_steps must be non-negative")
         if roi_patience is not None and roi_patience <= 0:
@@ -296,6 +329,7 @@ class ObjectiveScheduler:
         self.confidence_penalty_weight = confidence_penalty_weight
         self.control_exploration_bonus = control_exploration_bonus
         self.max_control_candidate_values = max_control_candidate_values
+        self.min_rollout_coverage_fraction = min_rollout_coverage_fraction
         self.min_train_steps = min_train_steps
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
@@ -332,6 +366,10 @@ class ObjectiveScheduler:
         self._last_stale_reason = ""
         self._last_decision: SchedulerDecision | None = None
         self._last_decision_snapshot: dict[str, Any] | None = None
+        self._coverage_forced_decisions = 0
+        self._last_rollout_coverage_target = 0.0
+        self._last_rollout_coverage_share = 0.0
+        self._last_rollout_coverage_deficit = 0.0
         self._last_train_batch_priority = 0.0
         self._last_train_batch_policy_lag = 0
         self._last_train_batch_lag_limit = -1
@@ -355,6 +393,7 @@ class ObjectiveScheduler:
         self._lag_controls: dict[int, ControlStats] = {}
         self._admission_controls: dict[int, ControlStats] = {}
         self._actor_count_controls: dict[int, ControlStats] = {}
+        self._actors: dict[int, ActorStats] = {}
 
     def select_rollout(
         self,
@@ -374,12 +413,38 @@ class ObjectiveScheduler:
             raise ValueError("at least one action codec is required")
 
         arms = self._arm_candidates(scenarios, action_codecs)
-        arm_id, scenario, codec = max(arms, key=lambda arm: self._score_arm(arm[0]))
+        coverage_selection = self._coverage_candidate(arms)
+        if coverage_selection is None:
+            arm_id, scenario, codec = max(
+                arms,
+                key=lambda arm: self._score_arm(arm[0]),
+            )
+            coverage_forced = False
+            coverage_target = self._effective_coverage_target(len(arms))
+            coverage_share = self._arm_decision_share(arm_id)
+            coverage_deficit = max(0.0, coverage_target - coverage_share)
+        else:
+            (
+                arm_id,
+                scenario,
+                codec,
+                coverage_target,
+                coverage_share,
+                coverage_deficit,
+            ) = coverage_selection
+            coverage_forced = True
+            self._coverage_forced_decisions += 1
         selected_stats = self._arms[arm_id]
         decision_score = self._score_arm(arm_id)
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
         self._record_arm_decision(selected_stats)
+        actor_stats = self._actors.setdefault(actor_id, ActorStats())
+        actor_stats.decisions += 1
+        actor_stats.inflight += 1
+        self._last_rollout_coverage_target = coverage_target
+        self._last_rollout_coverage_share = coverage_share
+        self._last_rollout_coverage_deficit = coverage_deficit
         decision = SchedulerDecision(
             scenario=scenario,
             action_codec=codec,
@@ -404,6 +469,10 @@ class ObjectiveScheduler:
                 "objective_score": objective_score,
                 "exploration_score": exploration_score,
                 "inflight_rollouts": selected_stats.inflight,
+                "coverage_forced": coverage_forced,
+                "coverage_target": coverage_target,
+                "coverage_share": coverage_share,
+                "coverage_deficit": coverage_deficit,
                 "expected_rollout_dollar_seconds": (
                     selected_stats.dollar_seconds_ema
                     if selected_stats.pulls
@@ -608,6 +677,16 @@ class ObjectiveScheduler:
             trajectory,
             marginal_objective,
         )
+        self._credit_rollout_objective_to_actor(
+            trajectory,
+            marginal_objective,
+            accepted=accepted,
+            rollout_cost=rollout_cost,
+            queue_wait_cost=queue_wait_cost,
+            admission_cost=admission_cost,
+            quality=quality,
+            failure_modes=failure_modes,
+        )
         self._global_objective_ema = self._ema(
             self._global_objective_ema,
             marginal_objective,
@@ -736,6 +815,11 @@ class ObjectiveScheduler:
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
+        self._credit_train_objective_to_actors(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
         if continuation_objective <= self.min_train_objective:
             self._low_roi_train_steps += 1
         else:
@@ -794,6 +878,12 @@ class ObjectiveScheduler:
             stale_feedback=True,
             stale_experience=stale_experience,
         )
+        self._credit_objective_to_actors(
+            groups,
+            penalty_objective,
+            stale_feedback=True,
+            stale_experience=stale_experience,
+        )
 
     def score_train_groups(
         self,
@@ -810,13 +900,15 @@ class ObjectiveScheduler:
             for trajectory in group.trajectories:
                 arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
                 stats = self._arms.get(arm_id)
+                quality = action_quality(trajectory)
                 if stats is None or stats.accepted == 0:
-                    arm_values.append(
-                        max(0.0, trajectory.reward)
-                        * action_quality(trajectory)
-                    )
+                    arm_values.append(max(0.0, trajectory.reward) * quality)
                 else:
-                    arm_values.append(self._arm_value(stats))
+                    arm_value = self._arm_value(stats)
+                    if quality <= 0.0:
+                        arm_values.append(min(arm_value, -self.unsafe_penalty))
+                    else:
+                        arm_values.append(arm_value * quality)
         raw_reward_component = max(
             0.0,
             mean(
@@ -899,6 +991,9 @@ class ObjectiveScheduler:
                 "max_control_candidate_values": (
                     self.max_control_candidate_values
                 ),
+                "min_rollout_coverage_fraction": (
+                    self.min_rollout_coverage_fraction
+                ),
                 "min_train_steps": self.min_train_steps,
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
@@ -961,6 +1056,14 @@ class ObjectiveScheduler:
                 "last_train_batch_staleness_bonus": (
                     self._last_train_batch_staleness_bonus
                 ),
+                "coverage_forced_decisions": self._coverage_forced_decisions,
+                "last_rollout_coverage_target": (
+                    self._last_rollout_coverage_target
+                ),
+                "last_rollout_coverage_share": self._last_rollout_coverage_share,
+                "last_rollout_coverage_deficit": (
+                    self._last_rollout_coverage_deficit
+                ),
                 "global_action_quality_ema": self._global_action_quality_ema,
                 "low_roi_train_steps": self._low_roi_train_steps,
                 "stop_recommended": self._stop_recommended,
@@ -1003,6 +1106,10 @@ class ObjectiveScheduler:
             "actor_count_controls": {
                 str(value): _dataclass_state(stats)
                 for value, stats in self._actor_count_controls.items()
+            },
+            "actors": {
+                str(actor_id): _actor_stats_state(stats)
+                for actor_id, stats in self._actors.items()
             },
             "last_decision": (
                 dict(self._last_decision_snapshot)
@@ -1106,6 +1213,16 @@ class ObjectiveScheduler:
                 self.max_control_candidate_values,
             ),
         )
+        self.min_rollout_coverage_fraction = min(
+            1.0,
+            max(
+                0.0,
+                _state_float(
+                    config.get("min_rollout_coverage_fraction"),
+                    self.min_rollout_coverage_fraction,
+                ),
+            ),
+        )
         self.min_train_steps = _state_int(
             config.get("min_train_steps"),
             self.min_train_steps,
@@ -1174,6 +1291,7 @@ class ObjectiveScheduler:
         self._actor_count_controls = _control_family_from_state(
             state.get("actor_count_controls")
         )
+        self._actors = _actor_family_from_state(state.get("actors"))
 
         learning_state = _mapping_state(state.get("learning_state"))
         total_pulls_default = sum(stats.pulls for stats in self._arms.values())
@@ -1284,6 +1402,22 @@ class ObjectiveScheduler:
         self._last_train_batch_staleness_bonus = _state_float(
             learning_state.get("last_train_batch_staleness_bonus"),
             self._last_train_batch_staleness_bonus,
+        )
+        self._coverage_forced_decisions = _state_int(
+            learning_state.get("coverage_forced_decisions"),
+            self._coverage_forced_decisions,
+        )
+        self._last_rollout_coverage_target = _state_float(
+            learning_state.get("last_rollout_coverage_target"),
+            self._last_rollout_coverage_target,
+        )
+        self._last_rollout_coverage_share = _state_float(
+            learning_state.get("last_rollout_coverage_share"),
+            self._last_rollout_coverage_share,
+        )
+        self._last_rollout_coverage_deficit = _state_float(
+            learning_state.get("last_rollout_coverage_deficit"),
+            self._last_rollout_coverage_deficit,
         )
         self._global_action_quality_ema = _state_float(
             learning_state.get("global_action_quality_ema"),
@@ -1430,6 +1564,19 @@ class ObjectiveScheduler:
             "scheduler/weights/control_exploration": (
                 self.control_exploration_bonus
             ),
+            "scheduler/coverage/min_fraction": (
+                self.min_rollout_coverage_fraction
+            ),
+            "scheduler/coverage/forced_decisions": float(
+                self._coverage_forced_decisions
+            ),
+            "scheduler/coverage/last_target": (
+                self._last_rollout_coverage_target
+            ),
+            "scheduler/coverage/last_share": self._last_rollout_coverage_share,
+            "scheduler/coverage/last_deficit": (
+                self._last_rollout_coverage_deficit
+            ),
             "scheduler/max_control_candidate_values": float(
                 self.max_control_candidate_values
             ),
@@ -1484,6 +1631,9 @@ class ObjectiveScheduler:
         for arm_id, stats in self._arms.items():
             prefix = f"scheduler/arm/{_safe_metric_key(arm_id)}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/decision_share"] = self._arm_decision_share(
+                arm_id
+            )
             metrics[f"{prefix}/inflight"] = float(stats.inflight)
             metrics[f"{prefix}/pulls"] = float(stats.pulls)
             metrics[f"{prefix}/accepted"] = float(stats.accepted)
@@ -1597,6 +1747,73 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/total_stale_penalty_objective"] = (
                 stats.total_stale_penalty_objective
             )
+        for actor_id, stats in sorted(self._actors.items()):
+            prefix = f"scheduler/actor/{_actor_metric_key(actor_id)}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/inflight"] = float(stats.inflight)
+            metrics[f"{prefix}/pulls"] = float(stats.pulls)
+            metrics[f"{prefix}/accepted"] = float(stats.accepted)
+            metrics[f"{prefix}/unsafe"] = float(stats.unsafe)
+            metrics[f"{prefix}/unsafe_rate"] = (
+                stats.unsafe / stats.pulls if stats.pulls else 0.0
+            )
+            metrics[f"{prefix}/failure_rollouts"] = float(stats.failed_rollouts)
+            metrics[f"{prefix}/failure_rate"] = (
+                stats.failed_rollouts / stats.pulls if stats.pulls else 0.0
+            )
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(
+                _actor_feedback_updates(stats)
+            )
+            metrics[f"{prefix}/stale_batches"] = float(stats.stale_batches)
+            metrics[f"{prefix}/stale_trajectories"] = float(
+                stats.stale_trajectories
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/rollout_objective_ema"] = (
+                stats.rollout_objective_ema
+            )
+            metrics[f"{prefix}/train_objective_ema"] = stats.train_objective_ema
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_rollout_objective"] = (
+                stats.total_rollout_objective
+            )
+            metrics[f"{prefix}/total_train_objective"] = (
+                stats.total_train_objective
+            )
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/sample_dollar_seconds"] = stats.total_dollar_seconds
+            metrics[f"{prefix}/rollout_dollar_seconds"] = stats.rollout_dollar_seconds
+            metrics[f"{prefix}/queue_wait_dollar_seconds"] = (
+                stats.queue_wait_dollar_seconds
+            )
+            metrics[f"{prefix}/admission_dollar_seconds"] = (
+                stats.admission_dollar_seconds
+            )
+            metrics[f"{prefix}/mean_sample_dollar_seconds"] = (
+                stats.total_dollar_seconds / stats.pulls if stats.pulls else 0.0
+            )
+            metrics[f"{prefix}/mean_queue_wait_dollar_seconds"] = (
+                stats.queue_wait_dollar_seconds / stats.pulls
+                if stats.pulls
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_admission_dollar_seconds"] = (
+                stats.admission_dollar_seconds / stats.pulls
+                if stats.pulls
+                else 0.0
+            )
+            metrics[f"{prefix}/action_units"] = float(stats.action_units)
+            metrics[f"{prefix}/source_tokens"] = float(stats.source_tokens)
+            metrics[f"{prefix}/semantic_bandwidth_tokens_per_decision"] = (
+                stats.source_tokens / stats.action_units
+                if stats.action_units
+                else 0.0
+            )
         for value, stats in sorted(self._cadence_controls.items()):
             prefix = f"scheduler/control/cadence_{value}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
@@ -1703,6 +1920,58 @@ class ObjectiveScheduler:
             for scenario in scenarios
             for codec in action_codecs
         ]
+
+    def _coverage_candidate(
+        self,
+        arms: Sequence[tuple[str, Scenario, ActionCodec]],
+    ) -> tuple[str, Scenario, ActionCodec, float, float, float] | None:
+        if self.min_rollout_coverage_fraction <= 0.0 or not arms:
+            return None
+        if self._total_decisions < len(arms):
+            return None
+        for arm_id, _, _ in arms:
+            stats = self._arms.get(arm_id)
+            if stats is None or stats.decisions == 0:
+                return None
+        target = self._effective_coverage_target(len(arms))
+        if target <= 0.0:
+            return None
+
+        most_undercovered: (
+            tuple[str, Scenario, ActionCodec, float, float, float] | None
+        ) = None
+        for arm_id, scenario, codec in arms:
+            self._arms.setdefault(arm_id, ArmStats())
+            share = self._arm_decision_share(arm_id)
+            deficit = target - share
+            if deficit <= 0.0:
+                continue
+            candidate = (arm_id, scenario, codec, target, share, deficit)
+            if most_undercovered is None:
+                most_undercovered = candidate
+                continue
+            if deficit > most_undercovered[5]:
+                most_undercovered = candidate
+                continue
+            if (
+                math.isclose(deficit, most_undercovered[5])
+                and self._score_arm(arm_id) > self._score_arm(most_undercovered[0])
+            ):
+                most_undercovered = candidate
+        return most_undercovered
+
+    def _effective_coverage_target(self, arm_count: int) -> float:
+        if arm_count <= 0:
+            return 0.0
+        return min(self.min_rollout_coverage_fraction, 1.0 / arm_count)
+
+    def _arm_decision_share(self, arm_id: str) -> float:
+        if self._total_decisions <= 0:
+            return 0.0
+        stats = self._arms.get(arm_id)
+        if stats is None:
+            return 0.0
+        return stats.decisions / self._total_decisions
 
     def _score_arm(self, arm_id: str) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
@@ -1955,6 +2224,49 @@ class ObjectiveScheduler:
                 _control_feedback_updates(stats),
             )
 
+    def _credit_train_objective_to_actors(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        actor_credit: dict[int, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                actor_id = _trajectory_actor_id(trajectory)
+                if actor_id is None:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                actor_credit[actor_id] = actor_credit.get(actor_id, 0.0) + credit
+
+        for actor_id, credit in actor_credit.items():
+            stats = self._actors.setdefault(actor_id, ActorStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.total_train_objective += credit
+            stats.train_objective_ema = self._ema(
+                stats.train_objective_ema,
+                credit,
+                stats.train_updates,
+            )
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _actor_feedback_updates(stats),
+            )
+
     def _credit_objective_to_controls(
         self,
         groups: Sequence[TrajectoryGroup],
@@ -2097,6 +2409,101 @@ class ObjectiveScheduler:
                 stats.objective_ema,
                 credit,
                 _control_feedback_updates(stats),
+            )
+
+    def _credit_rollout_objective_to_actor(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+        *,
+        accepted: bool,
+        rollout_cost: float,
+        queue_wait_cost: float,
+        admission_cost: float,
+        quality: float,
+        failure_modes: Sequence[str],
+    ) -> None:
+        actor_id = _trajectory_actor_id(trajectory)
+        if actor_id is None:
+            return
+        stats = self._actors.setdefault(actor_id, ActorStats())
+        if stats.inflight > 0:
+            stats.inflight -= 1
+        stats.pulls += 1
+        if accepted:
+            stats.accepted += 1
+        if quality <= 0.0:
+            stats.unsafe += 1
+        if failure_modes:
+            stats.failed_rollouts += 1
+        stats.total_objective += objective
+        stats.total_rollout_objective += objective
+        stats.total_dollar_seconds += rollout_cost + queue_wait_cost + admission_cost
+        stats.rollout_dollar_seconds += rollout_cost
+        stats.queue_wait_dollar_seconds += queue_wait_cost
+        stats.admission_dollar_seconds += admission_cost
+        stats.action_units += trajectory.action_units
+        stats.source_tokens += trajectory.token_count
+        stats.rollout_objective_ema = self._ema(
+            stats.rollout_objective_ema,
+            objective,
+            stats.pulls,
+        )
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _actor_feedback_updates(stats),
+        )
+
+    def _credit_objective_to_actors(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        objective: float,
+        *,
+        stale_feedback: bool,
+        stale_experience: float,
+    ) -> None:
+        actor_weights: dict[int, float] = {}
+        actor_trajectories: dict[int, int] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                actor_id = _trajectory_actor_id(trajectory)
+                if actor_id is None:
+                    continue
+                weight = _trajectory_credit_weight(trajectory)
+                actor_weights[actor_id] = actor_weights.get(actor_id, 0.0) + weight
+                actor_trajectories[actor_id] = (
+                    actor_trajectories.get(actor_id, 0) + 1
+                )
+
+        total_weight = sum(actor_weights.values())
+        for actor_id, weight in actor_weights.items():
+            stats = self._actors.setdefault(actor_id, ActorStats())
+            credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
+            stale_credit = (
+                stale_experience * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
+            if stale_feedback:
+                stats.stale_updates += 1
+                stats.stale_batches += 1
+                stats.stale_trajectories += actor_trajectories.get(actor_id, 0)
+                stats.stale_experience += stale_credit
+                stats.total_stale_penalty_objective += credit
+            else:
+                stats.train_updates += 1
+                stats.total_train_objective += credit
+                stats.train_objective_ema = self._ema(
+                    stats.train_objective_ema,
+                    credit,
+                    stats.train_updates,
+                )
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _actor_feedback_updates(stats),
             )
 
     def _control_candidates(
@@ -2266,12 +2673,20 @@ def _safe_metric_key(value: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in value).strip("_")
 
 
+def _actor_metric_key(actor_id: int) -> str:
+    return _safe_metric_key(f"actor_{actor_id}")
+
+
 def _arm_feedback_updates(stats: ArmStats) -> int:
     return stats.train_updates + stats.stale_updates
 
 
 def _control_feedback_updates(stats: ControlStats) -> int:
     return stats.rollout_updates + stats.train_updates + stats.stale_updates
+
+
+def _actor_feedback_updates(stats: ActorStats) -> int:
+    return stats.pulls + stats.train_updates + stats.stale_updates
 
 
 def _seconds_to_milliseconds(seconds: float) -> int:
@@ -2389,6 +2804,12 @@ def _arm_stats_state(stats: ArmStats) -> dict[str, Any]:
     return state
 
 
+def _actor_stats_state(stats: ActorStats) -> dict[str, Any]:
+    state = _dataclass_state(stats)
+    state["inflight"] = 0
+    return state
+
+
 def _arm_credit_weights(groups: Sequence[TrajectoryGroup]) -> dict[str, float]:
     arm_weights: dict[str, float] = {}
     for group in groups:
@@ -2416,6 +2837,10 @@ def _trajectory_credit_weight(trajectory: Trajectory) -> float:
     if quality <= 0.0:
         return 0.0
     return max(0.0, trajectory.reward * quality) or quality
+
+
+def _trajectory_actor_id(trajectory: Trajectory) -> int | None:
+    return _state_optional_int(trajectory.metadata.get("actor_id"), None)
 
 
 def _mapping_state(value: Any) -> Mapping[str, Any]:
@@ -2603,6 +3028,100 @@ def _control_family_from_state(value: Any) -> dict[int, ControlStats]:
         if key is not None:
             controls[key] = _control_stats_from_state(raw_stats)
     return controls
+
+
+def _actor_stats_from_state(value: Any) -> ActorStats:
+    state = _mapping_state(value)
+    default = ActorStats()
+    return ActorStats(
+        decisions=_state_int(state.get("decisions"), default.decisions),
+        inflight=0,
+        pulls=_state_int(state.get("pulls"), default.pulls),
+        accepted=_state_int(state.get("accepted"), default.accepted),
+        unsafe=_state_int(state.get("unsafe"), default.unsafe),
+        failed_rollouts=_state_int(
+            state.get("failed_rollouts"),
+            default.failed_rollouts,
+        ),
+        train_updates=_state_int(
+            state.get("train_updates"),
+            default.train_updates,
+        ),
+        stale_updates=_state_int(
+            state.get("stale_updates"),
+            default.stale_updates,
+        ),
+        stale_batches=_state_int(
+            state.get("stale_batches"),
+            default.stale_batches,
+        ),
+        stale_trajectories=_state_int(
+            state.get("stale_trajectories"),
+            default.stale_trajectories,
+        ),
+        objective_ema=_state_float(
+            state.get("objective_ema"),
+            default.objective_ema,
+        ),
+        rollout_objective_ema=_state_float(
+            state.get("rollout_objective_ema"),
+            default.rollout_objective_ema,
+        ),
+        train_objective_ema=_state_float(
+            state.get("train_objective_ema"),
+            default.train_objective_ema,
+        ),
+        total_objective=_state_float(
+            state.get("total_objective"),
+            default.total_objective,
+        ),
+        total_rollout_objective=_state_float(
+            state.get("total_rollout_objective"),
+            default.total_rollout_objective,
+        ),
+        total_train_objective=_state_float(
+            state.get("total_train_objective"),
+            default.total_train_objective,
+        ),
+        total_stale_penalty_objective=_state_float(
+            state.get("total_stale_penalty_objective"),
+            default.total_stale_penalty_objective,
+        ),
+        total_dollar_seconds=_state_float(
+            state.get("total_dollar_seconds"),
+            default.total_dollar_seconds,
+        ),
+        rollout_dollar_seconds=_state_float(
+            state.get("rollout_dollar_seconds"),
+            default.rollout_dollar_seconds,
+        ),
+        queue_wait_dollar_seconds=_state_float(
+            state.get("queue_wait_dollar_seconds"),
+            default.queue_wait_dollar_seconds,
+        ),
+        admission_dollar_seconds=_state_float(
+            state.get("admission_dollar_seconds"),
+            default.admission_dollar_seconds,
+        ),
+        stale_experience=_state_float(
+            state.get("stale_experience"),
+            default.stale_experience,
+        ),
+        action_units=_state_int(state.get("action_units"), default.action_units),
+        source_tokens=_state_int(
+            state.get("source_tokens"),
+            default.source_tokens,
+        ),
+    )
+
+
+def _actor_family_from_state(value: Any) -> dict[int, ActorStats]:
+    actors: dict[int, ActorStats] = {}
+    for raw_key, raw_stats in _mapping_state(value).items():
+        key = _state_optional_int(raw_key, None)
+        if key is not None:
+            actors[key] = _actor_stats_from_state(raw_stats)
+    return actors
 
 
 def _state_int(value: Any, default: int) -> int:
