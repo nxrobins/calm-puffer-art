@@ -267,6 +267,8 @@ class AsyncArtBackend:
         self._completed_batches = 0
         self._failed_batches = 0
         self._stale_batches = 0
+        self._trainer_wait_s = 0.0
+        self._trainer_wait_dollar_seconds = 0.0
         self._pending_groups: list[_PendingArtGroup] = []
         self._pending_lock = asyncio.Lock()
 
@@ -412,6 +414,10 @@ class AsyncArtBackend:
         stats["art_backend/completed_batches"] = float(self._completed_batches)
         stats["art_backend/failed_batches"] = float(self._failed_batches)
         stats["art_backend/stale_batches"] = float(self._stale_batches)
+        stats["art_backend/trainer_wait_s"] = self._trainer_wait_s
+        stats["art_backend/trainer_wait_dollar_seconds"] = (
+            self._trainer_wait_dollar_seconds
+        )
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
         return stats
 
@@ -422,7 +428,14 @@ class AsyncArtBackend:
     async def _trainer_loop(self) -> None:
         while not self._closed:
             self.ring.max_policy_lag = self._max_policy_lag()
+            train_wait_started = time.perf_counter()
             batch = await self.ring.get(current_policy_step=self._current_step)
+            train_wait_s = time.perf_counter() - train_wait_started
+            train_wait_dollar_seconds = (
+                train_wait_s * self.config.cost_per_second_usd
+            )
+            self._trainer_wait_s += train_wait_s
+            self._trainer_wait_dollar_seconds += train_wait_dollar_seconds
             futures = self._batch_futures(batch)
             if not futures:
                 continue
@@ -461,7 +474,9 @@ class AsyncArtBackend:
                         groups=batch.groups,
                         result=local_result,
                         duration_s=duration_s,
-                        dollar_seconds=train_dollar_seconds,
+                        dollar_seconds=(
+                            train_dollar_seconds + train_wait_dollar_seconds
+                        ),
                         policy_step=policy_step,
                     )
                 checkpoint_metadata = dict(local_result.metadata)

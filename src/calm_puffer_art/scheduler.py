@@ -59,6 +59,23 @@ class AdaptiveScheduler(Protocol):
     ) -> int:
         ...
 
+    def rollout_admission_delay_s(
+        self,
+        *,
+        trajectory_queue_pressure: float,
+        train_queue_pressure: float,
+        policy_step: int,
+    ) -> float:
+        ...
+
+    def observe_rollout_admission_delay(
+        self,
+        *,
+        seconds: float,
+        dollar_seconds: float,
+    ) -> None:
+        ...
+
     def observe_rollout(
         self,
         trajectory: Trajectory,
@@ -118,6 +135,8 @@ class ArmStats:
     pulls: int = 0
     accepted: int = 0
     unsafe: int = 0
+    failed_rollouts: int = 0
+    failure_modes: dict[str, int] = field(default_factory=dict)
     train_updates: int = 0
     stale_updates: int = 0
     stale_batches: int = 0
@@ -182,6 +201,10 @@ class ObjectiveScheduler:
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
+        max_rollout_admission_delay_s: float = 0.0,
+        rollout_admission_pressure_threshold: float = 0.75,
+        rollout_admission_positive_signal_scale: float = 0.25,
+        reconstruction_drift_threshold: float = 0.95,
     ) -> None:
         if min_train_batch_groups <= 0:
             raise ValueError("min_train_batch_groups must be positive")
@@ -205,6 +228,18 @@ class ObjectiveScheduler:
             raise ValueError("min_train_steps must be non-negative")
         if roi_patience is not None and roi_patience <= 0:
             raise ValueError("roi_patience must be positive when set")
+        if max_rollout_admission_delay_s < 0:
+            raise ValueError("max_rollout_admission_delay_s must be non-negative")
+        if not 0 <= rollout_admission_pressure_threshold < 1:
+            raise ValueError(
+                "rollout_admission_pressure_threshold must be in [0, 1)"
+            )
+        if not 0 <= rollout_admission_positive_signal_scale <= 1:
+            raise ValueError(
+                "rollout_admission_positive_signal_scale must be in [0, 1]"
+            )
+        if not 0 <= reconstruction_drift_threshold <= 1:
+            raise ValueError("reconstruction_drift_threshold must be in [0, 1]")
         self.min_train_batch_groups = min_train_batch_groups
         self.max_train_batch_groups = max_train_batch_groups
         self.min_policy_lag = min_policy_lag
@@ -220,6 +255,14 @@ class ObjectiveScheduler:
         self.min_train_steps = min_train_steps
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
+        self.max_rollout_admission_delay_s = max_rollout_admission_delay_s
+        self.rollout_admission_pressure_threshold = (
+            rollout_admission_pressure_threshold
+        )
+        self.rollout_admission_positive_signal_scale = (
+            rollout_admission_positive_signal_scale
+        )
+        self.reconstruction_drift_threshold = reconstruction_drift_threshold
         self._arms: dict[str, ArmStats] = {}
         self._total_decisions = 0
         self._total_pulls = 0
@@ -243,6 +286,11 @@ class ObjectiveScheduler:
         self._stop_recommended = False
         self._rollout_dollar_seconds = 0.0
         self._queue_wait_dollar_seconds = 0.0
+        self._rollout_admission_decisions = 0
+        self._rollout_admission_delay_s = 0.0
+        self._rollout_admission_dollar_seconds = 0.0
+        self._last_rollout_admission_delay_s = 0.0
+        self._last_rollout_admission_pressure = 0.0
         self._train_dollar_seconds = 0.0
         self._stale_batches = 0
         self._stale_trajectories = 0
@@ -400,6 +448,10 @@ class ObjectiveScheduler:
         self._rollout_dollar_seconds += rollout_cost
         self._queue_wait_dollar_seconds += queue_wait_cost
         quality = action_quality(trajectory)
+        failure_modes = trajectory_failure_modes(
+            trajectory,
+            reconstruction_drift_threshold=self.reconstruction_drift_threshold,
+        )
         reward = trajectory.reward if accepted else 0.0
         effective_reward = reward * quality
         previous_reward = stats.effective_reward_ema if stats.pulls else 0.0
@@ -413,6 +465,10 @@ class ObjectiveScheduler:
             stats.accepted += 1
         if quality <= 0.0:
             stats.unsafe += 1
+        if failure_modes:
+            stats.failed_rollouts += 1
+            for mode in failure_modes:
+                stats.failure_modes[mode] = stats.failure_modes.get(mode, 0) + 1
         stats.total_reward += reward
         stats.total_effective_reward += effective_reward
         stats.total_positive_improvement += positive_improvement
@@ -455,6 +511,51 @@ class ObjectiveScheduler:
             quality,
             self._total_pulls,
         )
+
+    def rollout_admission_delay_s(
+        self,
+        *,
+        trajectory_queue_pressure: float,
+        train_queue_pressure: float,
+        policy_step: int,
+    ) -> float:
+        """Return a pre-rollout delay when downstream buffers are saturated."""
+
+        pressure = max(
+            0.0,
+            min(1.0, trajectory_queue_pressure),
+            min(1.0, train_queue_pressure),
+        )
+        self._rollout_admission_decisions += 1
+        self._last_rollout_admission_pressure = pressure
+        if (
+            self.max_rollout_admission_delay_s <= 0.0
+            or pressure <= self.rollout_admission_pressure_threshold
+        ):
+            self._last_rollout_admission_delay_s = 0.0
+            return 0.0
+
+        span = max(1e-12, 1.0 - self.rollout_admission_pressure_threshold)
+        delay_fraction = min(
+            1.0,
+            (pressure - self.rollout_admission_pressure_threshold) / span,
+        )
+        if self._has_positive_objective_signal():
+            delay_fraction *= self.rollout_admission_positive_signal_scale
+        delay = self.max_rollout_admission_delay_s * delay_fraction
+        self._last_rollout_admission_delay_s = delay
+        return delay
+
+    def observe_rollout_admission_delay(
+        self,
+        *,
+        seconds: float,
+        dollar_seconds: float,
+    ) -> None:
+        delay_s = max(0.0, seconds)
+        delay_cost = max(0.0, dollar_seconds)
+        self._rollout_admission_delay_s += delay_s
+        self._rollout_admission_dollar_seconds += delay_cost
 
     def observe_train(
         self,
@@ -642,6 +743,18 @@ class ObjectiveScheduler:
                 "min_train_steps": self.min_train_steps,
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
+                "max_rollout_admission_delay_s": (
+                    self.max_rollout_admission_delay_s
+                ),
+                "rollout_admission_pressure_threshold": (
+                    self.rollout_admission_pressure_threshold
+                ),
+                "rollout_admission_positive_signal_scale": (
+                    self.rollout_admission_positive_signal_scale
+                ),
+                "reconstruction_drift_threshold": (
+                    self.reconstruction_drift_threshold
+                ),
             },
             "learning_state": {
                 "total_decisions": self._total_decisions,
@@ -670,6 +783,19 @@ class ObjectiveScheduler:
                 "stop_recommended": self._stop_recommended,
                 "rollout_dollar_seconds": self._rollout_dollar_seconds,
                 "queue_wait_dollar_seconds": self._queue_wait_dollar_seconds,
+                "rollout_admission_decisions": (
+                    self._rollout_admission_decisions
+                ),
+                "rollout_admission_delay_s": self._rollout_admission_delay_s,
+                "rollout_admission_dollar_seconds": (
+                    self._rollout_admission_dollar_seconds
+                ),
+                "last_rollout_admission_delay_s": (
+                    self._last_rollout_admission_delay_s
+                ),
+                "last_rollout_admission_pressure": (
+                    self._last_rollout_admission_pressure
+                ),
                 "train_dollar_seconds": self._train_dollar_seconds,
                 "stale_batches": self._stale_batches,
                 "stale_trajectories": self._stale_trajectories,
@@ -758,6 +884,40 @@ class ObjectiveScheduler:
         self.min_train_objective = _state_float(
             config.get("min_train_objective"),
             self.min_train_objective,
+        )
+        self.max_rollout_admission_delay_s = _state_float(
+            config.get("max_rollout_admission_delay_s"),
+            self.max_rollout_admission_delay_s,
+        )
+        self.rollout_admission_pressure_threshold = min(
+            0.999999,
+            max(
+                0.0,
+                _state_float(
+                    config.get("rollout_admission_pressure_threshold"),
+                    self.rollout_admission_pressure_threshold,
+                ),
+            ),
+        )
+        self.rollout_admission_positive_signal_scale = min(
+            1.0,
+            max(
+                0.0,
+                _state_float(
+                    config.get("rollout_admission_positive_signal_scale"),
+                    self.rollout_admission_positive_signal_scale,
+                ),
+            ),
+        )
+        self.reconstruction_drift_threshold = min(
+            1.0,
+            max(
+                0.0,
+                _state_float(
+                    config.get("reconstruction_drift_threshold"),
+                    self.reconstruction_drift_threshold,
+                ),
+            ),
         )
 
         arms = _mapping_state(state.get("arms"))
@@ -857,6 +1017,26 @@ class ObjectiveScheduler:
             learning_state.get("queue_wait_dollar_seconds"),
             self._queue_wait_dollar_seconds,
         )
+        self._rollout_admission_decisions = _state_int(
+            learning_state.get("rollout_admission_decisions"),
+            self._rollout_admission_decisions,
+        )
+        self._rollout_admission_delay_s = _state_float(
+            learning_state.get("rollout_admission_delay_s"),
+            self._rollout_admission_delay_s,
+        )
+        self._rollout_admission_dollar_seconds = _state_float(
+            learning_state.get("rollout_admission_dollar_seconds"),
+            self._rollout_admission_dollar_seconds,
+        )
+        self._last_rollout_admission_delay_s = _state_float(
+            learning_state.get("last_rollout_admission_delay_s"),
+            self._last_rollout_admission_delay_s,
+        )
+        self._last_rollout_admission_pressure = _state_float(
+            learning_state.get("last_rollout_admission_pressure"),
+            self._last_rollout_admission_pressure,
+        )
         self._train_dollar_seconds = _state_float(
             learning_state.get("train_dollar_seconds"),
             self._train_dollar_seconds,
@@ -880,10 +1060,23 @@ class ObjectiveScheduler:
 
     def metrics(self) -> dict[str, float]:
         inflight_rollouts = sum(stats.inflight for stats in self._arms.values())
+        failure_rollouts = sum(
+            stats.failed_rollouts for stats in self._arms.values()
+        )
+        failure_modes: dict[str, int] = {}
+        for stats in self._arms.values():
+            for mode, count in stats.failure_modes.items():
+                failure_modes[mode] = failure_modes.get(mode, 0) + count
         metrics: dict[str, float] = {
             "scheduler/total_rollout_decisions": float(self._total_decisions),
             "scheduler/total_rollout_observations": float(self._total_pulls),
             "scheduler/total_inflight_rollouts": float(inflight_rollouts),
+            "scheduler/failure_rollouts": float(failure_rollouts),
+            "scheduler/failure_rate": (
+                failure_rollouts / self._total_pulls
+                if self._total_pulls
+                else 0.0
+            ),
             "scheduler/global_marginal_objective_ema": self._global_objective_ema,
             "scheduler/global_action_quality_ema": self._global_action_quality_ema,
             "scheduler/train_reward_ema": self._train_reward_ema,
@@ -914,14 +1107,33 @@ class ObjectiveScheduler:
             "scheduler/weights/reward_efficiency": self.reward_efficiency_weight,
             "scheduler/weights/stale_penalty": self.stale_penalty_weight,
             "scheduler/weights/unsafe_penalty": self.unsafe_penalty,
+            "scheduler/reconstruction_drift_threshold": (
+                self.reconstruction_drift_threshold
+            ),
             "scheduler/costs/rollout_dollar_seconds": self._rollout_dollar_seconds,
             "scheduler/costs/queue_wait_dollar_seconds": (
                 self._queue_wait_dollar_seconds
+            ),
+            "scheduler/admission/decisions": float(
+                self._rollout_admission_decisions
+            ),
+            "scheduler/admission/total_delay_s": (
+                self._rollout_admission_delay_s
+            ),
+            "scheduler/admission/last_delay_s": (
+                self._last_rollout_admission_delay_s
+            ),
+            "scheduler/admission/last_pressure": (
+                self._last_rollout_admission_pressure
+            ),
+            "scheduler/costs/rollout_admission_dollar_seconds": (
+                self._rollout_admission_dollar_seconds
             ),
             "scheduler/costs/train_dollar_seconds": self._train_dollar_seconds,
             "scheduler/costs/total_dollar_seconds": (
                 self._rollout_dollar_seconds
                 + self._queue_wait_dollar_seconds
+                + self._rollout_admission_dollar_seconds
                 + self._train_dollar_seconds
             ),
         }
@@ -936,6 +1148,12 @@ class ObjectiveScheduler:
             metrics["scheduler/last_max_policy_lag"] = float(
                 self._last_decision_snapshot.get("max_policy_lag", 0)
             )
+        for mode, count in failure_modes.items():
+            safe_mode = _safe_metric_key(mode)
+            metrics[f"scheduler/failure/{safe_mode}"] = float(count)
+            metrics[f"scheduler/failure/{safe_mode}_rate"] = (
+                count / self._total_pulls if self._total_pulls else 0.0
+            )
         for arm_id, stats in self._arms.items():
             prefix = f"scheduler/arm/{_safe_metric_key(arm_id)}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
@@ -946,6 +1164,16 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/unsafe_rate"] = (
                 stats.unsafe / stats.pulls if stats.pulls else 0.0
             )
+            metrics[f"{prefix}/failure_rollouts"] = float(stats.failed_rollouts)
+            metrics[f"{prefix}/failure_rate"] = (
+                stats.failed_rollouts / stats.pulls if stats.pulls else 0.0
+            )
+            for mode, count in stats.failure_modes.items():
+                safe_mode = _safe_metric_key(mode)
+                metrics[f"{prefix}/failure/{safe_mode}"] = float(count)
+                metrics[f"{prefix}/failure/{safe_mode}_rate"] = (
+                    count / stats.pulls if stats.pulls else 0.0
+                )
             metrics[f"{prefix}/reward_ema"] = stats.reward_ema
             metrics[f"{prefix}/effective_reward_ema"] = stats.effective_reward_ema
             metrics[f"{prefix}/action_quality_ema"] = stats.action_quality_ema
@@ -1511,6 +1739,11 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
         pulls=_state_int(state.get("pulls"), default.pulls),
         accepted=_state_int(state.get("accepted"), default.accepted),
         unsafe=_state_int(state.get("unsafe"), default.unsafe),
+        failed_rollouts=_state_int(
+            state.get("failed_rollouts"),
+            default.failed_rollouts,
+        ),
+        failure_modes=_int_mapping_state(state.get("failure_modes")),
         train_updates=_state_int(
             state.get("train_updates"),
             default.train_updates,
@@ -1696,6 +1929,15 @@ def _state_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _int_mapping_state(value: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for key, raw_count in _mapping_state(value).items():
+        count = _state_int(raw_count, 0)
+        if count > 0:
+            result[str(key)] = count
+    return result
+
+
 def _decision_to_state(decision: SchedulerDecision) -> dict[str, Any]:
     return {
         "arm_id": decision.arm_id,
@@ -1822,3 +2064,38 @@ def action_quality(trajectory: Trajectory) -> float:
     if candidates:
         return min(candidates)
     return 1.0
+
+
+def trajectory_failure_modes(
+    trajectory: Trajectory,
+    *,
+    reconstruction_drift_threshold: float = 0.95,
+) -> tuple[str, ...]:
+    """Categorical action/rollout failure modes for scheduler credit."""
+
+    metadata = trajectory.metadata
+    modes: list[str] = []
+    if trajectory.exception:
+        modes.append("exception")
+    if metadata.get("action/safe") is False:
+        modes.append("action_unsafe")
+    if metadata.get("reconstruction/safe") is False:
+        modes.append("reconstruction_unsafe")
+    if metadata.get("verifier/passed") is False:
+        modes.append("verifier_failed")
+
+    reconstruction_accuracy = _first_nonnegative_mapping_float(
+        metadata,
+        ("reconstruction/accuracy",),
+    )
+    if reconstruction_accuracy is None:
+        reconstruction_accuracy = _first_nonnegative_mapping_float(
+            trajectory.metrics,
+            ("reconstruction/accuracy",),
+        )
+    if (
+        reconstruction_accuracy is not None
+        and reconstruction_accuracy < reconstruction_drift_threshold
+    ):
+        modes.append("reconstruction_drift")
+    return tuple(dict.fromkeys(modes))

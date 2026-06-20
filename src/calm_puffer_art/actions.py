@@ -481,6 +481,7 @@ class AdaptiveActionSpace:
         objective_values: list[float] = []
         quality_values: list[float] = []
         unsafe_values: list[float] = []
+        failure_values: list[float] = []
         pull_values: list[float] = []
         for key, value in metrics.items():
             if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
@@ -495,12 +496,16 @@ class AdaptiveActionSpace:
                 quality_values.append(float(value))
             elif key.endswith("/unsafe_rate"):
                 unsafe_values.append(float(value))
+            elif key.endswith("/failure_rate"):
+                failure_values.append(float(value))
             elif key.endswith("/pulls"):
                 pull_values.append(float(value))
         return _CodecSignal(
             objective=max(objective_values) if objective_values else 0.0,
             quality=min(quality_values) if quality_values else 0.0,
-            unsafe_rate=max(unsafe_values) if unsafe_values else 0.0,
+            unsafe_rate=max(unsafe_values + failure_values)
+            if unsafe_values or failure_values
+            else 0.0,
             pulls=sum(pull_values),
         )
 

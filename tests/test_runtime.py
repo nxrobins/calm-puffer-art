@@ -864,15 +864,19 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(summary.latest_step, 1)
         self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 42.0)
-        self.assertEqual(
-            summary.metrics["scheduler/costs/train_dollar_seconds"],
-            42.0,
+        expected_scheduler_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
         )
-        self.assertEqual(
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
             summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY][
                 "learning_state"
             ]["train_dollar_seconds"],
-            42.0,
+            expected_scheduler_cost,
         )
 
     def test_scheduler_train_objective_includes_promotion_eval_cost(self):
@@ -915,16 +919,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(summary.latest_step, 1)
         self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
         self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 8.0)
-        self.assertEqual(
-            summary.metrics["scheduler/costs/train_dollar_seconds"],
-            10.0,
+        expected_scheduler_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/promotion_eval_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
         )
-        self.assertAlmostEqual(summary.metrics["scheduler/train_last_objective"], 0.1)
-        self.assertEqual(
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/train_last_objective"],
+            1.0 / expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
             summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY][
                 "learning_state"
             ]["train_dollar_seconds"],
-            10.0,
+            expected_scheduler_cost,
         )
 
     def test_grouper_drops_trajectories_that_exceed_policy_lag(self):
@@ -1005,6 +1017,16 @@ class RuntimeTests(unittest.TestCase):
             metrics,
         )
 
+    def test_runtime_telemetry_attributes_trainer_wait_cost(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=5.0)
+
+        telemetry.record_train_wait(2.0)
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/trainer_wait_s"], 2.0)
+        self.assertEqual(metrics["costs/trainer_wait_dollar_seconds"], 10.0)
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+
     def test_runtime_telemetry_accepts_explicit_rollout_dollar_seconds(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)
         trajectory = Trajectory(
@@ -1067,6 +1089,63 @@ class RuntimeTests(unittest.TestCase):
         self.assertIs(queued, trajectory)
         self.assertGreater(
             queued.metrics["cost/actor_queue_wait_dollar_seconds"],
+            0.0,
+        )
+
+    def test_runtime_applies_scheduler_rollout_admission_delay_before_work(self):
+        async def run():
+            runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
+            scheduler = ObjectiveScheduler(
+                max_rollout_admission_delay_s=0.001,
+                rollout_admission_pressure_threshold=0.0,
+                exploration_bonus=0.0,
+            )
+            queue: asyncio.Queue[Trajectory] = asyncio.Queue(maxsize=1)
+            await queue.put(
+                Trajectory(
+                    scenario_id="blocking",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                )
+            )
+            train_ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=1)
+            telemetry = RuntimeTelemetry(cost_per_second_usd=10.0)
+
+            elapsed = await runtime._apply_rollout_admission_delay(
+                scheduler=scheduler,
+                trajectory_queue=queue,
+                train_ring=train_ring,
+                telemetry=telemetry,
+                policy_step=0,
+            )
+            return elapsed, telemetry.metrics(stale_dropped=0), scheduler.metrics()
+
+        elapsed, telemetry_metrics, scheduler_metrics = asyncio.run(run())
+
+        self.assertGreater(elapsed, 0.0)
+        self.assertGreater(
+            telemetry_metrics["time/actor_admission_delay_s"],
+            0.0,
+        )
+        self.assertGreater(
+            telemetry_metrics["costs/actor_admission_delay_dollar_seconds"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            telemetry_metrics["costs/accounted_dollar_seconds"],
+            telemetry_metrics["costs/actor_admission_delay_dollar_seconds"],
+        )
+        self.assertEqual(scheduler_metrics["scheduler/admission/decisions"], 1.0)
+        self.assertGreater(
+            scheduler_metrics["scheduler/admission/total_delay_s"],
+            0.0,
+        )
+        self.assertGreater(
+            scheduler_metrics[
+                "scheduler/costs/rollout_admission_dollar_seconds"
+            ],
             0.0,
         )
 

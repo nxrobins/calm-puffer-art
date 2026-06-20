@@ -62,6 +62,7 @@ from .scheduler import (
     action_quality,
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
+    trajectory_failure_modes,
 )
 from .types import (
     ActionUnit,
@@ -139,5 +140,6 @@ __all__ = [
     "semantic_bandwidth",
     "train_result_from_art",
     "train_result_dollar_seconds",
+    "trajectory_failure_modes",
     "restore_control_state",
 ]

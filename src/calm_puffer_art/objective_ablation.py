@@ -50,7 +50,10 @@ class MeanRewardTrainer:
         return TrainResult(
             policy=current.policy,
             checkpoint_id=f"ablation-step-{current.step + 1}",
-            metrics={"train/reward": fmean(rewards)},
+            metrics={
+                "train/reward": fmean(rewards),
+                "train/dollar_seconds": 1.0,
+            },
         )
 
 

@@ -82,6 +82,24 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
 
+    def test_adaptive_action_space_does_not_promote_failed_chunks(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/failure_rate": 0.5,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
+
     def test_adaptive_action_space_demotes_bad_promoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
         action_space.update_from_metrics(
@@ -122,6 +140,33 @@ class ActionCodecTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(metrics["action_space/max_chunk_size"], 2.0)
+
+    def test_adaptive_action_space_demotes_failed_promoted_chunks(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+            }
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/failure_rate": 0.5,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/demotions"], 1.0)
 
     def test_adaptive_action_space_does_not_repromote_demoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)

@@ -111,6 +111,7 @@ class FixedCadenceScheduler:
         self.stale_batches = []
         self.scored_batches = []
         self.lag_calls = []
+        self.observed_dollar_seconds = []
 
     def target_train_batch_groups(self, **kwargs):
         return self.target
@@ -127,6 +128,7 @@ class FixedCadenceScheduler:
 
     def observe_train(self, *, groups, result, duration_s, dollar_seconds, policy_step):
         self.observed_batches.append(len(groups))
+        self.observed_dollar_seconds.append(dollar_seconds)
 
     def observe_stale_batch(self, *, groups, policy_step, reason):
         self.stale_batches.append(
@@ -322,13 +324,58 @@ class ArtAdapterTests(unittest.TestCase):
             await async_backend.register("art-model")
             result = await async_backend.train("art-model", [art_group])
             metrics = scheduler.metrics()
+            stats = async_backend.stats()
             await async_backend.close()
-            return result, metrics
+            return result, metrics, stats
 
-        result, metrics = asyncio.run(run())
+        result, metrics, stats = asyncio.run(run())
 
         self.assertEqual(result.step, 1)
-        self.assertEqual(metrics["scheduler/costs/train_dollar_seconds"], 17.0)
+        self.assertGreaterEqual(
+            stats["art_backend/trainer_wait_dollar_seconds"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/costs/train_dollar_seconds"],
+            17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+        )
+
+    def test_async_art_backend_charges_trainer_wait_to_scheduler(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            scheduler = FixedCadenceScheduler(target=1)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(cost_per_second_usd=1000.0),
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                    )
+                ],
+                metadata={"scenario_id": "waited-art"},
+            )
+
+            await async_backend.register("art-model")
+            await asyncio.sleep(0.001)
+            result = await async_backend.train("art-model", [art_group])
+            stats = async_backend.stats()
+            await async_backend.close()
+            return result, stats, scheduler
+
+        result, stats, scheduler = asyncio.run(run())
+
+        self.assertEqual(result.step, 1)
+        self.assertGreater(stats["art_backend/trainer_wait_dollar_seconds"], 0.0)
+        self.assertEqual(scheduler.observed_batches, [1])
+        self.assertAlmostEqual(
+            scheduler.observed_dollar_seconds[0],
+            17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+        )
 
     def test_async_art_backend_submit_train_returns_future_before_training_finishes(self):
         async def run():

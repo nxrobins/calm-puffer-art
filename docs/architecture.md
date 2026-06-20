@@ -41,12 +41,13 @@ The trainer consumes the highest-priority non-stale batch from the ring and retu
 
 ## Closed-Loop Objective Scheduler
 
-`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories. Concurrent actor selections reserve in-flight arms until their rollout feedback is observed, preventing high-throughput actors from all choosing the same untried arm before the first result returns. Train credit is arm-baseline-aware: a batch only creates reward-improving experience for an arm when the train score improves over that arm's own previous train score, preventing alternating workflows from inheriting each other's baselines.
+`ObjectiveScheduler` turns the north-star metric into online control decisions. It treats each `(scenario, action_codec)` pair as an arm, explores every arm, then prefers arms with higher marginal reward improvement per dollar-second. Rollout outcomes provide the first signal; consumed train batches then credit actual train-step improvement back to the arms and active runtime controls that produced the trajectories. Concurrent actor selections reserve in-flight arms until their rollout feedback is observed, preventing high-throughput actors from all choosing the same untried arm before the first result returns. The scheduler can also impose pre-rollout actor admission delay under downstream queue saturation: low-signal saturation backs off before spending rollout cost, while positive marginal objective signal scales the delay down so useful sampling keeps flowing. Train credit is arm-baseline-aware: a batch only creates reward-improving experience for an arm when the train score improves over that arm's own previous train score, preventing alternating workflows from inheriting each other's baselines.
 
-The scheduler currently controls six things:
+The scheduler currently controls seven things:
 
 - **Rollout choice:** which `Scenario` an actor attempts next.
 - **Action granularity:** which `ActionCodec` the workflow receives in `RolloutContext`.
+- **Actor admission:** whether saturated downstream queues warrant pre-rollout delay.
 - **Training priority:** which ready train batch the ring should consume next.
 - **Batch cadence:** target train groups per `VersionedTrajectoryBatch`.
 - **Policy lag:** current max accepted rollout/checkpoint lag.
@@ -84,7 +85,7 @@ Action-space state is checkpointable. `AdaptiveActionSpace.state_dict()` capture
 
 The control loop is online:
 
-1. Actors ask the scheduler for a scenario and action codec, reserving that arm as in-flight until the rollout is observed.
+1. Actors ask the scheduler whether saturated downstream queues warrant pre-rollout admission delay, then request a scenario and action codec, reserving that arm as in-flight until the rollout is observed.
 2. Runtime tags the resulting trajectory with the scheduler arm.
 3. Workflows or verifiers can attach action-quality metadata such as `action/safe`, `action/quality`, `reconstruction/accuracy`, `reconstruction/safe`, `verifier/score`, or `verifier/passed`.
 4. The batcher reports accepted or rejected rollout outcomes, effective reward, action quality, and dollar-seconds.
@@ -103,7 +104,7 @@ The scheduler deliberately keeps the configured policy-lag allowance until every
 
 Arm scoring is objective-weighted. The default score is marginal rollout reward-improvement per dollar-second plus credited train-step policy-improvement objective. Train-step objective uses each arm's `max(0, reward - previous_arm_reward) * useful_trajectory_count / candidate_dollar_seconds`, so larger useful batches earn proportionally more credit than equally improving tiny batches. `candidate_dollar_seconds` is trainer spend plus promotion-evaluation spend for that candidate. Trainer spend can come from explicit trainer metrics or metadata under `cost/dollar_seconds`, `train/dollar_seconds`, or `trainer/dollar_seconds`; otherwise trainer duration is multiplied by the configured infrastructure rate. Raw reward efficiency is reported but has weight `0` unless the caller explicitly sets `reward_efficiency_weight`; this keeps the controller from chasing high raw rollout scores that are no longer improving the policy.
 
-Cadence is pressure-aware and credited. When the train ring is saturated and the scheduler has no positive objective signal, it widens train batches toward `max_train_batch_groups` to amortize trainer spend. When rollout or train feedback shows positive marginal reward improvement per dollar-second, it tightens cadence back to `min_train_batch_groups` so useful gradients are consumed sooner. Actor queue-wait cost is stamped onto trajectories before enqueue and included in the scheduler's rollout denominator, so backpressure can reduce the marginal objective of arms and control settings that create it. Consumed train batches also credit the active cadence and policy-lag values under `scheduler/control/*`, letting later decisions reuse settings that show better train objective than the default heuristic.
+Cadence is pressure-aware and credited. When the train ring is saturated and the scheduler has no positive objective signal, it widens train batches toward `max_train_batch_groups` to amortize trainer spend. When rollout or train feedback shows positive marginal reward improvement per dollar-second, it tightens cadence back to `min_train_batch_groups` so useful gradients are consumed sooner. Actor queue-wait cost is stamped onto trajectories before enqueue and included in the scheduler's rollout denominator, so backpressure can reduce the marginal objective of arms and control settings that create it. Pre-rollout admission delay is accounted separately as actor admission cost: it protects against spending on rollouts that would immediately queue behind saturated downstream buffers, but it still appears in wall-clock/accounted dollar telemetry. Consumed train batches also credit the active cadence and policy-lag values under `scheduler/control/*`, letting later decisions reuse settings that show better train objective than the default heuristic.
 
 Stale train-ring drops are negative feedback, not just telemetry. When a queued `VersionedTrajectoryBatch` becomes too stale to train, the runtime reports the discarded groups through `observe_stale_batch_feedback()`. `ObjectiveScheduler` converts their quality-weighted useful experience into a configurable negative objective credit, debiting the arms, batch-cadence values, and policy-lag values that produced the untrained samples.
 
@@ -115,7 +116,7 @@ Train credit is also quality-aware. A batch can improve the trainer's reported r
 
 ROI patience is opt-in. By default, `ObjectiveScheduler` will run to `max_train_steps`; setting `roi_patience` and `min_train_objective` lets the scheduler stop spending once train-step marginal reward improvement per dollar-second has stayed too low for the configured patience window.
 
-Scheduler state is checkpointable. `state_dict()` captures the numeric control policy memory: arm statistics, decision counts, cadence and lag control credit, stale-drop penalties, budget counters, ROI state, scoring configuration, and scalar last-decision metadata. Live in-flight reservations are not restored across process resume. `load_state_dict()` restores that memory into a fresh scheduler and tolerates missing sections for older checkpoints. `ControlPlane` writes the snapshot into checkpoint metadata under `scheduler/state` after `observe_train()` has credited the consumed batch, so resumed runs see the controller state that produced the published policy. It does not serialize live `Scenario` or `ActionCodec` objects; those remain user-code/programming-layer concerns, preserving ART's control-plane boundary.
+Scheduler state is checkpointable. `state_dict()` captures the numeric control policy memory: arm statistics, decision counts, cadence and lag control credit, admission-delay counters, stale-drop penalties, budget counters, ROI state, scoring configuration, and scalar last-decision metadata. Live in-flight reservations are not restored across process resume. `load_state_dict()` restores that memory into a fresh scheduler and tolerates missing sections for older checkpoints. `ControlPlane` writes the snapshot into checkpoint metadata under `scheduler/state` after `observe_train()` has credited the consumed batch, so resumed runs see the controller state that produced the published policy. It does not serialize live `Scenario` or `ActionCodec` objects; those remain user-code/programming-layer concerns, preserving ART's control-plane boundary.
 
 Resume uses the same metadata. `restore_control_state()` accepts checkpoint-style metadata, `PolicySnapshot`, or `Checkpoint` objects and loads compatible scheduler, action-space, and promotion-evaluator objects. `ControlPlane.run()` calls it automatically when `initial_policy` is a `PolicySnapshot`; the registry seeds from that snapshot's step, checkpoint id, policy object, and metadata. That keeps policy-lag accounting and promotion gating on the resumed version instead of resetting the async runtime to step 0.
 
@@ -154,7 +155,7 @@ The versioned batch metadata stays in the control plane. A future ART backend ca
 
 This means the async runtime can reason about ART data without taking a hard dependency on ART or reimplementing ART's GRPO/CISPO losses. The full drop-in `art.Backend` remains deferred; this adapter is the tested object-preservation seam it should use.
 
-`AsyncArtBackend.train()` returns the supplied backend's train result for compatibility. Internally, the submitted ART groups are converted, prioritized, enqueued, consumed by a background trainer task, observed by the scheduler, and published through `WeightBroadcastChannel`. Published ART bridge updates include `scheduler/state` metadata after train feedback is observed. Before each consume, the bridge asks `scheduler.max_policy_lag(...)` for the active stale-policy limit. If a queued batch exceeds that limit before training, the awaiting caller receives `StaleArtBatchError` instead of hanging, and the scheduler receives stale-batch feedback for the discarded groups.
+`AsyncArtBackend.train()` returns the supplied backend's train result for compatibility. Internally, the submitted ART groups are converted, prioritized, enqueued, consumed by a background trainer task, observed by the scheduler, and published through `WeightBroadcastChannel`. Published ART bridge updates include `scheduler/state` metadata after train feedback is observed. Before each consume, the bridge asks `scheduler.max_policy_lag(...)` for the active stale-policy limit. Trainer wait for a ready ART batch is added to the scheduler's train-objective dollar-second denominator and exposed in `art_backend/trainer_wait_*` stats. If a queued batch exceeds that limit before training, the awaiting caller receives `StaleArtBatchError` instead of hanging, and the scheduler receives stale-batch feedback for the discarded groups.
 
 `submit_train()` is the nonblocking path. It returns an `asyncio.Future` once the bounded ring has accepted the converted ART groups. The caller can continue producing rollouts and await the future later. Backend stats report submitted, completed, failed, and stale batches under `art_backend/*`.
 
@@ -209,9 +210,9 @@ Trajectory(
 )
 ```
 
-The runtime and scheduler use the minimum available quality signal as the effective-reward multiplier.
+The runtime and scheduler use the minimum available quality signal as the effective-reward multiplier. The scheduler also records categorical failure modes such as exceptions, unsafe action outputs, reconstruction safety failures, verifier failures, and reconstruction drift below `reconstruction_drift_threshold`.
 
-`AdaptiveActionSpace` uses the same scheduler metrics for promotion and retirement, so unsafe or poor-reconstruction chunk arms do not unlock larger chunks and promoted arms with enough bad evidence stop competing for rollout slots. Token and the minimum chunk size remain active as comparison baselines. This is a runtime control surface, not a learned CALM encoder; learned latent policies remain deferred until old/new logprob semantics are explicit.
+`AdaptiveActionSpace` uses the same scheduler metrics for promotion and retirement, so unsafe or poor-reconstruction chunk arms do not unlock larger chunks and promoted arms with enough bad evidence stop competing for rollout slots. Scheduler failure rate is treated as a safety signal alongside unsafe rate, so reconstruction drift can retire a higher-bandwidth chunk even when raw reward and aggregate quality still look high. Token and the minimum chunk size remain active as comparison baselines. This is a runtime control surface, not a learned CALM encoder; learned latent policies remain deferred until old/new logprob semantics are explicit.
 
 ## North-Star Metric
 
@@ -232,12 +233,14 @@ The runtime also reports attributed cost telemetry:
 - `costs/wall_clock_dollar_seconds`: elapsed runtime multiplied by configured infrastructure cost.
 - `costs/rollout_dollar_seconds`: summed explicit rollout costs from `cost/dollar_seconds` or `rollout/dollar_seconds`, falling back to rollout duration multiplied by configured cost.
 - `costs/trainer_dollar_seconds`: summed explicit train costs from `cost/dollar_seconds`, `train/dollar_seconds`, or `trainer/dollar_seconds`, falling back to trainer duration multiplied by configured cost.
+- `costs/trainer_wait_dollar_seconds`: trainer-side time spent waiting for a ready train batch.
 - `costs/promotion_eval_dollar_seconds`: promotion-gate evaluation spend, including held-out workflow rollouts or custom evaluator cost.
+- `costs/actor_admission_delay_dollar_seconds`: scheduler-imposed pre-rollout delay when downstream buffers are saturated.
 - `costs/actor_queue_wait_dollar_seconds`: actor time spent waiting on bounded queues.
-- `costs/accounted_dollar_seconds`: rollout, trainer, promotion-evaluation, and queue-wait attribution combined.
+- `costs/accounted_dollar_seconds`: rollout, trainer, trainer-wait, promotion-evaluation, admission-delay, and queue-wait attribution combined.
 - `north_star/accounted_reward_improving_experience_per_dollar_second`: the same reward-improvement numerator divided by accounted cost.
 
-`costs/runtime_dollar_seconds` remains the wall-clock infrastructure denominator for compatibility. The accounted denominator is useful when tuning actor count, train cadence, model/API spend, promotion gates, or backpressure because it exposes where the local scaffold is spending work. Scheduler arm metrics also expose `mean_rollout_dollar_seconds`, `queue_wait_dollar_seconds`, `mean_queue_wait_dollar_seconds`, `mean_sample_dollar_seconds`, and `total_improvement_per_dollar_second` for auditing whether a scenario/action-codec arm is actually worth its observed rollout and queue-wait cost.
+`costs/runtime_dollar_seconds` remains the wall-clock infrastructure denominator for compatibility. The accounted denominator is useful when tuning actor count, train cadence, model/API spend, promotion gates, or backpressure because it exposes where the local scaffold is spending work. Scheduler train objective receives trainer wait as part of the candidate dollar-second denominator, so large batch cadence can be penalized when it keeps the trainer idle. Scheduler arm metrics also expose `mean_rollout_dollar_seconds`, `queue_wait_dollar_seconds`, `mean_queue_wait_dollar_seconds`, `mean_sample_dollar_seconds`, `failure_rate`, failure-mode counters, and `total_improvement_per_dollar_second` for auditing whether a scenario/action-codec arm is actually worth its observed rollout, queue-wait, and failure cost.
 
 ## Implementation Boundary
 

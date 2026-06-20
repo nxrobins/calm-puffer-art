@@ -8,6 +8,7 @@ from calm_puffer_art import (
     Trajectory,
     TrajectoryGroup,
     TrainResult,
+    trajectory_failure_modes,
 )
 
 
@@ -311,6 +312,148 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertGreater(
             metrics["scheduler/arm/no_wait_token/objective_score"],
             metrics["scheduler/arm/waited_token/objective_score"],
+        )
+
+    def test_rollout_admission_delay_backs_off_saturated_low_signal_sampling(self):
+        scheduler = ObjectiveScheduler(
+            max_rollout_admission_delay_s=0.2,
+            rollout_admission_pressure_threshold=0.5,
+            exploration_bonus=0.0,
+        )
+
+        delay = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout_admission_delay(
+            seconds=delay,
+            dollar_seconds=delay * 3.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertAlmostEqual(delay, 0.2)
+        self.assertEqual(metrics["scheduler/admission/decisions"], 1.0)
+        self.assertAlmostEqual(metrics["scheduler/admission/total_delay_s"], 0.2)
+        self.assertAlmostEqual(
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+            0.6,
+        )
+        self.assertAlmostEqual(metrics["scheduler/costs/total_dollar_seconds"], 0.6)
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertAlmostEqual(
+            restored_metrics["scheduler/admission/total_delay_s"],
+            metrics["scheduler/admission/total_delay_s"],
+        )
+        self.assertAlmostEqual(
+            restored_metrics[
+                "scheduler/costs/rollout_admission_dollar_seconds"
+            ],
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+        )
+
+    def test_rollout_admission_delay_preserves_more_sampling_with_objective_signal(self):
+        no_signal = ObjectiveScheduler(
+            max_rollout_admission_delay_s=0.2,
+            rollout_admission_pressure_threshold=0.5,
+            exploration_bonus=0.0,
+        )
+        positive_signal = ObjectiveScheduler(
+            max_rollout_admission_delay_s=0.2,
+            rollout_admission_pressure_threshold=0.5,
+            rollout_admission_positive_signal_scale=0.25,
+            exploration_bonus=0.0,
+        )
+        positive_signal.observe_rollout(
+            Trajectory(
+                scenario_id="useful",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={"scheduler/arm_id": "useful|token"},
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        no_signal_delay = no_signal.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        positive_signal_delay = positive_signal.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+
+        self.assertAlmostEqual(no_signal_delay, 0.2)
+        self.assertAlmostEqual(positive_signal_delay, 0.05)
+        self.assertLess(positive_signal_delay, no_signal_delay)
+
+    def test_rollout_failure_modes_track_reconstruction_drift(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            reconstruction_drift_threshold=0.95,
+        )
+        trajectory = Trajectory(
+            scenario_id="code",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "code|chunk(chunk_size=4)",
+                "reconstruction/accuracy": 0.9,
+            },
+        )
+
+        self.assertEqual(
+            trajectory_failure_modes(
+                trajectory,
+                reconstruction_drift_threshold=0.95,
+            ),
+            ("reconstruction_drift",),
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/failure_rollouts"], 1.0)
+        self.assertEqual(metrics["scheduler/failure/reconstruction_drift"], 1.0)
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/failure/reconstruction_drift"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/code_chunk_chunk_size_4/failure_rate"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/code_chunk_chunk_size_4/unsafe"],
+            0.0,
+        )
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(
+            restored_metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/failure/reconstruction_drift"
+            ],
+            1.0,
         )
 
     def test_positive_objective_tightens_cadence_and_policy_lag(self):

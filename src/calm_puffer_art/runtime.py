@@ -730,7 +730,9 @@ class RuntimeTelemetry:
         self.source_tokens = 0
         self.rollout_s = 0.0
         self.rollout_dollar_seconds = 0.0
+        self.actor_admission_delay_s = 0.0
         self.actor_queue_wait_s = 0.0
+        self.trainer_wait_s = 0.0
         self.trainer_s = 0.0
         self.trainer_dollar_seconds = 0.0
         self.rewards: list[float] = []
@@ -747,8 +749,14 @@ class RuntimeTelemetry:
         self.latest_promotion_improvement = 0.0
         self.latest_promotion_promoted = False
 
+    def record_actor_admission_delay(self, seconds: float) -> None:
+        self.actor_admission_delay_s += max(0.0, seconds)
+
     def record_actor_queue_wait(self, seconds: float) -> None:
         self.actor_queue_wait_s += max(0.0, seconds)
+
+    def record_train_wait(self, seconds: float) -> None:
+        self.trainer_wait_s += max(0.0, seconds)
 
     def record_trajectory(
         self,
@@ -816,12 +824,18 @@ class RuntimeTelemetry:
         dollar_seconds = wall_s * self.cost_per_second_usd
         rollout_dollar_seconds = self.rollout_dollar_seconds
         trainer_dollar_seconds = self.trainer_dollar_seconds
+        trainer_wait_dollar_seconds = self.trainer_wait_s * self.cost_per_second_usd
+        admission_delay_dollar_seconds = (
+            self.actor_admission_delay_s * self.cost_per_second_usd
+        )
         queue_wait_dollar_seconds = (
             self.actor_queue_wait_s * self.cost_per_second_usd
         )
         accounted_dollar_seconds = (
             rollout_dollar_seconds
             + trainer_dollar_seconds
+            + trainer_wait_dollar_seconds
+            + admission_delay_dollar_seconds
             + queue_wait_dollar_seconds
             + self.promotion_eval_dollar_seconds
         )
@@ -846,6 +860,8 @@ class RuntimeTelemetry:
             "time/wall_clock_s": wall_s,
             "time/rollout_s": self.rollout_s,
             "time/trainer_s": self.trainer_s,
+            "time/trainer_wait_s": self.trainer_wait_s,
+            "time/actor_admission_delay_s": self.actor_admission_delay_s,
             "time/actor_queue_wait_s": self.actor_queue_wait_s,
             "data/trajectories_seen": float(self.trajectories_seen),
             "data/trajectories_accepted": float(self.trajectories_accepted),
@@ -874,8 +890,12 @@ class RuntimeTelemetry:
             "costs/wall_clock_dollar_seconds": dollar_seconds,
             "costs/rollout_dollar_seconds": rollout_dollar_seconds,
             "costs/trainer_dollar_seconds": trainer_dollar_seconds,
+            "costs/trainer_wait_dollar_seconds": trainer_wait_dollar_seconds,
             "costs/promotion_eval_dollar_seconds": (
                 self.promotion_eval_dollar_seconds
+            ),
+            "costs/actor_admission_delay_dollar_seconds": (
+                admission_delay_dollar_seconds
             ),
             "costs/actor_queue_wait_dollar_seconds": queue_wait_dollar_seconds,
             "costs/accounted_dollar_seconds": accounted_dollar_seconds,
@@ -1004,7 +1024,13 @@ class ControlPlane:
                     train_ring=train_ring,
                     policy_step=current.step,
                 )
+                train_wait_started = time.perf_counter()
                 batch = await train_ring.get(current_policy_step=current.step)
+                train_wait_s = time.perf_counter() - train_wait_started
+                train_wait_dollar_seconds = (
+                    train_wait_s * self.config.cost_per_second_usd
+                )
+                telemetry.record_train_wait(train_wait_s)
                 self._tag_batch_control_metadata(
                     batch.groups,
                     max_policy_lag=train_ring.max_policy_lag,
@@ -1026,7 +1052,7 @@ class ControlPlane:
                 candidate_dollar_seconds = train_dollar_seconds + max(
                     0.0,
                     promotion.dollar_seconds,
-                )
+                ) + train_wait_dollar_seconds
                 if scheduler is not None:
                     self._observe_promotion_rollouts(
                         scheduler=scheduler,
@@ -1240,6 +1266,15 @@ class ControlPlane:
     ) -> None:
         while not stop.is_set():
             snapshot = await registry.snapshot()
+            admission_delay_s = await self._apply_rollout_admission_delay(
+                scheduler=scheduler,
+                trajectory_queue=trajectory_queue,
+                train_ring=train_ring,
+                telemetry=telemetry,
+                policy_step=snapshot.step,
+            )
+            if admission_delay_s > 0.0:
+                snapshot = await registry.snapshot()
             decision = await self._select_rollout(
                 scheduler=scheduler,
                 sampler=sampler,
@@ -1297,6 +1332,47 @@ class ControlPlane:
                 started_at=queue_started,
             )
             telemetry.record_actor_queue_wait(queue_wait_s)
+
+    async def _apply_rollout_admission_delay(
+        self,
+        *,
+        scheduler: AdaptiveScheduler | None,
+        trajectory_queue: asyncio.Queue[Trajectory],
+        train_ring: TrajectoryRingBuffer,
+        telemetry: RuntimeTelemetry,
+        policy_step: int,
+    ) -> float:
+        if scheduler is None:
+            return 0.0
+        controller = getattr(scheduler, "rollout_admission_delay_s", None)
+        if controller is None:
+            return 0.0
+        delay_s = max(
+            0.0,
+            float(
+                controller(
+                    trajectory_queue_pressure=self._queue_pressure(
+                        trajectory_queue
+                    ),
+                    train_queue_pressure=self._train_queue_pressure(train_ring),
+                    policy_step=policy_step,
+                )
+            ),
+        )
+        if delay_s <= 0.0:
+            return 0.0
+
+        started = time.perf_counter()
+        await asyncio.sleep(delay_s)
+        elapsed_s = time.perf_counter() - started
+        telemetry.record_actor_admission_delay(elapsed_s)
+        observer = getattr(scheduler, "observe_rollout_admission_delay", None)
+        if observer is not None:
+            observer(
+                seconds=elapsed_s,
+                dollar_seconds=elapsed_s * self.config.cost_per_second_usd,
+            )
+        return elapsed_s
 
     def _resolve_action_codecs(
         self,

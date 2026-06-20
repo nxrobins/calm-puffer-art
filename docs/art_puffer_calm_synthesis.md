@@ -42,25 +42,29 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It estimates marginal reward improvement per dollar-second for each arm.
 - It explores untried arms, then prefers arms with better objective estimates.
 - It reserves in-flight rollout decisions so concurrent actors explore distinct untried arms before feedback arrives.
+- It can delay actor admission before rollout under downstream queue saturation, scaling the delay down when positive objective signal says useful sampling should keep flowing.
 - It scores candidate train batches so ready samples with higher estimated objective value train first.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
 - It credits train-step reward improvement back to active cadence and policy-lag values from the same arm-local credit map, reported under `scheduler/control/*`.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
+- It records verifier failures, reconstruction safety failures, and reconstruction drift as checkpointed scheduler failure modes.
 - It tightens train-batch cadence after positive objective signal so useful gradients are consumed sooner.
 - It widens train-batch cadence under trainer saturation when there is no positive objective signal, reducing low-ROI tiny-batch churn.
 - It tightens policy lag after positive objective signal so high-value samples stay closer to the active checkpoint.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and train-step objective stays below threshold.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective and quality signals make higher semantic bandwidth worth trying, retires promoted chunks after enough bad objective, quality, or safety evidence, and snapshots that action-space state under `action_space/state`.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs when objective and quality signals make higher semantic bandwidth worth trying, retires promoted chunks after enough bad objective, quality, failure-rate, or safety evidence, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
 - It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space/promotion control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
+- It charges trainer wait for a ready batch into the train-objective denominator, so batch cadence pays for idle trainer time.
 - It attributes actor queue-wait cost into scheduler rollout denominators, so backpressure is part of arm/control objective feedback rather than telemetry only.
+- It reports actor admission-delay cost separately, so pre-rollout backpressure avoidance is visible in accounted dollar-seconds instead of disappearing from the control audit.
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation dollar-seconds are included in the train-objective denominator for the candidate.
 
-This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as verifier failure modes, reward variance, reconstruction drift, and per-actor causal cost attribution.
+This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reward variance, reconstruction-drift distributions, and per-actor causal cost attribution.
 
 ## Bounded Staleness
 
