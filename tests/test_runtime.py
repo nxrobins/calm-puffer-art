@@ -1645,6 +1645,67 @@ class RuntimeTests(unittest.TestCase):
             expected_scheduler_cost,
         )
 
+    def test_scheduler_does_not_double_count_rollout_promotion_eval_cost(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="rollout-promotion")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=FixedCostTrainer(score=1.0, dollar_seconds=2.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldoutcosted", payload={"target": 1})],
+                    workflow=costed_counting_rollout,
+                    action_codec=TokenActionCodec(),
+                    min_delta=0.0,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldoutcosted_token/rollout_dollar_seconds"],
+            2.0,
+        )
+        expected_train_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_train_cost,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/train_last_objective"],
+            1.0 / expected_train_cost,
+        )
+
     def test_grouper_drops_trajectories_that_exceed_policy_lag(self):
         grouper = TrajectoryGrouper(group_size=2)
         stale = Trajectory(

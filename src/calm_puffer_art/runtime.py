@@ -1225,9 +1225,19 @@ class ControlPlane:
                     result=result,
                     groups=batch.groups,
                 )
+                promotion_rollout_dollar_seconds = (
+                    _promotion_rollout_dollar_seconds(
+                        promotion,
+                        cost_per_second_usd=self.config.cost_per_second_usd,
+                    )
+                )
+                promotion_overhead_dollar_seconds = max(
+                    0.0,
+                    promotion.dollar_seconds - promotion_rollout_dollar_seconds,
+                )
                 candidate_dollar_seconds = train_dollar_seconds + max(
                     0.0,
-                    promotion.dollar_seconds,
+                    promotion_overhead_dollar_seconds,
                 ) + train_wait_dollar_seconds
                 if scheduler is not None:
                     self._observe_promotion_rollouts(
@@ -2171,6 +2181,20 @@ def _trajectory_eval_dollar_seconds(
     if explicit_cost is not None:
         return explicit_cost
     return max(0.0, trajectory.duration_s) * cost_per_second_usd
+
+
+def _promotion_rollout_dollar_seconds(
+    decision: PromotionDecision,
+    *,
+    cost_per_second_usd: float,
+) -> float:
+    return sum(
+        _trajectory_eval_dollar_seconds(
+            trajectory,
+            cost_per_second_usd=cost_per_second_usd,
+        )
+        for trajectory in decision.trajectories
+    )
 
 
 def _with_promotion_metadata(
