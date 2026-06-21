@@ -78,6 +78,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It treats `cost/dollar_seconds` as total sample/API/tool cost and `rollout/dollar_seconds` as rollout-only cost; when total sample cost is present, local rollout feedback subtracts separately stamped queue-wait and admission-delay cost before scheduler accounting, and otherwise stamps inferred rollout cost before enqueue so train-batch priority reuses the same denominator as arm feedback.
 - It can gate candidate checkpoints through a programmable `PromotionEvaluator`, including held-out workflow rollouts that feed back into scheduler arm evidence and promotion-only adaptive action-space refreshes, so train/eval spend is counted even when a candidate is rejected and scheduler credit follows the promotion-effective score rather than raw trainer-local reward. Promotion-evaluation overhead is included in the train-objective denominator for the candidate, while held-out rollout trajectory costs remain in rollout accounting and are not duplicated.
 - It reports a published-policy north-star companion that counts only positive promoted-checkpoint score improvement times useful promoted-batch experience, so rejected candidates remain spend without becoming useful policy improvement in run-level audits.
+- It exposes local runtime throughput, drop/failure-rate, accounted-spend-rate, and stage-utilization telemetry, so Puffer-like sample production can be audited by bottleneck and spend rate rather than only by final reward metrics.
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 - It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
 
@@ -171,5 +172,6 @@ Phase 4: Measurement
 - Keep the deterministic static-vs-objective ablations green as local proof that scheduler control and adaptive action-space control improve the north-star on controlled workloads, including learned actor-count, cadence, lag, and chunk-granularity controls together.
 - Benchmark stock ART, ART plus async runtime, and ART plus async runtime plus semantic actions.
 - Report reward-improving experience per dollar-second, not only throughput.
+- Report throughput and utilization next to the objective so rollouts/sec gains are distinguishable from reward-improving experience gains.
 - Compare both wall-clock infrastructure cost and accounted rollout/trainer/queue cost, including explicit rollout dollar-seconds for API, token, tool, or GPU spend when available.
 - Include ablations for `max_policy_lag`, `train_queue_capacity`, actor count, and action codec.

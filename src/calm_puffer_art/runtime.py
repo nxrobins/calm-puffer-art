@@ -969,6 +969,8 @@ class RuntimeTelemetry:
             )
         else:
             accounted_published_reward_experience = 0.0
+        trajectories_seen = max(float(self.trajectories_seen), 1.0)
+        train_steps = max(float(self.train_steps), 1.0)
 
         return {
             "time/wall_clock_s": wall_s,
@@ -985,10 +987,44 @@ class RuntimeTelemetry:
             "data/groups_trained": float(self.groups_trained),
             "data/train_steps": float(self.train_steps),
             "data/checkpoints_promoted": float(self.promotions),
+            "data/trajectory_acceptance_rate": (
+                self.trajectories_accepted / trajectories_seen
+            ),
+            "data/trajectory_failure_rate": (
+                self.trajectories_failed / trajectories_seen
+            ),
+            "data/stale_drop_rate": stale_dropped / trajectories_seen,
+            "data/train_groups_per_step": self.groups_trained / train_steps,
+            "throughput/trajectories_seen_per_s": self.trajectories_seen / wall_s,
             "throughput/accepted_trajectories_per_s": self.trajectories_accepted
             / wall_s,
+            "throughput/failed_trajectories_per_s": (
+                self.trajectories_failed / wall_s
+            ),
+            "throughput/stale_trajectories_dropped_per_s": stale_dropped / wall_s,
+            "throughput/groups_trained_per_s": self.groups_trained / wall_s,
+            "throughput/train_steps_per_s": self.train_steps / wall_s,
+            "throughput/checkpoints_promoted_per_s": self.promotions / wall_s,
             "throughput/action_units_per_s": self.action_units / wall_s,
             "throughput/source_tokens_per_s": self.source_tokens / wall_s,
+            "throughput/rollout_dollar_seconds_per_s": (
+                rollout_dollar_seconds / wall_s
+            ),
+            "throughput/trainer_dollar_seconds_per_s": (
+                trainer_dollar_seconds / wall_s
+            ),
+            "throughput/accounted_dollar_seconds_per_s": (
+                accounted_dollar_seconds / wall_s
+            ),
+            "utilization/rollout_parallelism": self.rollout_s / wall_s,
+            "utilization/trainer": self.trainer_s / wall_s,
+            "utilization/trainer_wait": self.trainer_wait_s / wall_s,
+            "utilization/actor_admission_delay_parallelism": (
+                self.actor_admission_delay_s / wall_s
+            ),
+            "utilization/actor_queue_wait_parallelism": (
+                self.actor_queue_wait_s / wall_s
+            ),
             "actions/semantic_bandwidth_tokens_per_decision": self.source_tokens
             / self.action_units
             if self.action_units

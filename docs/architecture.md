@@ -262,6 +262,9 @@ The runtime also reports attributed cost telemetry:
 - `north_star/accounted_reward_improving_experience_per_dollar_second`: the same reward-improvement numerator divided by accounted cost.
 - `north_star/published_policy_reward_improving_experience_per_dollar_second`: promoted checkpoint score improvement times useful promoted-batch experience, divided by wall-clock dollar-seconds.
 - `north_star/accounted_published_policy_reward_improving_experience_per_dollar_second`: the same published-policy numerator divided by accounted rollout, trainer, trainer-wait, promotion-evaluation, admission-delay, and queue-wait spend.
+- `throughput/*_per_s`: wall-clock-normalized trajectory, train-step, group, checkpoint, action-unit, source-token, stale-drop, and dollar-second rates.
+- `utilization/*`: rollout, trainer, trainer-wait, queue-wait, and admission-delay seconds divided by wall-clock seconds, exposing serial bottlenecks and parallel actor occupancy.
+- `data/trajectory_acceptance_rate`, `data/trajectory_failure_rate`, `data/stale_drop_rate`, and `data/train_groups_per_step`: sample-production health ratios for auditing backpressure and train cadence.
 - `scheduler/budget/projected_accounted_dollar_seconds`: observed accounted spend plus reserved in-flight rollout cost used by the hard budget gate.
 - `scheduler/budget/reserved_inflight_rollout_dollar_seconds`: estimated rollout cost reserved by admitted actor decisions whose feedback has not arrived yet.
 
@@ -287,7 +290,7 @@ Implemented now:
 - Explicit total sample and rollout-only dollar-second overrides for API/token/tool/GPU cost accounting.
 - Explicit train dollar-second overrides for trainer/API/GPU cost accounting.
 - Pressure-aware train cadence that widens low-ROI batches under trainer saturation.
-- Rollout, trainer, queue-wait, wall-clock, and accounted cost telemetry.
+- Rollout, trainer, queue-wait, wall-clock, accounted cost, throughput, and utilization telemetry.
 - Actor queue-wait cost attribution into scheduler rollout objective denominators.
 - Stale train-batch discard feedback into scheduler arm, cadence, and policy-lag objective memory.
 - Opt-in stale feedback demotion refresh for adaptive action-space codecs.

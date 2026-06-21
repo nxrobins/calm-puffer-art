@@ -1820,6 +1820,96 @@ class RuntimeTests(unittest.TestCase):
             metrics,
         )
 
+    def test_runtime_telemetry_reports_sample_production_rates(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=2.0)
+        telemetry.started_at = time.perf_counter() - 10.0
+        accepted = Trajectory(
+            scenario_id="rate",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=4.0,
+        )
+        failed = Trajectory(
+            scenario_id="rate",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            duration_s=1.0,
+            exception="boom",
+        )
+
+        telemetry.record_actor_admission_delay(0.5)
+        telemetry.record_actor_queue_wait(1.0)
+        telemetry.record_train_wait(2.0)
+        telemetry.record_trajectory(accepted, accepted=True)
+        telemetry.record_trajectory(failed, accepted=False)
+        telemetry.record_train(
+            [TrajectoryGroup(scenario_id="rate", trajectories=(accepted,))],
+            TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=3.0,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=1)
+        wall_s = metrics["time/wall_clock_s"]
+
+        self.assertEqual(metrics["data/trajectory_acceptance_rate"], 0.5)
+        self.assertEqual(metrics["data/trajectory_failure_rate"], 0.5)
+        self.assertEqual(metrics["data/stale_drop_rate"], 0.5)
+        self.assertEqual(metrics["data/train_groups_per_step"], 1.0)
+        self.assertAlmostEqual(
+            metrics["throughput/trajectories_seen_per_s"],
+            2.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/accepted_trajectories_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/failed_trajectories_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/stale_trajectories_dropped_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/groups_trained_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/train_steps_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/rollout_dollar_seconds_per_s"],
+            10.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/trainer_dollar_seconds_per_s"],
+            6.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/accounted_dollar_seconds_per_s"],
+            23.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["utilization/rollout_parallelism"],
+            5.0 / wall_s,
+        )
+        self.assertAlmostEqual(metrics["utilization/trainer"], 3.0 / wall_s)
+        self.assertAlmostEqual(metrics["utilization/trainer_wait"], 2.0 / wall_s)
+        self.assertAlmostEqual(
+            metrics["utilization/actor_admission_delay_parallelism"],
+            0.5 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["utilization/actor_queue_wait_parallelism"],
+            1.0 / wall_s,
+        )
+
     def test_runtime_telemetry_attributes_trainer_wait_cost(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=5.0)
 
