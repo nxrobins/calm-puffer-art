@@ -3184,12 +3184,12 @@ class ObjectiveScheduler:
         arm_weights: Mapping[str, float],
     ) -> None:
         if objective is not None:
-            self._credit_objective_to_controls(
-                groups,
-                objective,
-                stale_feedback=False,
-            )
-            return
+            train_objective = sum(max(0.0, value) for value in arm_objectives.values())
+            scale = objective / train_objective if train_objective > 0.0 else 0.0
+            arm_objectives = {
+                arm_id: max(0.0, value) * scale
+                for arm_id, value in arm_objectives.items()
+            }
         self._credit_train_objective_to_control_family(
             self._cadence_controls,
             groups,

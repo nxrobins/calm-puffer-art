@@ -2074,6 +2074,100 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/control/policy_lag_1/objective_ema"],
         )
 
+    def test_accounted_train_control_credit_follows_improving_arm_in_mixed_batch(
+        self,
+    ):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.0,
+        )
+        high_reward_baseline = Trajectory(
+            scenario_id="high-static",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=10.0,
+            metadata={"scheduler/arm_id": "high-static|token"},
+        )
+        scheduler.observe_train(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="high-static",
+                    trajectories=(high_reward_baseline,),
+                )
+            ],
+            result=TrainResult(metrics={"train/reward": 10.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+
+        high_reward_static = Trajectory(
+            scenario_id="high-static",
+            policy_step=1,
+            messages=[],
+            actions=[],
+            reward=10.0,
+            metadata={
+                "scheduler/arm_id": "high-static|token",
+                "scheduler/active_target_train_batch_groups": 4,
+            },
+        )
+        low_reward_improving = Trajectory(
+            scenario_id="low-improving",
+            policy_step=1,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "low-improving|token",
+                "scheduler/active_target_train_batch_groups": 1,
+            },
+        )
+        scheduler.observe_train(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="mixed-control",
+                    trajectories=(high_reward_static, low_reward_improving),
+                )
+            ],
+            result=TrainResult(metrics={"train/reward": 10.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/accounted_last_objective"], 10.0)
+        self.assertEqual(
+            metrics["scheduler/arm/high_static_token/last_train_reward_improvement"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/low_improving_token/last_train_reward_improvement"],
+            10.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/cadence_4/total_objective"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/control/cadence_1/total_objective"],
+            10.0,
+        )
+        self.assertEqual(
+            scheduler.target_train_batch_groups(
+                configured=2,
+                pending_groups=0,
+                train_queue_pressure=0.0,
+                policy_step=2,
+            ),
+            1,
+        )
+
     def test_stale_batch_feedback_penalizes_arms_and_controls(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,

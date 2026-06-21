@@ -80,7 +80,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It reports a published-policy north-star companion that counts only positive promoted-checkpoint score improvement times useful promoted-batch experience, so rejected candidates remain spend without becoming useful policy improvement in run-level audits.
 - It exposes local runtime throughput, drop/failure-rate, accounted-spend-rate, and stage-utilization telemetry, so Puffer-like sample production can be audited by bottleneck and spend rate rather than only by final reward metrics.
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
-- It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
+- It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone, while mixed-batch credit still follows each arm's actual train-improvement contribution instead of raw trajectory reward.
 
 This is still a local bandit controller, not the final supremum. It now has an opt-in reward-scale safeguard for heterogeneous workflows, but broader policy-level comparability still depends on users exposing meaningful reward scales, promotion gates, or evaluators for their domains.
 
