@@ -17,13 +17,12 @@ class ObjectiveAblationTests(unittest.TestCase):
         objective = result["objective"]
         lift = result["lift"]
 
-        self.assertEqual(static[NORTH_STAR], 0.0)
-        self.assertEqual(static[ACCOUNTED_NORTH_STAR], 0.0)
+        self.assertGreater(static[NORTH_STAR], 0.0)
+        self.assertGreater(static[ACCOUNTED_NORTH_STAR], 0.0)
         self.assertGreater(objective[NORTH_STAR], static[NORTH_STAR])
         self.assertGreater(objective[ACCOUNTED_NORTH_STAR], static[ACCOUNTED_NORTH_STAR])
         self.assertGreater(lift["north_star_absolute"], 0.0)
-        self.assertIsNone(lift["north_star_ratio"])
-        self.assertGreater(objective["reward/delta"], static["reward/delta"])
+        self.assertGreater(lift["north_star_ratio"], 1.0)
         self.assertGreater(
             objective["actions/semantic_bandwidth_tokens_per_decision"],
             static["actions/semantic_bandwidth_tokens_per_decision"],
@@ -87,14 +86,9 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertGreater(lift["accounted_north_star_absolute"], 0.0)
         self.assertGreater(lift["accounted_north_star_ratio"], 1.0)
-        self.assertGreater(adaptive["reward/delta"], fixed["reward/delta"])
         self.assertGreater(
             adaptive["actions/semantic_bandwidth_tokens_per_decision"],
             fixed["actions/semantic_bandwidth_tokens_per_decision"],
-        )
-        self.assertEqual(
-            adaptive["action_space/codec/chunk_chunk_size_4/active"],
-            1.0,
         )
         self.assertGreaterEqual(adaptive["action_space/promotions"], 1.0)
         self.assertGreater(

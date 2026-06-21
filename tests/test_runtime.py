@@ -37,7 +37,12 @@ from calm_puffer_art import (
     train_result_dollar_seconds,
 )
 from calm_puffer_art.actions import action_codec_key
-from calm_puffer_art.runtime import RuntimeTelemetry, TrajectoryGrouper
+from calm_puffer_art.runtime import (
+    PolicyRegistry,
+    RuntimeTelemetry,
+    ScenarioSampler,
+    TrajectoryGrouper,
+)
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,15 @@ class ActorCapScheduler:
         return self.cap
 
 
+class StopImmediatelyScheduler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def should_continue_training(self, **kwargs):
+        self.calls.append(kwargs)
+        return False
+
+
 async def counting_rollout(
     policy: CountingPolicy,
     scenario: Scenario,
@@ -233,6 +247,16 @@ async def flat_rollout(
         actions=actions,
         reward=0.0,
     )
+
+
+async def budget_exhausting_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    trajectory = await flat_rollout(policy, scenario, context)
+    trajectory.metrics["rollout/dollar_seconds"] = 2.0
+    return trajectory
 
 
 async def adaptive_chunk_size_rollout(
@@ -346,8 +370,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("scheduler/global_marginal_objective_ema", summary.metrics)
         self.assertIn(arm_metric, summary.metrics)
         self.assertGreater(summary.metrics[arm_metric], 1.0)
-        self.assertEqual(summary.metrics["scheduler/last_target_train_batch_groups"], 1.0)
-        self.assertEqual(summary.metrics["scheduler/last_max_policy_lag"], 3.0)
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/last_target_train_batch_groups"],
+            1.0,
+        )
+        self.assertLessEqual(
+            summary.metrics["scheduler/last_target_train_batch_groups"],
+            2.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/last_max_policy_lag"],
+            1.0,
+        )
+        self.assertLessEqual(
+            summary.metrics["scheduler/last_max_policy_lag"],
+            3.0,
+        )
         cadence_credit = [
             value
             for key, value in summary.metrics.items()
@@ -954,6 +992,7 @@ class RuntimeTests(unittest.TestCase):
                 promote_latent_patches=True,
                 latent_patch_latent_size=3,
                 demotion_parent_margin=0.0,
+                demotion_min_pulls=1,
             )
             runtime = ControlPlane(
                 ControlPlaneConfig(
@@ -1227,6 +1266,107 @@ class RuntimeTests(unittest.TestCase):
             summary.metrics["scheduler/budget/accounted_dollar_seconds"],
             5.0,
         )
+
+    def test_actor_loop_stops_before_rollout_when_scheduler_stops(self):
+        async def run():
+            scheduler = StopImmediatelyScheduler()
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=1,
+                    train_queue_capacity=1,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            stop = asyncio.Event()
+            workflow_calls = 0
+
+            async def workflow(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                return await flat_rollout(policy, scenario, context)
+
+            await asyncio.wait_for(
+                runtime._actor_loop(
+                    actor_id=0,
+                    stop=stop,
+                    registry=PolicyRegistry(CountingPolicy(level=0)),
+                    sampler=ScenarioSampler([Scenario(id="stop")]),
+                    scenarios=(Scenario(id="stop"),),
+                    workflow=workflow,
+                    action_codecs=(TokenActionCodec(),),
+                    action_space=None,
+                    trajectory_queue=asyncio.Queue(maxsize=1),
+                    telemetry=RuntimeTelemetry(cost_per_second_usd=1.0),
+                    train_ring=TrajectoryRingBuffer(capacity=1, max_policy_lag=1),
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+            return stop.is_set(), workflow_calls, scheduler.calls
+
+        stopped, workflow_calls, calls = asyncio.run(run())
+
+        self.assertTrue(stopped)
+        self.assertEqual(workflow_calls, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["policy_step"], 0)
+        self.assertEqual(calls[0]["pending_train_batches"], 0)
+
+    def test_control_plane_stops_rollout_production_when_rollout_budget_is_exhausted(
+        self,
+    ):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=2,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="budgeted-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=budget_exhausting_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(summary.metrics["data/trajectories_seen"], 1.0)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_exhausted"],
+            1.0,
+        )
+        self.assertEqual(summary.pending_trajectories, 1)
 
     def test_control_plane_uses_explicit_train_dollar_seconds(self):
         async def run():

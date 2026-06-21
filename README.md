@@ -250,7 +250,7 @@ result = await future
 - `examples/counting_agent.py`: a deterministic trainable toy policy whose reward improves over checkpoints.
 - `examples/adaptive_scheduler_agent.py`: a deterministic closed-loop scheduler demo that learns which scenario/action-codec arm has better reward-per-cost signal.
 - `examples/adaptive_action_space_agent.py`: a deterministic demo where objective feedback promotes a larger chunk action codec during the run.
-- `examples/objective_ablation.py`: deterministic static-vs-objective comparisons that report north-star lift from scheduler control and adaptive action-space control.
+- `examples/objective_ablation.py`: deterministic static-vs-objective comparisons that report published-policy north-star lift from scheduler control and adaptive action-space control.
 - `docs/art_puffer_calm_synthesis.md`: cleaned integration plan for the ART backend and future optional CALM layer.
 
 ## Non-goals

@@ -23,9 +23,11 @@ from .types import (
 )
 
 
-NORTH_STAR = "north_star/reward_improving_experience_per_dollar_second"
+NORTH_STAR = (
+    "north_star/published_policy_reward_improving_experience_per_dollar_second"
+)
 ACCOUNTED_NORTH_STAR = (
-    "north_star/accounted_reward_improving_experience_per_dollar_second"
+    "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
 )
 
 

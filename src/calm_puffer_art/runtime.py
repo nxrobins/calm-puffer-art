@@ -1191,7 +1191,9 @@ class ControlPlane:
                     policy_step=current.step,
                 )
                 train_wait_started = time.perf_counter()
-                batch = await train_ring.get(
+                batch = await self._get_train_batch_or_stop(
+                    stop=stop,
+                    train_ring=train_ring,
                     current_policy_step=current.step,
                     priority_scorer=self._batch_priority_scorer(scheduler),
                 )
@@ -1200,6 +1202,8 @@ class ControlPlane:
                     train_wait_s * self.config.cost_per_second_usd
                 )
                 telemetry.record_train_wait(train_wait_s)
+                if batch is None:
+                    break
                 self._tag_batch_control_metadata(
                     batch.groups,
                     max_policy_lag=train_ring.max_policy_lag,
@@ -1455,6 +1459,13 @@ class ControlPlane:
     ) -> None:
         while not stop.is_set():
             snapshot = await registry.snapshot()
+            if not self._should_continue_training(
+                scheduler=scheduler,
+                train_ring=train_ring,
+                policy_step=snapshot.step,
+            ):
+                stop.set()
+                break
             active_actor_count = self._active_actor_count(
                 scheduler=scheduler,
                 trajectory_queue=trajectory_queue,
@@ -1473,6 +1484,13 @@ class ControlPlane:
             )
             if admission_delay_s > 0.0:
                 snapshot = await registry.snapshot()
+                if not self._should_continue_training(
+                    scheduler=scheduler,
+                    train_ring=train_ring,
+                    policy_step=snapshot.step,
+                ):
+                    stop.set()
+                    break
             decision = await self._select_rollout(
                 scheduler=scheduler,
                 sampler=sampler,
@@ -1551,6 +1569,42 @@ class ControlPlane:
                 started_at=queue_started,
             )
             telemetry.record_actor_queue_wait(queue_wait_s)
+            # Let batcher feedback update scheduler controls before this actor
+            # admits more rollout spend.
+            await asyncio.sleep(0)
+
+    async def _get_train_batch_or_stop(
+        self,
+        *,
+        stop: asyncio.Event,
+        train_ring: TrajectoryRingBuffer,
+        current_policy_step: int,
+        priority_scorer: Callable[[VersionedTrajectoryBatch, int], float]
+        | None = None,
+    ) -> VersionedTrajectoryBatch | None:
+        batch_task = asyncio.create_task(
+            train_ring.get(
+                current_policy_step=current_policy_step,
+                priority_scorer=priority_scorer,
+            )
+        )
+        stop_task = asyncio.create_task(stop.wait())
+        tasks = (batch_task, stop_task)
+        pending: set[asyncio.Task[Any]] = set()
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and stop.is_set():
+                return None
+            return await batch_task
+        finally:
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     def _active_actor_count(
         self,
