@@ -14,6 +14,7 @@ from .actions import (
     semantic_bandwidth,
 )
 from .art_adapter import (
+    ART_BACKEND_STATE_KEY,
     ART_RAW_GROUP_KEY,
     ART_RAW_TRAJECTORY_KEY,
     ArtAdapterConfig,
@@ -93,6 +94,7 @@ __all__ = [
     "AgentPolicy",
     "ACCOUNTED_NORTH_STAR",
     "ACTION_SPACE_STATE_KEY",
+    "ART_BACKEND_STATE_KEY",
     "ART_RAW_GROUP_KEY",
     "ART_RAW_TRAJECTORY_KEY",
     "ArtAdapterConfig",

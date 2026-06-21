@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from calm_puffer_art import (
     ACTION_SPACE_STATE_KEY,
+    ART_BACKEND_STATE_KEY,
     ART_RAW_GROUP_KEY,
     ART_RAW_TRAJECTORY_KEY,
     AdaptiveActionSpace,
@@ -268,6 +269,16 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(update.step, 1)
         self.assertEqual(update.checkpoint_id, "step_1")
         self.assertEqual(update.metadata["art/step"], 1)
+        self.assertEqual(
+            update.metadata[ART_BACKEND_STATE_KEY]["published_policy_updates"],
+            1,
+        )
+        self.assertEqual(
+            update.metadata[ART_BACKEND_STATE_KEY][
+                "published_policy_improvement"
+            ],
+            0.75,
+        )
         self.assertEqual(update.metadata[SCHEDULER_STATE_KEY]["version"], 1)
         self.assertIn("art-task|art", update.metadata[SCHEDULER_STATE_KEY]["arms"])
         self.assertGreater(
@@ -500,6 +511,7 @@ class ArtAdapterTests(unittest.TestCase):
                 "action_space": True,
                 "promotion": False,
                 "policy_step": True,
+                "art_backend": True,
             },
         )
         self.assertEqual(resolved_step, update.step)
@@ -520,6 +532,59 @@ class ArtAdapterTests(unittest.TestCase):
             action_codec_key(second.action_codec),
         }
         self.assertIn("chunk(chunk_size=4)", selected_codec_keys)
+
+    def test_async_art_backend_restores_published_policy_accounting(self):
+        async def run():
+            first_backend = FakeArtBackend()
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            first_async_backend = AsyncArtBackend(
+                backend=first_backend,
+                weight_channel=channel,
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metadata={"scenario_id": "published-art"},
+                    )
+                ],
+                metadata={"scenario_id": "published-art"},
+            )
+
+            await first_async_backend.register("art-model")
+            await first_async_backend.train("art-model", [art_group])
+            update = updates.get_nowait()
+            await first_async_backend.close()
+
+            resumed_backend = FakeArtBackend()
+            resumed_async_backend = AsyncArtBackend(backend=resumed_backend)
+            snapshot = PolicySnapshot(
+                step=update.step,
+                policy="art-model",
+                checkpoint_id=update.checkpoint_id,
+                created_at=update.created_at,
+                metadata=update.metadata,
+            )
+            restored = resumed_async_backend.restore_control_state(snapshot)
+            await resumed_async_backend.register("art-model")
+            await resumed_async_backend.train("art-model", [art_group])
+            stats = resumed_async_backend.stats()
+            await resumed_async_backend.close()
+            return restored, stats
+
+        restored, stats = asyncio.run(run())
+
+        self.assertTrue(restored["art_backend"])
+        self.assertEqual(stats["art_backend/published_policy_updates"], 2.0)
+        self.assertEqual(stats["art_backend/published_policy_improvement"], 0.75)
+        self.assertEqual(
+            stats["art_backend/published_policy_reward_improving_experience"],
+            0.75,
+        )
+        self.assertEqual(stats["art_backend/latest_published_policy_score"], 0.75)
 
     def test_async_art_backend_selects_external_art_rollout_and_metadata(self):
         async def run():

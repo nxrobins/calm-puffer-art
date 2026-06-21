@@ -44,6 +44,7 @@ from .types import (
 
 ART_RAW_GROUP_KEY = "art/raw_group"
 ART_RAW_TRAJECTORY_KEY = "art/raw_trajectory"
+ART_BACKEND_STATE_KEY = "art_backend/state"
 
 
 class StaleArtBatchError(RuntimeError):
@@ -352,12 +353,65 @@ class AsyncArtBackend:
             )
         )
         restored["policy_step"] = False
+        restored["art_backend"] = False
         step = _source_policy_step(source)
         if step is not None:
             self._current_step = max(self._current_step, step)
             self.ring.current_policy_step = self._current_step
             restored["policy_step"] = True
+        metadata = _source_metadata(source)
+        backend_state = metadata.get(ART_BACKEND_STATE_KEY)
+        if isinstance(backend_state, Mapping):
+            self.load_state_dict(backend_state)
+            restored["art_backend"] = True
         return restored
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return JSON-friendly ART bridge accounting state."""
+
+        return {
+            "version": 1,
+            "published_policy_updates": self._published_policy_updates,
+            "published_policy_improvement": self._published_policy_improvement,
+            "published_policy_reward_improving_experience": (
+                self._published_policy_reward_improving_experience
+            ),
+            "latest_published_policy_score": self._latest_published_policy_score,
+            "last_published_policy_score": self._last_published_policy_score,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Load state produced by :meth:`state_dict`."""
+
+        self._published_policy_updates = max(
+            0,
+            _state_int(
+                state.get("published_policy_updates"),
+                self._published_policy_updates,
+            ),
+        )
+        self._published_policy_improvement = max(
+            0.0,
+            _state_float(
+                state.get("published_policy_improvement"),
+                self._published_policy_improvement,
+            ),
+        )
+        self._published_policy_reward_improving_experience = max(
+            0.0,
+            _state_float(
+                state.get("published_policy_reward_improving_experience"),
+                self._published_policy_reward_improving_experience,
+            ),
+        )
+        self._latest_published_policy_score = _state_float(
+            state.get("latest_published_policy_score"),
+            self._latest_published_policy_score,
+        )
+        self._last_published_policy_score = _state_float(
+            state.get("last_published_policy_score"),
+            self._last_published_policy_score,
+        )
 
     async def admit_rollout(
         self,
@@ -805,11 +859,13 @@ class AsyncArtBackend:
                         self.action_space.update_from_metrics(
                             self.scheduler.metrics()
                         )
+                self._record_published_update(local_result, batch.groups)
                 checkpoint_metadata = dict(local_result.metadata)
                 checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
                 checkpoint_metadata.update(
                     action_space_checkpoint_metadata(self.action_space)
                 )
+                checkpoint_metadata[ART_BACKEND_STATE_KEY] = self.state_dict()
                 snapshot = PolicySnapshot(
                     step=self._current_step,
                     policy=model,
@@ -821,7 +877,6 @@ class AsyncArtBackend:
                     metadata=checkpoint_metadata,
                 )
                 await self.weight_channel.publish(snapshot)
-                self._record_published_update(local_result, batch.groups)
                 self._completed_batches += 1
                 for future in futures:
                     if not future.done():
@@ -1427,9 +1482,43 @@ def _source_policy_step(
     return None
 
 
+def _source_metadata(
+    source: Mapping[str, Any] | PolicySnapshot | Checkpoint | None,
+) -> Mapping[str, Any]:
+    if source is None:
+        return {}
+    if isinstance(source, (PolicySnapshot, Checkpoint)):
+        return source.metadata
+    if not isinstance(source, Mapping):
+        return {}
+    nested = source.get("metadata")
+    if isinstance(nested, Mapping):
+        return nested
+    return source
+
+
 def _first_int(*values: Any) -> int:
     for value in values:
         parsed = _optional_int(value)
         if parsed is not None:
             return parsed
     return 0
+
+
+def _state_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _state_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return default
+    return candidate if isfinite(candidate) else default
