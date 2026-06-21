@@ -2084,6 +2084,63 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/arm/task_token/decision_share"],
         )
 
+    def test_rollout_coverage_floor_respects_cost_cap(self):
+        scenarios = [Scenario(id="task")]
+        codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_rollout_coverage_fraction=0.25,
+            max_rollout_coverage_cost_fraction=0.5,
+        )
+
+        rewards = {
+            "task|token": 1.0,
+            "task|chunk(chunk_size=2)": 0.1,
+        }
+        costs = {
+            "task|token": 1.0,
+            "task|chunk(chunk_size=2)": 10.0,
+        }
+        decisions = []
+        for _ in range(6):
+            decision = scheduler.select_rollout(
+                scenarios=scenarios,
+                action_codecs=codecs,
+                actor_id=0,
+                policy_step=0,
+                trajectory_queue_pressure=0.0,
+                train_queue_pressure=0.0,
+                configured_train_batch_groups=2,
+                configured_max_policy_lag=2,
+            )
+            decisions.append(decision)
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=decision.scenario.id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=rewards[decision.arm_id],
+                    metadata={"scheduler/arm_id": decision.arm_id},
+                ),
+                accepted=True,
+                dollar_seconds=costs[decision.arm_id],
+            )
+
+        metrics = scheduler.metrics()
+
+        self.assertEqual(decisions[-1].arm_id, "task|token")
+        self.assertFalse(decisions[-1].metadata["coverage_forced"])
+        self.assertTrue(decisions[-1].metadata["coverage_cost_limited"])
+        self.assertEqual(decisions[-1].metadata["coverage_cost_limit"], 0.5)
+        self.assertEqual(metrics["scheduler/coverage/forced_decisions"], 0.0)
+        self.assertEqual(metrics["scheduler/coverage/max_cost_fraction"], 0.5)
+        self.assertEqual(metrics["scheduler/coverage/last_cost_limited"], 1.0)
+        self.assertGreater(
+            metrics["scheduler/arm/task_chunk_chunk_size_2/sample_dollar_share"],
+            0.5,
+        )
+
     def test_rollout_coverage_floor_is_capped_by_arm_count(self):
         scenarios = [Scenario(id="left"), Scenario(id="right")]
         codecs = [TokenActionCodec()]
@@ -2521,6 +2578,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             control_exploration_bonus=0.15,
             max_control_candidate_values=5,
             min_rollout_coverage_fraction=0.2,
+            max_rollout_coverage_cost_fraction=0.4,
             roi_patience=3,
             min_train_objective=0.01,
             continuation_objective="accounted",
@@ -2583,6 +2641,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.control_exploration_bonus, 0.15)
         self.assertEqual(restored.max_control_candidate_values, 5)
         self.assertEqual(restored.min_rollout_coverage_fraction, 0.2)
+        self.assertEqual(restored.max_rollout_coverage_cost_fraction, 0.4)
         self.assertEqual(restored.min_actor_count, 1)
         self.assertEqual(restored.max_actor_count_limit, 4)
         self.assertEqual(restored.continuation_objective, "accounted")
@@ -2637,10 +2696,13 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_max_policy_lag",
             "scheduler/weights/control_exploration",
             "scheduler/coverage/min_fraction",
+            "scheduler/coverage/max_cost_fraction",
             "scheduler/coverage/forced_decisions",
             "scheduler/coverage/last_target",
             "scheduler/coverage/last_share",
             "scheduler/coverage/last_deficit",
+            "scheduler/coverage/last_cost_share",
+            "scheduler/coverage/last_cost_limited",
             "scheduler/max_control_candidate_values",
         ):
             self.assertAlmostEqual(restored_metrics[key], before_metrics[key])

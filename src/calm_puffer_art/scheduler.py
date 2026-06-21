@@ -256,6 +256,7 @@ class ObjectiveScheduler:
         control_exploration_bonus: float = 0.1,
         max_control_candidate_values: int = 8,
         min_rollout_coverage_fraction: float = 0.0,
+        max_rollout_coverage_cost_fraction: float | None = None,
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
@@ -300,6 +301,13 @@ class ObjectiveScheduler:
         if not 0 <= min_rollout_coverage_fraction <= 1:
             raise ValueError(
                 "min_rollout_coverage_fraction must be in [0, 1]"
+            )
+        if (
+            max_rollout_coverage_cost_fraction is not None
+            and not 0 < max_rollout_coverage_cost_fraction <= 1
+        ):
+            raise ValueError(
+                "max_rollout_coverage_cost_fraction must be in (0, 1] when set"
             )
         if min_train_steps < 0:
             raise ValueError("min_train_steps must be non-negative")
@@ -349,6 +357,9 @@ class ObjectiveScheduler:
         self.control_exploration_bonus = control_exploration_bonus
         self.max_control_candidate_values = max_control_candidate_values
         self.min_rollout_coverage_fraction = min_rollout_coverage_fraction
+        self.max_rollout_coverage_cost_fraction = (
+            max_rollout_coverage_cost_fraction
+        )
         self.min_train_steps = min_train_steps
         self.roi_patience = roi_patience
         self.min_train_objective = min_train_objective
@@ -391,6 +402,8 @@ class ObjectiveScheduler:
         self._last_rollout_coverage_target = 0.0
         self._last_rollout_coverage_share = 0.0
         self._last_rollout_coverage_deficit = 0.0
+        self._last_rollout_coverage_cost_share = 0.0
+        self._last_rollout_coverage_cost_limited = False
         self._last_train_batch_priority = 0.0
         self._last_train_batch_policy_lag = 0
         self._last_train_batch_lag_limit = -1
@@ -437,7 +450,8 @@ class ObjectiveScheduler:
             raise ValueError("at least one action codec is required")
 
         arms = self._arm_candidates(scenarios, action_codecs)
-        coverage_selection = self._coverage_candidate(arms)
+        coverage_selection, coverage_cost_limited = self._coverage_candidate(arms)
+        arm_ids = [candidate[0] for candidate in arms]
         if coverage_selection is None:
             arm_id, scenario, codec = max(
                 arms,
@@ -447,6 +461,7 @@ class ObjectiveScheduler:
             coverage_target = self._effective_coverage_target(len(arms))
             coverage_share = self._arm_decision_share(arm_id)
             coverage_deficit = max(0.0, coverage_target - coverage_share)
+            coverage_cost_share = self._arm_sample_dollar_share(arm_id, arm_ids)
         else:
             (
                 arm_id,
@@ -455,9 +470,11 @@ class ObjectiveScheduler:
                 coverage_target,
                 coverage_share,
                 coverage_deficit,
+                coverage_cost_share,
             ) = coverage_selection
             coverage_forced = True
             self._coverage_forced_decisions += 1
+        coverage_cost_limit = self.max_rollout_coverage_cost_fraction or 0.0
         selected_stats = self._arms[arm_id]
         decision_score = self._score_arm(arm_id)
         objective_score = self._arm_value(selected_stats)
@@ -469,6 +486,8 @@ class ObjectiveScheduler:
         self._last_rollout_coverage_target = coverage_target
         self._last_rollout_coverage_share = coverage_share
         self._last_rollout_coverage_deficit = coverage_deficit
+        self._last_rollout_coverage_cost_share = coverage_cost_share
+        self._last_rollout_coverage_cost_limited = coverage_cost_limited
         decision = SchedulerDecision(
             scenario=scenario,
             action_codec=codec,
@@ -497,6 +516,9 @@ class ObjectiveScheduler:
                 "coverage_target": coverage_target,
                 "coverage_share": coverage_share,
                 "coverage_deficit": coverage_deficit,
+                "coverage_cost_share": coverage_cost_share,
+                "coverage_cost_limit": coverage_cost_limit,
+                "coverage_cost_limited": coverage_cost_limited,
                 "expected_rollout_dollar_seconds": (
                     selected_stats.dollar_seconds_ema
                     if selected_stats.pulls
@@ -1076,6 +1098,9 @@ class ObjectiveScheduler:
                 "min_rollout_coverage_fraction": (
                     self.min_rollout_coverage_fraction
                 ),
+                "max_rollout_coverage_cost_fraction": (
+                    self.max_rollout_coverage_cost_fraction
+                ),
                 "min_train_steps": self.min_train_steps,
                 "roi_patience": self.roi_patience,
                 "min_train_objective": self.min_train_objective,
@@ -1158,6 +1183,12 @@ class ObjectiveScheduler:
                 "last_rollout_coverage_share": self._last_rollout_coverage_share,
                 "last_rollout_coverage_deficit": (
                     self._last_rollout_coverage_deficit
+                ),
+                "last_rollout_coverage_cost_share": (
+                    self._last_rollout_coverage_cost_share
+                ),
+                "last_rollout_coverage_cost_limited": (
+                    self._last_rollout_coverage_cost_limited
                 ),
                 "global_action_quality_ema": self._global_action_quality_ema,
                 "low_roi_train_steps": self._low_roi_train_steps,
@@ -1318,6 +1349,16 @@ class ObjectiveScheduler:
                 ),
             ),
         )
+        restored_coverage_cost_fraction = _state_optional_float(
+            config.get("max_rollout_coverage_cost_fraction"),
+            self.max_rollout_coverage_cost_fraction,
+        )
+        if (
+            restored_coverage_cost_fraction is not None
+            and not 0 < restored_coverage_cost_fraction <= 1
+        ):
+            restored_coverage_cost_fraction = None
+        self.max_rollout_coverage_cost_fraction = restored_coverage_cost_fraction
         self.min_train_steps = _state_int(
             config.get("min_train_steps"),
             self.min_train_steps,
@@ -1538,6 +1579,14 @@ class ObjectiveScheduler:
             learning_state.get("last_rollout_coverage_deficit"),
             self._last_rollout_coverage_deficit,
         )
+        self._last_rollout_coverage_cost_share = _state_float(
+            learning_state.get("last_rollout_coverage_cost_share"),
+            self._last_rollout_coverage_cost_share,
+        )
+        self._last_rollout_coverage_cost_limited = _state_bool(
+            learning_state.get("last_rollout_coverage_cost_limited"),
+            self._last_rollout_coverage_cost_limited,
+        )
         self._global_action_quality_ema = _state_float(
             learning_state.get("global_action_quality_ema"),
             self._global_action_quality_ema,
@@ -1738,6 +1787,9 @@ class ObjectiveScheduler:
             "scheduler/coverage/min_fraction": (
                 self.min_rollout_coverage_fraction
             ),
+            "scheduler/coverage/max_cost_fraction": (
+                self.max_rollout_coverage_cost_fraction or 0.0
+            ),
             "scheduler/coverage/forced_decisions": float(
                 self._coverage_forced_decisions
             ),
@@ -1747,6 +1799,12 @@ class ObjectiveScheduler:
             "scheduler/coverage/last_share": self._last_rollout_coverage_share,
             "scheduler/coverage/last_deficit": (
                 self._last_rollout_coverage_deficit
+            ),
+            "scheduler/coverage/last_cost_share": (
+                self._last_rollout_coverage_cost_share
+            ),
+            "scheduler/coverage/last_cost_limited": (
+                1.0 if self._last_rollout_coverage_cost_limited else 0.0
             ),
             "scheduler/max_control_candidate_values": float(
                 self.max_control_candidate_values
@@ -1879,6 +1937,9 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
             metrics[f"{prefix}/sample_dollar_seconds"] = stats.total_dollar_seconds
+            metrics[f"{prefix}/sample_dollar_share"] = (
+                self._arm_sample_dollar_share(arm_id)
+            )
             metrics[f"{prefix}/rollout_dollar_seconds"] = stats.rollout_dollar_seconds
             metrics[f"{prefix}/queue_wait_dollar_seconds"] = (
                 stats.queue_wait_dollar_seconds
@@ -2119,29 +2180,46 @@ class ObjectiveScheduler:
     def _coverage_candidate(
         self,
         arms: Sequence[tuple[str, Scenario, ActionCodec]],
-    ) -> tuple[str, Scenario, ActionCodec, float, float, float] | None:
+    ) -> tuple[
+        tuple[str, Scenario, ActionCodec, float, float, float, float] | None,
+        bool,
+    ]:
         if self.min_rollout_coverage_fraction <= 0.0 or not arms:
-            return None
+            return None, False
         if self._total_decisions < len(arms):
-            return None
+            return None, False
         for arm_id, _, _ in arms:
             stats = self._arms.get(arm_id)
             if stats is None or stats.decisions == 0:
-                return None
+                return None, False
         target = self._effective_coverage_target(len(arms))
         if target <= 0.0:
-            return None
+            return None, False
 
         most_undercovered: (
-            tuple[str, Scenario, ActionCodec, float, float, float] | None
+            tuple[str, Scenario, ActionCodec, float, float, float, float] | None
         ) = None
+        arm_ids = [arm_id for arm_id, _, _ in arms]
+        cost_limited = False
         for arm_id, scenario, codec in arms:
             self._arms.setdefault(arm_id, ArmStats())
             share = self._arm_decision_share(arm_id)
             deficit = target - share
             if deficit <= 0.0:
                 continue
-            candidate = (arm_id, scenario, codec, target, share, deficit)
+            cost_share = self._arm_sample_dollar_share(arm_id, arm_ids)
+            if self._coverage_cost_limited(cost_share):
+                cost_limited = True
+                continue
+            candidate = (
+                arm_id,
+                scenario,
+                codec,
+                target,
+                share,
+                deficit,
+                cost_share,
+            )
             if most_undercovered is None:
                 most_undercovered = candidate
                 continue
@@ -2153,7 +2231,7 @@ class ObjectiveScheduler:
                 and self._score_arm(arm_id) > self._score_arm(most_undercovered[0])
             ):
                 most_undercovered = candidate
-        return most_undercovered
+        return most_undercovered, cost_limited
 
     def _effective_coverage_target(self, arm_count: int) -> float:
         if arm_count <= 0:
@@ -2167,6 +2245,28 @@ class ObjectiveScheduler:
         if stats is None:
             return 0.0
         return stats.decisions / self._total_decisions
+
+    def _arm_sample_dollar_share(
+        self,
+        arm_id: str,
+        arm_ids: Sequence[str] | None = None,
+    ) -> float:
+        selected_ids = list(arm_ids) if arm_ids is not None else list(self._arms)
+        total = sum(
+            max(0.0, self._arms.get(candidate, ArmStats()).total_dollar_seconds)
+            for candidate in selected_ids
+        )
+        if total <= 0.0:
+            return 0.0
+        stats = self._arms.get(arm_id)
+        if stats is None:
+            return 0.0
+        return max(0.0, stats.total_dollar_seconds) / total
+
+    def _coverage_cost_limited(self, cost_share: float) -> bool:
+        if self.max_rollout_coverage_cost_fraction is None:
+            return False
+        return cost_share >= self.max_rollout_coverage_cost_fraction
 
     def _score_arm(self, arm_id: str) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
