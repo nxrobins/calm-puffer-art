@@ -791,7 +791,6 @@ class AsyncArtBackend:
                 art_groups,
                 config=self.adapter_config,
             )
-            self._observe_submitted_rollouts(local_groups)
             active_max_policy_lag = self._max_policy_lag()
             self.ring.max_policy_lag = active_max_policy_lag
             self.ring.current_policy_step = self._current_step
@@ -806,6 +805,11 @@ class AsyncArtBackend:
                 local_groups
                 and self._groups_max_lag(local_groups) > active_max_policy_lag
             ):
+                self._observe_submitted_rollouts(
+                    local_groups,
+                    accepted=False,
+                    allow_action_space_promotions=False,
+                )
                 self._stale_batches += 1
                 self._failed_batches += 1
                 observe_stale_batch_feedback(
@@ -824,6 +828,7 @@ class AsyncArtBackend:
                     )
                 )
                 return future
+            self._observe_submitted_rollouts(local_groups)
             started = time.perf_counter()
             policy_step = self._current_step
             try:
@@ -893,8 +898,35 @@ class AsyncArtBackend:
             trajectory_groups,
             config=self.adapter_config,
         )
-        self._observe_submitted_rollouts(local_groups)
         future = asyncio.get_running_loop().create_future()
+        active_max_policy_lag = self._max_policy_lag()
+        if local_groups and self._groups_max_lag(local_groups) > active_max_policy_lag:
+            self._submitted_batches += 1
+            self._submitted_train_groups += len(local_groups)
+            self._observe_submitted_rollouts(
+                local_groups,
+                accepted=False,
+                allow_action_space_promotions=False,
+            )
+            self._stale_batches += 1
+            self._failed_batches += 1
+            observe_stale_batch_feedback(
+                self.scheduler,
+                groups=local_groups,
+                policy_step=self._current_step,
+                reason="art_async_stale_on_submit",
+            )
+            self._refresh_action_space_from_scheduler(
+                allow_promotions=False,
+                allow_demotions=True,
+            )
+            future.set_exception(
+                StaleArtBatchError(
+                    "ART batch exceeded max_policy_lag before async training"
+                )
+            )
+            return future
+        self._observe_submitted_rollouts(local_groups)
         await self._submit_local_batch(
             model=model,
             groups=local_groups,
@@ -923,7 +955,6 @@ class AsyncArtBackend:
             trajectory_group,
             config=self.adapter_config,
         )
-        self._observe_submitted_rollouts((local_group,))
         future = asyncio.get_running_loop().create_future()
         pending = _PendingArtGroup(
             model=model,
@@ -935,11 +966,17 @@ class AsyncArtBackend:
             self._discard_stale_pending_locked()
             self._submitted_groups += 1
             if self._pending_group_max_lag(pending) > self._max_policy_lag():
+                self._observe_submitted_rollouts(
+                    (local_group,),
+                    accepted=False,
+                    allow_action_space_promotions=False,
+                )
                 self._discard_pending_group(
                     pending,
                     reason="art_pending_group_stale_on_submit",
                 )
                 return future
+            self._observe_submitted_rollouts((local_group,))
             if self._pending_groups and not self._compatible_pending_group(pending):
                 await self._flush_pending_locked()
             self._pending_groups.append(pending)
@@ -1232,6 +1269,9 @@ class AsyncArtBackend:
     def _observe_submitted_rollouts(
         self,
         groups: Sequence[TrajectoryGroup],
+        *,
+        accepted: bool = True,
+        allow_action_space_promotions: bool = True,
     ) -> None:
         self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
         if self.scheduler is None:
@@ -1269,13 +1309,14 @@ class AsyncArtBackend:
                     )
                 observe_rollout(
                     trajectory,
-                    accepted=trajectory.exception is None,
+                    accepted=accepted and trajectory.exception is None,
                     dollar_seconds=rollout_cost,
                     queue_wait_dollar_seconds=queue_wait_cost,
                 )
         if self.action_space is not None:
             self.action_space.update_from_metrics(
                 self.scheduler.metrics(),
+                allow_promotions=allow_action_space_promotions,
                 allow_demotions=False,
             )
 

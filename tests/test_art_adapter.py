@@ -1654,6 +1654,7 @@ class ArtAdapterTests(unittest.TestCase):
     def test_async_art_backend_drops_stale_pending_group_on_submit(self):
         async def run():
             backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
             async_backend = AsyncArtBackend(
                 backend=backend,
                 config=AsyncArtBackendConfig(
@@ -1661,6 +1662,7 @@ class ArtAdapterTests(unittest.TestCase):
                     train_queue_capacity=2,
                     max_policy_lag=0,
                 ),
+                scheduler=scheduler,
             )
             await async_backend.register("art-model")
             async_backend._current_step = 2
@@ -1672,7 +1674,8 @@ class ArtAdapterTests(unittest.TestCase):
                         initial_policy_version=0,
                         metrics={"cost/dollar_seconds": 3.0},
                     )
-                ]
+                ],
+                metadata={"scenario_id": "stale-submit"},
             )
 
             future = await async_backend.submit_group("art-model", old_group)
@@ -1680,15 +1683,78 @@ class ArtAdapterTests(unittest.TestCase):
                 await future
             stats = async_backend.stats()
             await async_backend.close()
-            return stats
+            return backend, stats
 
-        stats = asyncio.run(run())
+        backend, stats = asyncio.run(run())
 
+        self.assertEqual(len(backend.calls), 0)
         self.assertEqual(stats["art_backend/submitted_groups"], 1.0)
         self.assertEqual(stats["art_backend/submitted_batches"], 0.0)
         self.assertEqual(stats["art_backend/pending_groups"], 0.0)
         self.assertEqual(stats["art_backend/stale_pending_groups"], 1.0)
         self.assertEqual(stats["art_backend/sample_dollar_seconds"], 3.0)
+        self.assertEqual(stats["scheduler/arm/stale_submit_art/pulls"], 1.0)
+        self.assertEqual(stats["scheduler/arm/stale_submit_art/accepted"], 0.0)
+        self.assertEqual(
+            stats["scheduler/arm/stale_submit_art/total_positive_improvement"],
+            0.0,
+        )
+        self.assertEqual(
+            stats["scheduler/arm/stale_submit_art/stale_updates"],
+            1.0,
+        )
+
+    def test_async_art_backend_rejects_stale_submit_train_without_rollout_credit(
+        self,
+    ):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=1,
+                    train_queue_capacity=2,
+                    max_policy_lag=0,
+                ),
+                scheduler=scheduler,
+            )
+            await async_backend.register("art-model")
+            async_backend._current_step = 2
+            old_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=10.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 5.0},
+                    )
+                ],
+                metadata={"scenario_id": "stale-train"},
+            )
+
+            future = await async_backend.submit_train("art-model", [old_group])
+            with self.assertRaises(StaleArtBatchError):
+                await future
+            stats = async_backend.stats()
+            await async_backend.close()
+            return backend, stats
+
+        backend, stats = asyncio.run(run())
+
+        self.assertEqual(len(backend.calls), 0)
+        self.assertEqual(stats["art_backend/submitted_batches"], 1.0)
+        self.assertEqual(stats["art_backend/completed_batches"], 0.0)
+        self.assertEqual(stats["art_backend/failed_batches"], 1.0)
+        self.assertEqual(stats["art_backend/stale_batches"], 1.0)
+        self.assertEqual(stats["art_backend/sample_dollar_seconds"], 5.0)
+        self.assertEqual(stats["scheduler/arm/stale_train_art/pulls"], 1.0)
+        self.assertEqual(stats["scheduler/arm/stale_train_art/accepted"], 0.0)
+        self.assertEqual(
+            stats["scheduler/arm/stale_train_art/total_positive_improvement"],
+            0.0,
+        )
+        self.assertEqual(stats["scheduler/arm/stale_train_art/stale_updates"], 1.0)
 
     def test_async_art_backend_debits_pending_group_stale_after_policy_update(self):
         async def run():
