@@ -632,12 +632,91 @@ class AsyncArtBackend:
         if self.config.synchronous_fallback:
             future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
             art_groups = list(trajectory_groups)
+            local_groups = art_groups_to_local(
+                art_groups,
+                config=self.adapter_config,
+            )
+            self._observe_submitted_rollouts(local_groups)
+            active_max_policy_lag = self._max_policy_lag()
+            self.ring.max_policy_lag = active_max_policy_lag
+            self.ring.current_policy_step = self._current_step
+            self._tag_batch_control_metadata(
+                local_groups,
+                target_train_batch_groups=len(local_groups),
+                max_policy_lag=active_max_policy_lag,
+            )
             self._submitted_batches += 1
             self._submitted_train_groups += len(art_groups)
+            if (
+                local_groups
+                and self._groups_max_lag(local_groups) > active_max_policy_lag
+            ):
+                self._stale_batches += 1
+                self._failed_batches += 1
+                observe_stale_batch_feedback(
+                    self.scheduler,
+                    groups=local_groups,
+                    policy_step=self._current_step,
+                    reason="art_sync_stale",
+                )
+                future.set_exception(
+                    StaleArtBatchError(
+                        "ART batch exceeded max_policy_lag before synchronous training"
+                    )
+                )
+                return future
+            started = time.perf_counter()
+            policy_step = self._current_step
             try:
                 result = await _maybe_await(
                     self.backend.train(model, art_groups, **kwargs)
                 )
+                duration_s = time.perf_counter() - started
+                local_result = train_result_from_art(result, fallback_policy=model)
+                train_dollar_seconds = train_result_dollar_seconds(
+                    local_result,
+                    duration_s=duration_s,
+                    cost_per_second_usd=self.config.cost_per_second_usd,
+                )
+                self._trainer_dollar_seconds += train_dollar_seconds
+                next_step = _optional_int(local_result.metadata.get("art/step"))
+                self._current_step = (
+                    max(self._current_step + 1, next_step)
+                    if next_step is not None
+                    else self._current_step + 1
+                )
+                self.ring.current_policy_step = self._current_step
+                if self.scheduler is not None:
+                    self.scheduler.observe_train(
+                        groups=local_groups,
+                        result=local_result,
+                        duration_s=duration_s,
+                        dollar_seconds=train_dollar_seconds,
+                        policy_step=policy_step,
+                    )
+                    if self.action_space is not None:
+                        self.action_space.update_from_metrics(
+                            self.scheduler.metrics()
+                        )
+                self._schedule_stale_pending_discard()
+                self._record_published_update(local_result, local_groups)
+                checkpoint_metadata = dict(local_result.metadata)
+                checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
+                checkpoint_metadata.update(
+                    action_space_checkpoint_metadata(self.action_space)
+                )
+                checkpoint_metadata[ART_BACKEND_STATE_KEY] = self.state_dict()
+                snapshot = PolicySnapshot(
+                    step=self._current_step,
+                    policy=model,
+                    checkpoint_id=(
+                        local_result.checkpoint_id
+                        or f"art-step-{self._current_step}"
+                    ),
+                    created_at=time.time(),
+                    metadata=checkpoint_metadata,
+                )
+                await self.weight_channel.publish(snapshot)
             except BaseException as exc:
                 self._failed_batches += 1
                 future.set_exception(exc)
@@ -1148,6 +1227,16 @@ class AsyncArtBackend:
         policy_steps = [
             trajectory.policy_step
             for trajectory in pending.group.trajectories
+        ]
+        if not policy_steps:
+            return 0
+        return max(0, self._current_step - min(policy_steps))
+
+    def _groups_max_lag(self, groups: Sequence[TrajectoryGroup]) -> int:
+        policy_steps = [
+            trajectory.policy_step
+            for group in groups
+            for trajectory in group.trajectories
         ]
         if not policy_steps:
             return 0

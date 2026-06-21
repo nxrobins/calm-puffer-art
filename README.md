@@ -227,7 +227,7 @@ future = await backend.submit_train(art_model, art_groups)
 result = await future
 ```
 
-`train()` is the compatibility wrapper that awaits the same future. `submit_train()` returns after bounded-ring admission, so callers pay backpressure only when the ring is full.
+`train()` is the compatibility wrapper that awaits the same future. `submit_train()` returns after bounded-ring admission, so callers pay backpressure only when the ring is full. With `AsyncArtBackendConfig(synchronous_fallback=True)`, the backend still receives the original ART groups inline and callers still receive the raw backend result, but the bridge now applies the same rollout/sample accounting, stale-policy rejection, train-feedback observation, action-space update, checkpoint metadata, and published-policy telemetry around that direct call.
 
 For scheduler-controlled batch cadence, submit individual ART trajectory groups:
 
