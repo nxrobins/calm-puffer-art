@@ -21,6 +21,8 @@ from .runtime import (
     WeightBroadcastChannel,
     restore_control_state as restore_runtime_control_state,
     train_result_dollar_seconds,
+    train_result_score,
+    useful_experience_count,
 )
 from .scheduler import (
     AdaptiveScheduler,
@@ -295,9 +297,15 @@ class AsyncArtBackend:
         self._stale_batches = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
+        self._trainer_dollar_seconds = 0.0
         self._actor_admission_delay_s = 0.0
         self._actor_admission_dollar_seconds = 0.0
         self._sample_dollar_seconds = 0.0
+        self._published_policy_updates = 0
+        self._published_policy_improvement = 0.0
+        self._published_policy_reward_improving_experience = 0.0
+        self._latest_published_policy_score = 0.0
+        self._last_published_policy_score = 0.0
         self._pending_groups: list[_PendingArtGroup] = []
         self._pending_lock = asyncio.Lock()
 
@@ -648,8 +656,29 @@ class AsyncArtBackend:
 
     def stats(self) -> dict[str, float]:
         wall_s = max(time.perf_counter() - self._started_at, 1e-9)
+        wall_dollar_seconds = wall_s * self.config.cost_per_second_usd
+        scheduler_stats = (
+            self.scheduler.metrics() if self.scheduler is not None else {}
+        )
+        accounted_dollar_seconds = self._accounted_dollar_seconds(scheduler_stats)
+        if wall_dollar_seconds > 0.0:
+            published_objective = (
+                self._published_policy_reward_improving_experience
+                / max(wall_dollar_seconds, 1e-9)
+            )
+        else:
+            published_objective = 0.0
+        if accounted_dollar_seconds > 0.0:
+            accounted_published_objective = (
+                self._published_policy_reward_improving_experience
+                / max(accounted_dollar_seconds, 1e-9)
+            )
+        else:
+            accounted_published_objective = 0.0
         stats = self.ring.stats()
         stats["art_backend/wall_clock_s"] = wall_s
+        stats["art_backend/wall_clock_dollar_seconds"] = wall_dollar_seconds
+        stats["art_backend/accounted_dollar_seconds"] = accounted_dollar_seconds
         stats["art_backend/current_step"] = float(self._current_step)
         stats["art_backend/current_max_policy_lag"] = float(self.ring.max_policy_lag)
         stats["art_backend/closed"] = 1.0 if self._closed else 0.0
@@ -665,6 +694,7 @@ class AsyncArtBackend:
         stats["art_backend/trainer_wait_dollar_seconds"] = (
             self._trainer_wait_dollar_seconds
         )
+        stats["art_backend/trainer_dollar_seconds"] = self._trainer_dollar_seconds
         stats["art_backend/actor_admission_delay_s"] = (
             self._actor_admission_delay_s
         )
@@ -685,8 +715,26 @@ class AsyncArtBackend:
         stats["art_backend/sample_dollar_seconds_per_s"] = (
             self._sample_dollar_seconds / wall_s
         )
-        if self.scheduler is not None:
-            stats.update(self.scheduler.metrics())
+        stats["art_backend/published_policy_updates"] = float(
+            self._published_policy_updates
+        )
+        stats["art_backend/published_policy_improvement"] = (
+            self._published_policy_improvement
+        )
+        stats[
+            "art_backend/published_policy_reward_improving_experience"
+        ] = self._published_policy_reward_improving_experience
+        stats["art_backend/latest_published_policy_score"] = (
+            self._latest_published_policy_score
+        )
+        stats[
+            "art_backend/published_policy_reward_improving_experience_per_dollar_second"
+        ] = published_objective
+        stats[
+            "art_backend/accounted_published_policy_reward_improving_experience_per_dollar_second"
+        ] = accounted_published_objective
+        if scheduler_stats:
+            stats.update(scheduler_stats)
         if self.action_space is not None:
             stats.update(self.action_space.metrics())
         return stats
@@ -735,6 +783,7 @@ class AsyncArtBackend:
                     duration_s=duration_s,
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 )
+                self._trainer_dollar_seconds += train_dollar_seconds
                 next_step = _optional_int(local_result.metadata.get("art/step"))
                 self._current_step = (
                     max(self._current_step + 1, next_step)
@@ -761,18 +810,18 @@ class AsyncArtBackend:
                 checkpoint_metadata.update(
                     action_space_checkpoint_metadata(self.action_space)
                 )
-                await self.weight_channel.publish(
-                    PolicySnapshot(
-                        step=self._current_step,
-                        policy=model,
-                        checkpoint_id=(
-                            local_result.checkpoint_id
-                            or f"art-step-{self._current_step}"
-                        ),
-                        created_at=time.time(),
-                        metadata=checkpoint_metadata,
-                    )
+                snapshot = PolicySnapshot(
+                    step=self._current_step,
+                    policy=model,
+                    checkpoint_id=(
+                        local_result.checkpoint_id
+                        or f"art-step-{self._current_step}"
+                    ),
+                    created_at=time.time(),
+                    metadata=checkpoint_metadata,
                 )
+                await self.weight_channel.publish(snapshot)
+                self._record_published_update(local_result, batch.groups)
                 self._completed_batches += 1
                 for future in futures:
                     if not future.done():
@@ -782,6 +831,43 @@ class AsyncArtBackend:
                 for future in futures:
                     if not future.done():
                         future.set_exception(exc)
+
+    def _record_published_update(
+        self,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> None:
+        score = train_result_score(result, groups)
+        improvement = max(0.0, score - self._last_published_policy_score)
+        experience = useful_experience_count(groups)
+        self._published_policy_updates += 1
+        self._published_policy_improvement += improvement
+        self._published_policy_reward_improving_experience += (
+            improvement * experience
+        )
+        self._last_published_policy_score = score
+        self._latest_published_policy_score = score
+
+    def _accounted_dollar_seconds(
+        self,
+        scheduler_stats: Mapping[str, float],
+    ) -> float:
+        scheduler_accounted = sum(
+            max(0.0, float(scheduler_stats.get(key, 0.0)))
+            for key in (
+                "scheduler/costs/rollout_dollar_seconds",
+                "scheduler/costs/queue_wait_dollar_seconds",
+                "scheduler/costs/rollout_admission_dollar_seconds",
+                "scheduler/costs/train_dollar_seconds",
+            )
+        )
+        if scheduler_accounted > 0.0:
+            return scheduler_accounted
+        return (
+            self._sample_dollar_seconds
+            + self._trainer_dollar_seconds
+            + self._trainer_wait_dollar_seconds
+        )
 
     def _score_groups(self, groups: Sequence[TrajectoryGroup]) -> float:
         if self.scheduler is None:

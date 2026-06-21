@@ -282,6 +282,27 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(stats["art_backend/submitted_train_groups"], 1.0)
         self.assertGreater(stats["art_backend/submitted_train_groups_per_s"], 0.0)
         self.assertGreater(stats["art_backend/completed_batches_per_s"], 0.0)
+        self.assertEqual(stats["art_backend/published_policy_updates"], 1.0)
+        self.assertEqual(stats["art_backend/published_policy_improvement"], 0.75)
+        self.assertEqual(
+            stats["art_backend/published_policy_reward_improving_experience"],
+            0.75,
+        )
+        self.assertEqual(stats["art_backend/latest_published_policy_score"], 0.75)
+        self.assertGreater(
+            stats[
+                "art_backend/"
+                "published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+        self.assertGreater(
+            stats[
+                "art_backend/"
+                "accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
         self.assertEqual(stats["scheduler/train_reward_ema"], 0.75)
         self.assertEqual(
             stats["scheduler/control/cadence_1/train_updates"],
@@ -969,6 +990,13 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(second_result.step, 2)
         self.assertEqual(after["art_backend/completed_batches"], 2.0)
         self.assertEqual(after["art_backend/failed_batches"], 0.0)
+        self.assertEqual(after["art_backend/published_policy_updates"], 2.0)
+        self.assertEqual(after["art_backend/published_policy_improvement"], 0.75)
+        self.assertEqual(
+            after["art_backend/published_policy_reward_improving_experience"],
+            0.75,
+        )
+        self.assertEqual(after["art_backend/latest_published_policy_score"], 0.75)
         self.assertEqual(
             [call[2]["batch"] for call in backend.calls],
             ["first", "second"],

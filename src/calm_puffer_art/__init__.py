@@ -49,6 +49,8 @@ from .runtime import (
     promotion_checkpoint_metadata,
     restore_control_state,
     train_result_dollar_seconds,
+    train_result_score,
+    useful_experience_count,
 )
 from .objective_ablation import (
     ACCOUNTED_NORTH_STAR,
@@ -152,6 +154,8 @@ __all__ = [
     "semantic_bandwidth",
     "train_result_from_art",
     "train_result_dollar_seconds",
+    "train_result_score",
     "trajectory_failure_modes",
     "restore_control_state",
+    "useful_experience_count",
 ]

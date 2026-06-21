@@ -1786,12 +1786,18 @@ def trajectory_semantic_bandwidth(trajectory: Trajectory) -> float:
     return semantic_bandwidth(trajectory.actions)
 
 
-def _useful_experience_count(groups: Sequence[TrajectoryGroup]) -> float:
+def useful_experience_count(groups: Sequence[TrajectoryGroup]) -> float:
+    """Return quality-weighted trainable trajectory experience."""
+
     return sum(
         action_quality(trajectory)
         for group in groups
         for trajectory in group.trajectories
     )
+
+
+def _useful_experience_count(groups: Sequence[TrajectoryGroup]) -> float:
+    return useful_experience_count(groups)
 
 
 def train_result_dollar_seconds(
@@ -1883,12 +1889,14 @@ def _with_promotion_metadata(
     )
 
 
-def _result_metric_score(
+def train_result_score(
     result: TrainResult,
     groups: Sequence[TrajectoryGroup],
     *,
     preferred_key: str = "train/reward",
 ) -> float:
+    """Return the policy-improvement score used by train feedback."""
+
     for key in (preferred_key, "promotion/score", "eval/reward", "train/reward"):
         value = result.metrics.get(key)
         if isinstance(value, bool):
@@ -1903,6 +1911,19 @@ def _result_metric_score(
             if isfinite(parsed):
                 return parsed
     return mean([group.mean_reward for group in groups])
+
+
+def _result_metric_score(
+    result: TrainResult,
+    groups: Sequence[TrajectoryGroup],
+    *,
+    preferred_key: str = "train/reward",
+) -> float:
+    return train_result_score(
+        result,
+        groups,
+        preferred_key=preferred_key,
+    )
 
 
 def _first_nonnegative_float(
