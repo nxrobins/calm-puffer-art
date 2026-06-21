@@ -72,6 +72,7 @@ from .scheduler import (
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
     trajectory_failure_modes,
+    trajectory_reconstruction_accuracy,
 )
 from .types import (
     ActionUnit,
@@ -158,6 +159,7 @@ __all__ = [
     "train_result_dollar_seconds",
     "train_result_score",
     "trajectory_failure_modes",
+    "trajectory_reconstruction_accuracy",
     "restore_control_state",
     "useful_experience_count",
 ]

@@ -244,12 +244,14 @@ class AdaptiveActionSpace:
     promotion_parent_margin: float = 0.0
     promotion_quality_threshold: float = 0.95
     promotion_semantic_bandwidth_threshold: float = 1.0
+    promotion_max_reconstruction_drift: float = 0.05
     promotion_min_pulls: int = 1
     unsafe_rate_threshold: float = 0.0
     demotion_objective_threshold: float = 0.0
     demotion_parent_margin: float = 0.0
     demotion_quality_threshold: float = 0.5
     demotion_semantic_bandwidth_threshold: float = 1.0
+    demotion_max_reconstruction_drift: float = 0.05
     demotion_min_pulls: int = 2
     promote_latent_patches: bool = False
     latent_patch_latent_size: int = 8
@@ -273,6 +275,8 @@ class AdaptiveActionSpace:
             raise ValueError(
                 "promotion_semantic_bandwidth_threshold must be non-negative"
             )
+        if self.promotion_max_reconstruction_drift < 0:
+            raise ValueError("promotion_max_reconstruction_drift must be non-negative")
         if self.promotion_min_pulls < 0:
             raise ValueError("promotion_min_pulls must be non-negative")
         if self.unsafe_rate_threshold < 0:
@@ -285,6 +289,8 @@ class AdaptiveActionSpace:
             raise ValueError(
                 "demotion_semantic_bandwidth_threshold must be non-negative"
             )
+        if self.demotion_max_reconstruction_drift < 0:
+            raise ValueError("demotion_max_reconstruction_drift must be non-negative")
         if self.demotion_min_pulls < 0:
             raise ValueError("demotion_min_pulls must be non-negative")
         if self.latent_patch_latent_size <= 0:
@@ -323,6 +329,8 @@ class AdaptiveActionSpace:
                 signal.semantic_bandwidth
                 < self.promotion_semantic_bandwidth_threshold
             ):
+                continue
+            if signal.reconstruction_drift > self.promotion_max_reconstruction_drift:
                 continue
             if signal.unsafe_rate > self.unsafe_rate_threshold:
                 continue
@@ -401,6 +409,8 @@ class AdaptiveActionSpace:
         if signal.quality < self.demotion_quality_threshold:
             return True
         if signal.semantic_bandwidth < self.demotion_semantic_bandwidth_threshold:
+            return True
+        if signal.reconstruction_drift > self.demotion_max_reconstruction_drift:
             return True
         if self._parent_outperforms(codec, signal, metrics):
             return True
@@ -507,6 +517,9 @@ class AdaptiveActionSpace:
                 "promotion_semantic_bandwidth_threshold": (
                     self.promotion_semantic_bandwidth_threshold
                 ),
+                "promotion_max_reconstruction_drift": (
+                    self.promotion_max_reconstruction_drift
+                ),
                 "promotion_min_pulls": self.promotion_min_pulls,
                 "unsafe_rate_threshold": self.unsafe_rate_threshold,
                 "demotion_objective_threshold": self.demotion_objective_threshold,
@@ -514,6 +527,9 @@ class AdaptiveActionSpace:
                 "demotion_quality_threshold": self.demotion_quality_threshold,
                 "demotion_semantic_bandwidth_threshold": (
                     self.demotion_semantic_bandwidth_threshold
+                ),
+                "demotion_max_reconstruction_drift": (
+                    self.demotion_max_reconstruction_drift
                 ),
                 "demotion_min_pulls": self.demotion_min_pulls,
                 "promote_latent_patches": self.promote_latent_patches,
@@ -561,6 +577,10 @@ class AdaptiveActionSpace:
             config.get("promotion_semantic_bandwidth_threshold"),
             self.promotion_semantic_bandwidth_threshold,
         )
+        self.promotion_max_reconstruction_drift = _state_float(
+            config.get("promotion_max_reconstruction_drift"),
+            self.promotion_max_reconstruction_drift,
+        )
         self.promotion_min_pulls = _state_int(
             config.get("promotion_min_pulls"),
             self.promotion_min_pulls,
@@ -585,6 +605,10 @@ class AdaptiveActionSpace:
             config.get("demotion_semantic_bandwidth_threshold"),
             self.demotion_semantic_bandwidth_threshold,
         )
+        self.demotion_max_reconstruction_drift = _state_float(
+            config.get("demotion_max_reconstruction_drift"),
+            self.demotion_max_reconstruction_drift,
+        )
         self.demotion_min_pulls = _state_int(
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
@@ -608,12 +632,20 @@ class AdaptiveActionSpace:
             self.promotion_semantic_bandwidth_threshold,
         )
         self.promotion_parent_margin = max(0.0, self.promotion_parent_margin)
+        self.promotion_max_reconstruction_drift = max(
+            0.0,
+            self.promotion_max_reconstruction_drift,
+        )
         self.promotion_min_pulls = max(0, self.promotion_min_pulls)
         self.demotion_semantic_bandwidth_threshold = max(
             0.0,
             self.demotion_semantic_bandwidth_threshold,
         )
         self.demotion_parent_margin = max(0.0, self.demotion_parent_margin)
+        self.demotion_max_reconstruction_drift = max(
+            0.0,
+            self.demotion_max_reconstruction_drift,
+        )
         self.latent_patch_latent_size = max(1, self.latent_patch_latent_size)
 
         active_codec_states = state.get("active_codecs")
@@ -686,6 +718,7 @@ class AdaptiveActionSpace:
         failure_values: list[float] = []
         pull_values: list[float] = []
         semantic_bandwidth_values: list[float] = []
+        reconstruction_drift_values: list[float] = []
         for key, value in metrics.items():
             if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
                 continue
@@ -705,6 +738,10 @@ class AdaptiveActionSpace:
                 pull_values.append(float(value))
             elif key.endswith("/semantic_bandwidth_tokens_per_decision"):
                 semantic_bandwidth_values.append(float(value))
+            elif key.endswith("/reconstruction_max_drift"):
+                reconstruction_drift_values.append(float(value))
+            elif key.endswith("/reconstruction_drift_ema"):
+                reconstruction_drift_values.append(float(value))
         return _CodecSignal(
             objective=max(objective_values) if objective_values else 0.0,
             quality=min(quality_values) if quality_values else 0.0,
@@ -717,6 +754,11 @@ class AdaptiveActionSpace:
                 if semantic_bandwidth_values
                 else 0.0
             ),
+            reconstruction_drift=(
+                max(reconstruction_drift_values)
+                if reconstruction_drift_values
+                else 0.0
+            ),
         )
 
 
@@ -727,6 +769,7 @@ class _CodecSignal:
     unsafe_rate: float
     pulls: float
     semantic_bandwidth: float
+    reconstruction_drift: float
 
 
 def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:

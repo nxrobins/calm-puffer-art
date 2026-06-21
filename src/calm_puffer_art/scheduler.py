@@ -147,6 +147,12 @@ class ArmStats:
     unsafe: int = 0
     failed_rollouts: int = 0
     failure_modes: dict[str, int] = field(default_factory=dict)
+    reconstruction_observations: int = 0
+    reconstruction_accuracy_ema: float = 1.0
+    reconstruction_drift_ema: float = 0.0
+    total_reconstruction_accuracy: float = 0.0
+    min_reconstruction_accuracy: float = 1.0
+    max_reconstruction_drift: float = 0.0
     train_updates: int = 0
     stale_updates: int = 0
     stale_batches: int = 0
@@ -644,6 +650,7 @@ class ObjectiveScheduler:
             trajectory,
             reconstruction_drift_threshold=self.reconstruction_drift_threshold,
         )
+        reconstruction_accuracy = trajectory_reconstruction_accuracy(trajectory)
         reward = trajectory.reward if accepted else 0.0
         effective_reward = reward * quality
         previous_reward = stats.effective_reward_ema if stats.pulls else 0.0
@@ -661,6 +668,28 @@ class ObjectiveScheduler:
             stats.failed_rollouts += 1
             for mode in failure_modes:
                 stats.failure_modes[mode] = stats.failure_modes.get(mode, 0) + 1
+        if reconstruction_accuracy is not None:
+            reconstruction_drift = max(0.0, 1.0 - reconstruction_accuracy)
+            stats.reconstruction_observations += 1
+            stats.total_reconstruction_accuracy += reconstruction_accuracy
+            stats.min_reconstruction_accuracy = min(
+                stats.min_reconstruction_accuracy,
+                reconstruction_accuracy,
+            )
+            stats.max_reconstruction_drift = max(
+                stats.max_reconstruction_drift,
+                reconstruction_drift,
+            )
+            stats.reconstruction_accuracy_ema = self._ema(
+                stats.reconstruction_accuracy_ema,
+                reconstruction_accuracy,
+                stats.reconstruction_observations,
+            )
+            stats.reconstruction_drift_ema = self._ema(
+                stats.reconstruction_drift_ema,
+                reconstruction_drift,
+                stats.reconstruction_observations,
+            )
         stats.total_reward += reward
         stats.total_effective_reward += effective_reward
         stats.total_positive_improvement += positive_improvement
@@ -1575,6 +1604,16 @@ class ObjectiveScheduler:
         failure_rollouts = sum(
             stats.failed_rollouts for stats in self._arms.values()
         )
+        reconstruction_observations = sum(
+            stats.reconstruction_observations for stats in self._arms.values()
+        )
+        total_reconstruction_accuracy = sum(
+            stats.total_reconstruction_accuracy for stats in self._arms.values()
+        )
+        max_reconstruction_drift = max(
+            (stats.max_reconstruction_drift for stats in self._arms.values()),
+            default=0.0,
+        )
         accounted_dollar_seconds = self._accounted_dollar_seconds()
         budget_limit = self.max_accounted_dollar_seconds or 0.0
         budget_remaining = (
@@ -1601,6 +1640,15 @@ class ObjectiveScheduler:
                 if self._total_pulls
                 else 0.0
             ),
+            "scheduler/reconstruction_observations": float(
+                reconstruction_observations
+            ),
+            "scheduler/reconstruction_accuracy_mean": (
+                total_reconstruction_accuracy / reconstruction_observations
+                if reconstruction_observations
+                else 0.0
+            ),
+            "scheduler/reconstruction_max_drift": max_reconstruction_drift,
             "scheduler/global_marginal_objective_ema": self._global_objective_ema,
             "scheduler/global_action_quality_ema": self._global_action_quality_ema,
             "scheduler/train_observations": float(self._train_observations),
@@ -1769,6 +1817,35 @@ class ObjectiveScheduler:
                 metrics[f"{prefix}/failure/{safe_mode}_rate"] = (
                     count / stats.pulls if stats.pulls else 0.0
                 )
+            metrics[f"{prefix}/reconstruction_observations"] = float(
+                stats.reconstruction_observations
+            )
+            metrics[f"{prefix}/reconstruction_accuracy_ema"] = (
+                stats.reconstruction_accuracy_ema
+                if stats.reconstruction_observations
+                else 0.0
+            )
+            metrics[f"{prefix}/reconstruction_accuracy_mean"] = (
+                stats.total_reconstruction_accuracy
+                / stats.reconstruction_observations
+                if stats.reconstruction_observations
+                else 0.0
+            )
+            metrics[f"{prefix}/reconstruction_accuracy_min"] = (
+                stats.min_reconstruction_accuracy
+                if stats.reconstruction_observations
+                else 0.0
+            )
+            metrics[f"{prefix}/reconstruction_drift_ema"] = (
+                stats.reconstruction_drift_ema
+                if stats.reconstruction_observations
+                else 0.0
+            )
+            metrics[f"{prefix}/reconstruction_max_drift"] = (
+                stats.max_reconstruction_drift
+                if stats.reconstruction_observations
+                else 0.0
+            )
             metrics[f"{prefix}/reward_ema"] = stats.reward_ema
             metrics[f"{prefix}/effective_reward_ema"] = stats.effective_reward_ema
             metrics[f"{prefix}/action_quality_ema"] = stats.action_quality_ema
@@ -2993,6 +3070,30 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             default.failed_rollouts,
         ),
         failure_modes=_int_mapping_state(state.get("failure_modes")),
+        reconstruction_observations=_state_int(
+            state.get("reconstruction_observations"),
+            default.reconstruction_observations,
+        ),
+        reconstruction_accuracy_ema=_state_float(
+            state.get("reconstruction_accuracy_ema"),
+            default.reconstruction_accuracy_ema,
+        ),
+        reconstruction_drift_ema=_state_float(
+            state.get("reconstruction_drift_ema"),
+            default.reconstruction_drift_ema,
+        ),
+        total_reconstruction_accuracy=_state_float(
+            state.get("total_reconstruction_accuracy"),
+            default.total_reconstruction_accuracy,
+        ),
+        min_reconstruction_accuracy=_state_float(
+            state.get("min_reconstruction_accuracy"),
+            default.min_reconstruction_accuracy,
+        ),
+        max_reconstruction_drift=_state_float(
+            state.get("max_reconstruction_drift"),
+            default.max_reconstruction_drift,
+        ),
         train_updates=_state_int(
             state.get("train_updates"),
             default.train_updates,
@@ -3463,6 +3564,23 @@ def action_quality(trajectory: Trajectory) -> float:
     return 1.0
 
 
+def trajectory_reconstruction_accuracy(trajectory: Trajectory) -> float | None:
+    """Return clamped reconstruction accuracy when rollout metadata provides it."""
+
+    reconstruction_accuracy = _first_nonnegative_mapping_float(
+        trajectory.metadata,
+        ("reconstruction/accuracy",),
+    )
+    if reconstruction_accuracy is None:
+        reconstruction_accuracy = _first_nonnegative_mapping_float(
+            trajectory.metrics,
+            ("reconstruction/accuracy",),
+        )
+    if reconstruction_accuracy is None:
+        return None
+    return min(1.0, max(0.0, reconstruction_accuracy))
+
+
 def trajectory_failure_modes(
     trajectory: Trajectory,
     *,
@@ -3481,15 +3599,7 @@ def trajectory_failure_modes(
     if metadata.get("verifier/passed") is False:
         modes.append("verifier_failed")
 
-    reconstruction_accuracy = _first_nonnegative_mapping_float(
-        metadata,
-        ("reconstruction/accuracy",),
-    )
-    if reconstruction_accuracy is None:
-        reconstruction_accuracy = _first_nonnegative_mapping_float(
-            trajectory.metrics,
-            ("reconstruction/accuracy",),
-        )
+    reconstruction_accuracy = trajectory_reconstruction_accuracy(trajectory)
     if (
         reconstruction_accuracy is not None
         and reconstruction_accuracy < reconstruction_drift_threshold

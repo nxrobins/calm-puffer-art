@@ -52,13 +52,13 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It credits reward improvement back to active actor-count, cadence, policy-lag, and actor-admission delay values, reports their objective/exploration scores under `scheduler/control/*`, and reuses the higher-value runtime controls.
 - It attributes rollout, train, stale, queue-wait, admission cost, semantic bandwidth, and objective back to individual actor slots under `scheduler/actor/*`, so actor-count control can be audited by marginal actor-slot contribution.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
-- It records verifier failures, reconstruction safety failures, and reconstruction drift as checkpointed scheduler failure modes.
+- It records verifier failures, reconstruction safety failures, reconstruction drift failure modes, and numeric reconstruction drift summaries as checkpointed scheduler evidence.
 - It explores train-batch cadence candidates after the configured default, then tightens or widens cadence according to reward-improving experience per dollar-second.
 - It widens train-batch cadence under trainer saturation when there is no positive objective signal, reducing low-ROI tiny-batch churn.
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold, or when `max_accounted_dollar_seconds` exhausts the configured rollout/train/promotion spend envelope.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when observed pulls, objective, quality, observed semantic-bandwidth, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, failure-rate, safety, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when observed pulls, objective, quality, reconstruction drift, observed semantic-bandwidth, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, drift, failure-rate, safety, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory, including runtime-control scores and exploration configuration, through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
@@ -74,7 +74,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 - It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
 
-This is still a local bandit controller, not the final supremum. The next version should add richer diagnostic state, such as reconstruction-drift distributions and stronger multi-objective safeguards for fairness beyond a simple coverage floor.
+This is still a local bandit controller, not the final supremum. The next version should add stronger multi-objective safeguards for fairness beyond a simple coverage floor and richer diagnostics for domain-specific verifier failures.
 
 ## Bounded Staleness
 

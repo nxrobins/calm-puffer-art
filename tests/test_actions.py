@@ -260,6 +260,26 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
 
+    def test_adaptive_action_space_does_not_promote_drifty_chunks(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/reconstruction_max_drift": 0.2,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
+
     def test_adaptive_action_space_demotes_bad_promoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
         action_space.update_from_metrics(
@@ -301,6 +321,39 @@ class ActionCodecTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(metrics["action_space/max_chunk_size"], 2.0)
+
+    def test_adaptive_action_space_demotes_drifty_promoted_chunks(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/reconstruction_max_drift": 0.2,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/demotions"], 1.0)
 
     def test_adaptive_action_space_demotes_failed_promoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
@@ -517,6 +570,8 @@ class ActionCodecTests(unittest.TestCase):
             promote_latent_patches=True,
             latent_patch_latent_size=3,
             promotion_min_pulls=2,
+            promotion_max_reconstruction_drift=0.03,
+            demotion_max_reconstruction_drift=0.08,
         )
         action_space.update_from_metrics(
             {
@@ -544,9 +599,11 @@ class ActionCodecTests(unittest.TestCase):
         self.assertEqual(restored.max_chunk_size, 8)
         self.assertEqual(restored.promotion_parent_margin, 0.1)
         self.assertEqual(restored.promotion_semantic_bandwidth_threshold, 1.0)
+        self.assertEqual(restored.promotion_max_reconstruction_drift, 0.03)
         self.assertEqual(restored.promotion_min_pulls, 2)
         self.assertEqual(restored.demotion_parent_margin, 0.25)
         self.assertEqual(restored.demotion_semantic_bandwidth_threshold, 1.0)
+        self.assertEqual(restored.demotion_max_reconstruction_drift, 0.08)
         self.assertTrue(restored.promote_latent_patches)
         self.assertEqual(restored.latent_patch_latent_size, 3)
         self.assertEqual(metrics["action_space/promotions"], 2.0)

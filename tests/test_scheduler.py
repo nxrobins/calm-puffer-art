@@ -10,6 +10,7 @@ from calm_puffer_art import (
     TrajectoryGroup,
     TrainResult,
     trajectory_failure_modes,
+    trajectory_reconstruction_accuracy,
 )
 
 
@@ -678,6 +679,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             ),
             ("reconstruction_drift",),
         )
+        self.assertEqual(trajectory_reconstruction_accuracy(trajectory), 0.9)
 
         scheduler.observe_rollout(
             trajectory,
@@ -698,6 +700,47 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/arm/code_chunk_chunk_size_4/failure_rate"],
             1.0,
         )
+        self.assertEqual(metrics["scheduler/reconstruction_observations"], 1.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/reconstruction_accuracy_mean"],
+            0.9,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/reconstruction_max_drift"],
+            0.1,
+        )
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/reconstruction_observations"
+            ],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/reconstruction_accuracy_ema"
+            ],
+            0.9,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/reconstruction_accuracy_mean"
+            ],
+            0.9,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/reconstruction_accuracy_min"
+            ],
+            0.9,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/code_chunk_chunk_size_4/reconstruction_drift_ema"],
+            0.1,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/code_chunk_chunk_size_4/reconstruction_max_drift"],
+            0.1,
+        )
         self.assertEqual(
             metrics["scheduler/arm/code_chunk_chunk_size_4/unsafe"],
             0.0,
@@ -712,6 +755,12 @@ class ObjectiveSchedulerTests(unittest.TestCase):
                 "scheduler/arm/code_chunk_chunk_size_4/failure/reconstruction_drift"
             ],
             1.0,
+        )
+        self.assertAlmostEqual(
+            restored_metrics[
+                "scheduler/arm/code_chunk_chunk_size_4/reconstruction_max_drift"
+            ],
+            0.1,
         )
 
     def test_positive_objective_tightens_cadence_and_policy_lag(self):
