@@ -1563,6 +1563,20 @@ class ControlPlane:
                 trajectory_queue=trajectory_queue,
                 train_ring=train_ring,
             )
+            if self._selected_rollout_exceeds_accounted_budget(scheduler):
+                self._should_continue_training(
+                    scheduler=scheduler,
+                    train_ring=train_ring,
+                    policy_step=snapshot.step,
+                )
+                self._cancel_rollout_decision(
+                    scheduler,
+                    decision,
+                    active_actor_count=active_actor_count,
+                    admission_delay_s=admission_delay_s,
+                )
+                stop.set()
+                break
             context = RolloutContext(
                 actor_id=actor_id,
                 policy_step=snapshot.step,
@@ -2025,6 +2039,49 @@ class ControlPlane:
             pending_train_batches=train_ring.pending_batches,
             train_queue_pressure=self._train_queue_pressure(train_ring),
         )
+
+    def _selected_rollout_exceeds_accounted_budget(
+        self,
+        scheduler: AdaptiveScheduler | None,
+    ) -> bool:
+        if scheduler is None:
+            return False
+        metrics = scheduler.metrics()
+        budget = _state_float(
+            metrics.get("scheduler/budget/max_accounted_dollar_seconds"),
+            0.0,
+        )
+        if budget <= 0.0:
+            return False
+        projected = _state_float(
+            metrics.get("scheduler/budget/projected_accounted_dollar_seconds"),
+            0.0,
+        )
+        return projected > budget
+
+    @staticmethod
+    def _cancel_rollout_decision(
+        scheduler: AdaptiveScheduler | None,
+        decision: SchedulerDecision,
+        *,
+        active_actor_count: int | None = None,
+        admission_delay_s: float | None = None,
+    ) -> None:
+        if scheduler is None:
+            return
+        cancel = getattr(scheduler, "cancel_rollout_decision", None)
+        if cancel is not None:
+            metadata = dict(decision.metadata)
+            if active_actor_count is not None:
+                metadata["scheduler/active_actor_count"] = active_actor_count
+            if admission_delay_s is not None:
+                metadata["scheduler/active_rollout_admission_delay_ms"] = max(
+                    0,
+                    int(round(admission_delay_s * 1000.0)),
+                )
+                metadata["scheduler/admission_observed"] = admission_delay_s > 0.0
+            decision = replace(decision, metadata=metadata)
+            cancel(decision)
 
     def _trajectory_dollar_seconds(self, trajectory: Trajectory) -> float:
         explicit_total = _first_nonnegative_float(

@@ -1268,6 +1268,109 @@ class RuntimeTests(unittest.TestCase):
             5.0,
         )
 
+    def test_control_plane_cancels_selection_when_rollout_reservation_exceeds_budget(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=3.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budgeted",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budgeted|token"},
+                ),
+                accepted=True,
+                dollar_seconds=2.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            workflow_calls = 0
+
+            async def workflow(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                return await budget_exhausting_rollout(policy, scenario, context)
+
+            summary = await runtime.run(
+                scenarios=[Scenario(id="budgeted")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=workflow,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+            return summary, workflow_calls
+
+        summary, workflow_calls = asyncio.run(run())
+
+        self.assertEqual(workflow_calls, 0)
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/total_rollout_decisions"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/total_inflight_rollouts"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "scheduler/budget/reserved_inflight_rollout_dollar_seconds"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/cadence_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/policy_lag_1/decisions", 0.0),
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/actor_count_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(summary.metrics["scheduler/admission/decisions"], 0.0)
+        self.assertEqual(
+            summary.metrics.get(
+                "scheduler/control/admission_delay_ms_0/decisions",
+                0.0,
+            ),
+            0.0,
+        )
+
     def test_actor_loop_stops_before_rollout_when_scheduler_stops(self):
         async def run():
             scheduler = StopImmediatelyScheduler()

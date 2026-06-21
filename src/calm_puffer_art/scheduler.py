@@ -632,6 +632,7 @@ class ObjectiveScheduler:
     def cancel_rollout_decision(self, decision: SchedulerDecision) -> None:
         """Cancel a selected rollout before any rollout work was produced."""
 
+        metadata = _mapping_state(decision.metadata)
         stats = self._arms.get(decision.arm_id)
         if stats is not None:
             reserved_cost = _decision_reserved_rollout_dollar_seconds(decision)
@@ -649,9 +650,58 @@ class ObjectiveScheduler:
             actor_stats.inflight = max(0, actor_stats.inflight - 1)
             actor_stats.decisions = max(0, actor_stats.decisions - 1)
 
-        if self._last_decision_snapshot == _decision_to_state(decision):
+        self._cancel_control_decision(
+            self._cadence_controls,
+            decision.target_train_batch_groups,
+        )
+        self._cancel_control_decision(self._lag_controls, decision.max_policy_lag)
+        actor_count = _first_int_metadata(
+            metadata,
+            ("scheduler/active_actor_count", "active_actor_count"),
+        )
+        if actor_count is not None and actor_count > 0:
+            self._cancel_control_decision(self._actor_count_controls, actor_count)
+        admission_delay_ms = _first_int_metadata(
+            metadata,
+            (
+                "scheduler/active_rollout_admission_delay_ms",
+                "rollout_admission_delay_ms",
+            ),
+        )
+        if (
+            admission_delay_ms is not None
+            and not _state_bool(metadata.get("scheduler/admission_observed"), False)
+        ):
+            self._cancel_control_decision(
+                self._admission_controls,
+                admission_delay_ms,
+            )
+            self._rollout_admission_decisions = max(
+                0,
+                self._rollout_admission_decisions - 1,
+            )
+            self._last_rollout_admission_delay_s = 0.0
+
+        if _state_bool(
+            metadata.get("coverage_forced"),
+            False,
+        ):
+            self._coverage_forced_decisions = max(
+                0,
+                self._coverage_forced_decisions - 1,
+            )
+
+        if _decision_matches_snapshot_for_cancel(
+            self._last_decision_snapshot,
+            decision,
+        ):
             self._last_decision = None
             self._last_decision_snapshot = None
+            self._last_rollout_coverage_target = 0.0
+            self._last_rollout_coverage_share = 0.0
+            self._last_rollout_coverage_deficit = 0.0
+            self._last_rollout_coverage_cost_share = 0.0
+            self._last_rollout_coverage_cost_limited = False
 
     def target_train_batch_groups(
         self,
@@ -3723,6 +3773,24 @@ class ObjectiveScheduler:
         controls.setdefault(value, ControlStats()).decisions += 1
         return value
 
+    def _cancel_control_decision(
+        self,
+        controls: dict[int, ControlStats],
+        value: int,
+    ) -> None:
+        stats = controls.get(value)
+        if stats is None:
+            return
+        stats.decisions = max(0, stats.decisions - 1)
+        if (
+            stats.decisions == 0
+            and _control_feedback_updates(stats) == 0
+            and stats.total_objective == 0.0
+            and stats.total_stale_penalty_objective == 0.0
+            and stats.stale_experience == 0.0
+        ):
+            controls.pop(value, None)
+
     def _record_arm_decision(
         self,
         stats: ArmStats,
@@ -4482,6 +4550,24 @@ def _decision_to_state(decision: SchedulerDecision) -> dict[str, Any]:
         "max_policy_lag": decision.max_policy_lag,
         "metadata": _scalar_metadata(decision.metadata),
     }
+
+
+def _decision_matches_snapshot_for_cancel(
+    snapshot: Mapping[str, Any] | None,
+    decision: SchedulerDecision,
+) -> bool:
+    if snapshot is None:
+        return False
+    state = _decision_to_state(decision)
+    for key in ("arm_id", "target_train_batch_groups", "max_policy_lag"):
+        if snapshot.get(key) != state.get(key):
+            return False
+    snapshot_metadata = _mapping_state(snapshot.get("metadata"))
+    state_metadata = _mapping_state(state.get("metadata"))
+    return all(
+        state_metadata.get(key) == value
+        for key, value in snapshot_metadata.items()
+    )
 
 
 def _decision_state_from_mapping(value: Any) -> dict[str, Any] | None:

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from calm_puffer_art import (
     ActionUnit,
@@ -3631,6 +3632,17 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             accepted=True,
             dollar_seconds=2.0,
         )
+        actor_count = scheduler.active_actor_count(
+            configured=2,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        admission_delay_s = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
         decision = scheduler.select_rollout(
             scenarios=[Scenario(id="budgeted")],
             action_codecs=[TokenActionCodec()],
@@ -3640,6 +3652,37 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             train_queue_pressure=0.0,
             configured_train_batch_groups=1,
             configured_max_policy_lag=1,
+        )
+        decision = replace(
+            decision,
+            metadata={
+                **decision.metadata,
+                "scheduler/active_actor_count": actor_count,
+                "scheduler/active_rollout_admission_delay_ms": max(
+                    0,
+                    int(round(admission_delay_s * 1000.0)),
+                ),
+                "scheduler/admission_observed": False,
+            },
+        )
+        selected_metrics = scheduler.metrics()
+
+        self.assertEqual(
+            selected_metrics["scheduler/control/actor_count_2/decisions"],
+            1.0,
+        )
+        self.assertEqual(selected_metrics["scheduler/admission/decisions"], 1.0)
+        self.assertEqual(
+            selected_metrics["scheduler/control/admission_delay_ms_0/decisions"],
+            1.0,
+        )
+        self.assertEqual(
+            selected_metrics["scheduler/control/cadence_1/decisions"],
+            1.0,
+        )
+        self.assertEqual(
+            selected_metrics["scheduler/control/policy_lag_1/decisions"],
+            1.0,
         )
 
         scheduler.cancel_rollout_decision(decision)
@@ -3662,6 +3705,109 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0.0,
         )
         self.assertEqual(metrics["scheduler/arm/budgeted_token/decisions"], 0.0)
+        self.assertEqual(
+            metrics.get("scheduler/control/cadence_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(
+            metrics.get("scheduler/control/policy_lag_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(
+            metrics.get("scheduler/control/actor_count_2/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(metrics["scheduler/admission/decisions"], 0.0)
+        self.assertEqual(
+            metrics.get("scheduler/control/admission_delay_ms_0/decisions", 0.0),
+            0.0,
+        )
+        self.assertNotIn("scheduler/last_target_train_batch_groups", metrics)
+
+    def test_cancel_rollout_decision_rolls_back_coverage_forced_selection(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            min_rollout_coverage_fraction=0.5,
+        )
+        scenarios = [Scenario(id="left"), Scenario(id="right")]
+        codecs = [TokenActionCodec()]
+
+        first = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        second = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=1,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        self.assertNotEqual(first.arm_id, second.arm_id)
+
+        for decision, reward in ((first, 10.0), (second, 0.0)):
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=decision.scenario.id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=reward,
+                    metadata={"scheduler/arm_id": decision.arm_id},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+
+        third = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=2,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        self.assertEqual(third.arm_id, first.arm_id)
+
+        forced = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=3,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        self.assertEqual(forced.arm_id, second.arm_id)
+        self.assertTrue(forced.metadata["coverage_forced"])
+        self.assertEqual(
+            scheduler.metrics()["scheduler/coverage/forced_decisions"],
+            1.0,
+        )
+
+        scheduler.cancel_rollout_decision(forced)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/coverage/forced_decisions"], 0.0)
+        self.assertEqual(metrics["scheduler/total_rollout_decisions"], 3.0)
+        self.assertEqual(metrics["scheduler/coverage/last_target"], 0.0)
+        self.assertEqual(metrics["scheduler/coverage/last_share"], 0.0)
+        self.assertEqual(
+            scheduler.state_dict()["arms"][second.arm_id]["decisions"],
+            1.0,
+        )
 
     def test_positive_train_objective_resets_roi_patience(self):
         scheduler = ObjectiveScheduler(

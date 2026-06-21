@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
 from typing import Any, Awaitable, Iterable, Mapping, Sequence
@@ -581,7 +581,10 @@ class AsyncArtBackend:
             trajectory_queue_pressure=trajectory_queue_pressure,
         )
         if self._selected_rollout_exceeds_accounted_budget():
-            self._cancel_rollout_decision(decision)
+            self._cancel_rollout_decision(
+                decision,
+                metadata=admission.metadata,
+            )
             self._stopped_admissions += 1
             metadata = {
                 **admission.metadata,
@@ -1295,11 +1298,21 @@ class AsyncArtBackend:
         )
         return projected > budget
 
-    def _cancel_rollout_decision(self, decision: SchedulerDecision) -> None:
+    def _cancel_rollout_decision(
+        self,
+        decision: SchedulerDecision,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         if self.scheduler is None:
             return
         cancel = getattr(self.scheduler, "cancel_rollout_decision", None)
         if cancel is not None:
+            if metadata:
+                decision = replace(
+                    decision,
+                    metadata={**decision.metadata, **metadata},
+                )
             cancel(decision)
 
     def _accounted_dollar_seconds(

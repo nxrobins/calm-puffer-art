@@ -981,6 +981,14 @@ class ArtAdapterTests(unittest.TestCase):
             2.0,
         )
         self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 0.0)
+        self.assertEqual(stats["scheduler/control/cadence_1/decisions"], 1.0)
+        self.assertEqual(stats["scheduler/control/policy_lag_1/decisions"], 1.0)
+        self.assertEqual(stats["scheduler/control/actor_count_4/decisions"], 1.0)
+        self.assertEqual(stats["scheduler/admission/decisions"], 1.0)
+        self.assertEqual(
+            stats["scheduler/control/admission_delay_ms_0/decisions"],
+            1.0,
+        )
         self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
 
     def test_async_art_backend_records_failed_rollout_assignment(self):
