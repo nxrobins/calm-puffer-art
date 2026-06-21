@@ -725,17 +725,22 @@ class ObjectiveScheduler:
             and self._low_roi_train_steps > 0
         ):
             preferred = self.min_actor_count
-            return self._record_control_decision(
-                self._actor_count_controls,
-                preferred,
-            )
-        if pressure >= 0.75 and not self._has_positive_objective_signal():
+        elif pressure >= 0.75 and not self._has_positive_objective_signal():
             preferred = self.min_actor_count
+        else:
+            preferred = configured
+        if (
+            preferred == self.min_actor_count
+            and not self._has_positive_objective_signal()
+            and not self._control_family_has_feedback(
+                self._actor_count_controls,
+                candidates,
+            )
+        ):
             return self._record_control_decision(
                 self._actor_count_controls,
                 preferred,
             )
-        preferred = configured
         return self._record_control_decision(
             self._actor_count_controls,
             self._select_control_value(

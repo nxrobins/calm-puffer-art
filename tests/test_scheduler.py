@@ -1601,6 +1601,52 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_actor_count_pressure_uses_feedback_after_stale_waste(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+        )
+        stale = Trajectory(
+            scenario_id="actors",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "actors|token",
+                "scheduler/active_actor_count": 1,
+            },
+        )
+
+        scheduler.observe_stale_batch(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="actors",
+                    trajectories=(stale,),
+                )
+            ],
+            policy_step=1,
+            reason="actor_pressure_waste",
+        )
+        count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertNotEqual(count, 1)
+        self.assertLess(
+            metrics["scheduler/control/actor_count_1/objective_ema"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/actor_count_{count}/decisions"],
+            1.0,
+        )
+
     def test_actor_count_backs_off_after_zero_roi_train_updates(self):
         scheduler = ObjectiveScheduler(
             min_actor_count=1,
@@ -1664,6 +1710,61 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/control/actor_count_1/decisions"],
             1.0,
         )
+
+    def test_actor_count_low_roi_uses_feedback_after_stale_waste(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+            ema_alpha=1.0,
+            min_train_objective=0.0,
+        )
+        stale = Trajectory(
+            scenario_id="actors",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "actors|token",
+                "scheduler/active_actor_count": 1,
+            },
+        )
+        zero_roi = Trajectory(
+            scenario_id="roi",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            metadata={"scheduler/arm_id": "roi|token"},
+        )
+
+        scheduler.observe_stale_batch(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="actors",
+                    trajectories=(stale,),
+                )
+            ],
+            policy_step=1,
+            reason="actor_low_roi_waste",
+        )
+        scheduler.observe_rollout(zero_roi, accepted=True, dollar_seconds=1.0)
+        scheduler.observe_train(
+            groups=[TrajectoryGroup(scenario_id="roi", trajectories=(zero_roi,))],
+            result=TrainResult(metrics={"train/reward": 0.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+        count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+
+        self.assertNotEqual(count, 1)
 
     def test_train_objective_tightens_cadence_and_lag_under_pressure(self):
         scheduler = ObjectiveScheduler(
