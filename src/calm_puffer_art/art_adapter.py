@@ -900,6 +900,11 @@ class AsyncArtBackend:
         )
         future = asyncio.get_running_loop().create_future()
         active_max_policy_lag = self._max_policy_lag()
+        self._tag_batch_control_metadata(
+            local_groups,
+            target_train_batch_groups=len(local_groups),
+            max_policy_lag=active_max_policy_lag,
+        )
         if local_groups and self._groups_max_lag(local_groups) > active_max_policy_lag:
             self._submitted_batches += 1
             self._submitted_train_groups += len(local_groups)
@@ -965,7 +970,16 @@ class AsyncArtBackend:
         async with self._pending_lock:
             self._discard_stale_pending_locked()
             self._submitted_groups += 1
-            if self._pending_group_max_lag(pending) > self._max_policy_lag():
+            active_max_policy_lag = self._max_policy_lag()
+            if self._pending_group_max_lag(pending) > active_max_policy_lag:
+                target = self._target_train_batch_groups(
+                    pending_groups=len(self._pending_groups) + 1
+                )
+                self._tag_batch_control_metadata(
+                    (local_group,),
+                    target_train_batch_groups=target,
+                    max_policy_lag=active_max_policy_lag,
+                )
                 self._observe_submitted_rollouts(
                     (local_group,),
                     accepted=False,
@@ -976,11 +990,18 @@ class AsyncArtBackend:
                     reason="art_pending_group_stale_on_submit",
                 )
                 return future
-            self._observe_submitted_rollouts((local_group,))
             if self._pending_groups and not self._compatible_pending_group(pending):
                 await self._flush_pending_locked()
+            target = self._target_train_batch_groups(
+                pending_groups=len(self._pending_groups) + 1
+            )
+            self._tag_batch_control_metadata(
+                (local_group,),
+                target_train_batch_groups=target,
+                max_policy_lag=active_max_policy_lag,
+            )
+            self._observe_submitted_rollouts((local_group,))
             self._pending_groups.append(pending)
-            target = self._target_train_batch_groups()
             if len(self._pending_groups) >= target:
                 await self._flush_pending_locked()
         return future
@@ -1453,14 +1474,18 @@ class AsyncArtBackend:
         current = self._pending_groups[0]
         return current.model is pending.model and current.kwargs == pending.kwargs
 
-    def _target_train_batch_groups(self) -> int:
+    def _target_train_batch_groups(self, *, pending_groups: int | None = None) -> int:
         if self.scheduler is None:
             return self.config.train_batch_groups
         return max(
             1,
             self.scheduler.target_train_batch_groups(
                 configured=self.config.train_batch_groups,
-                pending_groups=len(self._pending_groups),
+                pending_groups=(
+                    len(self._pending_groups)
+                    if pending_groups is None
+                    else pending_groups
+                ),
                 train_queue_pressure=self._train_queue_pressure(),
                 policy_step=self._current_step,
             ),
