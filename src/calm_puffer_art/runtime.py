@@ -1167,6 +1167,7 @@ class ControlPlane:
                 stop=stop,
                 registry=registry,
                 grouper=grouper,
+                producers=actors,
                 trajectory_queue=trajectory_queue,
                 train_ring=train_ring,
                 telemetry=telemetry,
@@ -1193,6 +1194,8 @@ class ControlPlane:
                 train_wait_started = time.perf_counter()
                 batch = await self._get_train_batch_or_stop(
                     stop=stop,
+                    producers=actors,
+                    trajectory_queue=trajectory_queue,
                     train_ring=train_ring,
                     current_policy_step=current.step,
                     priority_scorer=self._batch_priority_scorer(scheduler),
@@ -1358,6 +1361,7 @@ class ControlPlane:
         stop: asyncio.Event,
         registry: PolicyRegistry,
         grouper: TrajectoryGrouper,
+        producers: Sequence[asyncio.Task[Any]],
         trajectory_queue: asyncio.Queue[Trajectory],
         train_ring: TrajectoryRingBuffer,
         telemetry: RuntimeTelemetry,
@@ -1365,8 +1369,18 @@ class ControlPlane:
         action_space: AdaptiveActionSpace | None,
         scheduler: AdaptiveScheduler | None,
     ) -> None:
-        while not stop.is_set():
-            trajectory = await trajectory_queue.get()
+        while True:
+            producers_done = all(task.done() for task in producers)
+            if stop.is_set() and producers_done and trajectory_queue.empty():
+                break
+            if stop.is_set():
+                try:
+                    trajectory = trajectory_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0)
+                    continue
+            else:
+                trajectory = await trajectory_queue.get()
             latest = await registry.snapshot()
             max_policy_lag = self._max_policy_lag(
                 scheduler=scheduler,
@@ -1544,6 +1558,20 @@ class ControlPlane:
                 "scheduler/active_actor_count",
                 active_actor_count,
             )
+            for key in (
+                "expected_rollout_dollar_seconds",
+                "estimated_rollout_dollar_seconds",
+                "reserved_rollout_dollar_seconds",
+                "unobserved_rollout_cost_penalty",
+            ):
+                value = decision.metadata.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)) and isfinite(float(value)):
+                    trajectory.metadata.setdefault(
+                        f"scheduler/decision/{key}",
+                        float(value),
+                    )
             admission_delay_ms = max(0, int(round(admission_delay_s * 1000.0)))
             trajectory.metadata.setdefault(
                 "scheduler/active_rollout_admission_delay_ms",
@@ -1577,6 +1605,8 @@ class ControlPlane:
         self,
         *,
         stop: asyncio.Event,
+        producers: Sequence[asyncio.Task[Any]] = (),
+        trajectory_queue: asyncio.Queue[Trajectory] | None = None,
         train_ring: TrajectoryRingBuffer,
         current_policy_step: int,
         priority_scorer: Callable[[VersionedTrajectoryBatch, int], float]
@@ -1589,22 +1619,60 @@ class ControlPlane:
             )
         )
         stop_task = asyncio.create_task(stop.wait())
-        tasks = (batch_task, stop_task)
-        pending: set[asyncio.Task[Any]] = set()
+        stop_seen = stop.is_set()
         try:
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if stop_task in done and stop.is_set():
-                return None
-            return await batch_task
+            while True:
+                if batch_task.done():
+                    return await batch_task
+                if stop_seen and self._sample_production_drained(
+                    producers=producers,
+                    trajectory_queue=trajectory_queue,
+                    train_ring=train_ring,
+                ):
+                    await asyncio.sleep(0)
+                    if batch_task.done():
+                        return await batch_task
+                    if self._sample_production_drained(
+                        producers=producers,
+                        trajectory_queue=trajectory_queue,
+                        train_ring=train_ring,
+                    ):
+                        return None
+
+                wait_for: set[asyncio.Task[Any]] = {batch_task}
+                if not stop_seen:
+                    wait_for.add(stop_task)
+                wait_for.update(task for task in producers if not task.done())
+                if len(wait_for) == 1 and stop_seen:
+                    await asyncio.sleep(0)
+                    continue
+                done, _ = await asyncio.wait(
+                    wait_for,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if batch_task in done:
+                    return await batch_task
+                if stop_task in done:
+                    stop_seen = True
         finally:
-            for task in pending:
-                task.cancel()
-            for task in pending:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            for task in (batch_task, stop_task):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    @staticmethod
+    def _sample_production_drained(
+        *,
+        producers: Sequence[asyncio.Task[Any]],
+        trajectory_queue: asyncio.Queue[Trajectory] | None,
+        train_ring: TrajectoryRingBuffer,
+    ) -> bool:
+        return (
+            all(task.done() for task in producers)
+            and (trajectory_queue is None or trajectory_queue.empty())
+            and train_ring.pending_batches == 0
+        )
 
     def _active_actor_count(
         self,

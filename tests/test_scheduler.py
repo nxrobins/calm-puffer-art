@@ -3422,6 +3422,104 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             )
         )
 
+    def test_accounted_budget_counts_inflight_rollout_reservations(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            max_accounted_dollar_seconds=3.0,
+        )
+        observed = Trajectory(
+            scenario_id="budgeted",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "budgeted|token"},
+        )
+        scheduler.observe_rollout(
+            observed,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="budgeted")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+
+        self.assertEqual(decision.arm_id, "budgeted|token")
+        self.assertEqual(
+            decision.metadata["reserved_rollout_dollar_seconds"],
+            2.0,
+        )
+        self.assertFalse(
+            scheduler.should_continue_training(
+                policy_step=0,
+                max_train_steps=10,
+                pending_train_batches=0,
+                train_queue_pressure=0.0,
+            )
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/budget/accounted_dollar_seconds"], 2.0)
+        self.assertEqual(
+            metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            4.0,
+        )
+        self.assertEqual(metrics["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/arm/budgeted_token/reserved_rollout_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            scheduler.state_dict()["arms"]["budgeted|token"][
+                "reserved_rollout_dollar_seconds"
+            ],
+            0.0,
+        )
+
+        completed = Trajectory(
+            scenario_id="budgeted",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": decision.arm_id,
+                "scheduler/decision/reserved_rollout_dollar_seconds": 2.0,
+            },
+        )
+        scheduler.observe_rollout(
+            completed,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(
+            metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/budgeted_token/reserved_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(metrics["scheduler/budget/accounted_dollar_seconds"], 4.0)
+        self.assertEqual(
+            metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            4.0,
+        )
+
     def test_positive_train_objective_resets_roi_patience(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,
@@ -3607,9 +3705,6 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/continuation/objective_accounted",
             "scheduler/budget/max_accounted_dollar_seconds",
             "scheduler/budget/accounted_dollar_seconds",
-            "scheduler/budget/remaining_accounted_dollar_seconds",
-            "scheduler/budget/accounted_fraction",
-            "scheduler/budget/accounted_exhausted",
             "scheduler/control/train_objective_accounted",
             "scheduler/train_last_experience_count",
             "scheduler/train_last_reward_improving_experience",
@@ -3652,6 +3747,22 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/max_control_candidate_values",
         ):
             self.assertAlmostEqual(restored_metrics[key], before_metrics[key])
+        self.assertGreater(
+            before_metrics[
+                "scheduler/budget/reserved_inflight_rollout_dollar_seconds"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            restored_metrics[
+                "scheduler/budget/reserved_inflight_rollout_dollar_seconds"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            restored_metrics["scheduler/budget/accounted_dollar_seconds"],
+        )
 
         original_next = scheduler.select_rollout(
             scenarios=scenarios,

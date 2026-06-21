@@ -918,6 +918,7 @@ class RuntimeTests(unittest.TestCase):
                 min_chunk_size=2,
                 max_chunk_size=4,
                 demotion_parent_margin=0.0,
+                demotion_min_pulls=1,
             )
             runtime = ControlPlane(
                 ControlPlaneConfig(
@@ -1367,6 +1368,90 @@ class RuntimeTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(summary.pending_trajectories, 1)
+
+    def test_control_plane_counts_inflight_reservations_before_parallel_rollouts(
+        self,
+    ):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=3.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budgeted-rollout",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budgeted-rollout|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=4,
+                    group_size=3,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            workflow_calls = 0
+
+            async def slow_budgeted_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                await asyncio.sleep(0.01)
+                trajectory = await flat_rollout(policy, scenario, context)
+                trajectory.metrics["rollout/dollar_seconds"] = 1.0
+                return trajectory
+
+            summary = await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="budgeted-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=slow_budgeted_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+            return summary, workflow_calls
+
+        summary, workflow_calls = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(workflow_calls, 2)
+        self.assertEqual(summary.metrics["data/trajectories_seen"], 2.0)
+        self.assertEqual(summary.metrics["scheduler/total_rollout_decisions"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/total_rollout_observations"],
+            3.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(summary.metrics["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(summary.pending_trajectories, 2)
 
     def test_control_plane_uses_explicit_train_dollar_seconds(self):
         async def run():

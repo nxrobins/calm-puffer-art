@@ -1459,6 +1459,7 @@ def art_rollout_metadata(
         "coverage_cost_limited",
         "expected_rollout_dollar_seconds",
         "estimated_rollout_dollar_seconds",
+        "reserved_rollout_dollar_seconds",
         "unobserved_rollout_cost_penalty",
         "unobserved_rollout_cost_estimated",
     ):

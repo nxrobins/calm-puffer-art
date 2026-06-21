@@ -145,6 +145,7 @@ class AdaptiveScheduler(Protocol):
 class ArmStats:
     decisions: int = 0
     inflight: int = 0
+    reserved_rollout_dollar_seconds: float = 0.0
     pulls: int = 0
     accepted: int = 0
     unsafe: int = 0
@@ -559,7 +560,11 @@ class ObjectiveScheduler:
         decision_score = self._score_arm(arm_id, scenario, codec)
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
-        self._record_arm_decision(selected_stats)
+        reserved_rollout_dollar_seconds = max(0.0, estimated_rollout_dollar_seconds)
+        self._record_arm_decision(
+            selected_stats,
+            reserved_rollout_dollar_seconds=reserved_rollout_dollar_seconds,
+        )
         actor_stats = self._actors.setdefault(actor_id, ActorStats())
         actor_stats.decisions += 1
         actor_stats.inflight += 1
@@ -604,6 +609,9 @@ class ObjectiveScheduler:
                 ),
                 "estimated_rollout_dollar_seconds": (
                     estimated_rollout_dollar_seconds
+                ),
+                "reserved_rollout_dollar_seconds": (
+                    reserved_rollout_dollar_seconds
                 ),
                 "unobserved_rollout_cost_penalty": (
                     unobserved_rollout_cost_penalty
@@ -778,7 +786,19 @@ class ObjectiveScheduler:
         arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
         stats = self._arms.setdefault(arm_id, ArmStats())
         if stats.inflight > 0:
+            reserved_cost = _trajectory_reserved_rollout_dollar_seconds(trajectory)
+            if (
+                reserved_cost <= 0.0
+                and stats.reserved_rollout_dollar_seconds > 0.0
+            ):
+                reserved_cost = (
+                    stats.reserved_rollout_dollar_seconds / stats.inflight
+                )
             stats.inflight -= 1
+            stats.reserved_rollout_dollar_seconds = max(
+                0.0,
+                stats.reserved_rollout_dollar_seconds - reserved_cost,
+            )
         rollout_cost = max(dollar_seconds, 1e-12)
         queue_wait_cost = max(0.0, queue_wait_dollar_seconds)
         admission_cost = _trajectory_admission_dollar_seconds(trajectory)
@@ -2022,14 +2042,20 @@ class ObjectiveScheduler:
             default=0.0,
         )
         accounted_dollar_seconds = self._accounted_dollar_seconds()
+        reserved_inflight_dollar_seconds = (
+            self._reserved_inflight_rollout_dollar_seconds()
+        )
+        projected_accounted_dollar_seconds = (
+            accounted_dollar_seconds + reserved_inflight_dollar_seconds
+        )
         budget_limit = self.max_accounted_dollar_seconds or 0.0
         budget_remaining = (
-            max(0.0, budget_limit - accounted_dollar_seconds)
+            max(0.0, budget_limit - projected_accounted_dollar_seconds)
             if self.max_accounted_dollar_seconds is not None
             else 0.0
         )
         budget_fraction = (
-            accounted_dollar_seconds / budget_limit
+            projected_accounted_dollar_seconds / budget_limit
             if budget_limit > 0.0
             else 0.0
         )
@@ -2091,6 +2117,12 @@ class ObjectiveScheduler:
             ),
             "scheduler/budget/max_accounted_dollar_seconds": budget_limit,
             "scheduler/budget/accounted_dollar_seconds": accounted_dollar_seconds,
+            "scheduler/budget/reserved_inflight_rollout_dollar_seconds": (
+                reserved_inflight_dollar_seconds
+            ),
+            "scheduler/budget/projected_accounted_dollar_seconds": (
+                projected_accounted_dollar_seconds
+            ),
             "scheduler/budget/remaining_accounted_dollar_seconds": (
                 budget_remaining
             ),
@@ -2299,6 +2331,9 @@ class ObjectiveScheduler:
                 arm_id
             )
             metrics[f"{prefix}/inflight"] = float(stats.inflight)
+            metrics[f"{prefix}/reserved_rollout_dollar_seconds"] = (
+                stats.reserved_rollout_dollar_seconds
+            )
             metrics[f"{prefix}/pulls"] = float(stats.pulls)
             metrics[f"{prefix}/accepted"] = float(stats.accepted)
             metrics[f"{prefix}/unsafe"] = float(stats.unsafe)
@@ -3661,13 +3696,28 @@ class ObjectiveScheduler:
         controls.setdefault(value, ControlStats()).decisions += 1
         return value
 
-    def _record_arm_decision(self, stats: ArmStats) -> None:
+    def _record_arm_decision(
+        self,
+        stats: ArmStats,
+        *,
+        reserved_rollout_dollar_seconds: float,
+    ) -> None:
         stats.decisions += 1
         stats.inflight += 1
+        stats.reserved_rollout_dollar_seconds += max(
+            0.0,
+            reserved_rollout_dollar_seconds,
+        )
         self._total_decisions += 1
 
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
+
+    def _reserved_inflight_rollout_dollar_seconds(self) -> float:
+        return sum(
+            max(0.0, stats.reserved_rollout_dollar_seconds)
+            for stats in self._arms.values()
+        )
 
     def _observe_accounted_train_objective(
         self,
@@ -3714,7 +3764,11 @@ class ObjectiveScheduler:
     def _accounted_budget_exhausted(self) -> bool:
         if self.max_accounted_dollar_seconds is None:
             return False
-        return self._accounted_dollar_seconds() >= self.max_accounted_dollar_seconds
+        return (
+            self._accounted_dollar_seconds()
+            + self._reserved_inflight_rollout_dollar_seconds()
+            >= self.max_accounted_dollar_seconds
+        )
 
     def _ema(self, current: float, value: float, count: int) -> float:
         if count <= 1:
@@ -3887,6 +3941,7 @@ def _dataclass_state(value: Any) -> dict[str, Any]:
 def _arm_stats_state(stats: ArmStats) -> dict[str, Any]:
     state = _dataclass_state(stats)
     state["inflight"] = 0
+    state["reserved_rollout_dollar_seconds"] = 0.0
     return state
 
 
@@ -3940,6 +3995,7 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
         decisions=_state_int(state.get("decisions"), default.decisions),
         # In-flight reservations belong to a live process and should not resume.
         inflight=0,
+        reserved_rollout_dollar_seconds=0.0,
         pulls=_state_int(state.get("pulls"), default.pulls),
         accepted=_state_int(state.get("accepted"), default.accepted),
         unsafe=_state_int(state.get("unsafe"), default.unsafe),
@@ -4541,6 +4597,18 @@ def _trajectory_admission_dollar_seconds(trajectory: Trajectory) -> float:
             trajectory.metadata,
             ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
         )
+    return explicit_cost or 0.0
+
+
+def _trajectory_reserved_rollout_dollar_seconds(trajectory: Trajectory) -> float:
+    explicit_cost = _first_nonnegative_mapping_float(
+        trajectory.metadata,
+        (
+            "scheduler/decision/reserved_rollout_dollar_seconds",
+            "scheduler/decision/estimated_rollout_dollar_seconds",
+            "scheduler/decision/expected_rollout_dollar_seconds",
+        ),
+    )
     return explicit_cost or 0.0
 
 
