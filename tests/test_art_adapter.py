@@ -18,6 +18,7 @@ from calm_puffer_art import (
     Scenario,
     StaleArtBatchError,
     TokenActionCodec,
+    Trajectory,
     TrajectoryGroup,
     WeightBroadcastChannel,
     action_codec_key,
@@ -827,6 +828,88 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
         self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 1.0)
         self.assertEqual(stats["scheduler/stop_recommended"], 1.0)
+
+    def test_async_art_backend_admit_and_select_reserves_budget(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=3.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budget-art",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budget-art|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(train_batch_groups=1),
+            )
+
+            first = await async_backend.admit_and_select_rollout(
+                scenarios=[Scenario(id="budget-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=0,
+                configured_actor_count=4,
+                apply_delay=False,
+            )
+            second = await async_backend.admit_and_select_rollout(
+                scenarios=[Scenario(id="budget-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=1,
+                configured_actor_count=4,
+                apply_delay=False,
+            )
+            third = await async_backend.admit_and_select_rollout(
+                scenarios=[Scenario(id="budget-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=2,
+                configured_actor_count=4,
+                apply_delay=False,
+            )
+            stats = async_backend.stats()
+            await async_backend.close()
+            return first, second, third, stats
+
+        first, second, third, stats = asyncio.run(run())
+
+        self.assertTrue(first.admitted)
+        self.assertTrue(second.admitted)
+        self.assertFalse(third.admitted)
+        self.assertIsNotNone(first.decision)
+        self.assertIsNotNone(second.decision)
+        self.assertIsNone(third.decision)
+        self.assertEqual(first.metadata["scheduler/arm_id"], "budget-art|token")
+        self.assertEqual(
+            first.metadata["scheduler/decision/reserved_rollout_dollar_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            stats["scheduler/total_rollout_decisions"],
+            2.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/accounted_dollar_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/projected_accounted_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
 
     def test_async_art_backend_select_rollout_uses_promoted_action_space_codecs(self):
         async def run():

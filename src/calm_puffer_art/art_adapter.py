@@ -259,6 +259,19 @@ class ArtRolloutAdmission:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ArtRolloutAssignment:
+    """Atomic admission plus scheduler decision for an ART rollout producer."""
+
+    admission: ArtRolloutAdmission
+    decision: SchedulerDecision | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def admitted(self) -> bool:
+        return self.admission.admitted and self.decision is not None
+
+
 class AsyncArtBackend:
     """Backend-shaped ART wrapper backed by the local Puffer-style train ring.
 
@@ -506,6 +519,70 @@ class AsyncArtBackend:
             admitted=True,
             delay_s=elapsed_s,
             delay_dollar_seconds=delay_dollar_seconds,
+            metadata=metadata,
+        )
+
+    async def admit_and_select_rollout(
+        self,
+        *,
+        scenarios: Sequence[Scenario],
+        action_codec: ActionCodec | None = None,
+        action_codecs: Sequence[ActionCodec] | None = None,
+        actor_id: int = 0,
+        configured_actor_count: int = 1,
+        trajectory_queue_pressure: float = 0.0,
+        apply_delay: bool = True,
+    ) -> ArtRolloutAssignment:
+        """Atomically admit, reserve, and describe an external ART rollout.
+
+        This is the preferred bridge call for high-throughput producer pools:
+        it applies continuation and actor-count controls, then immediately
+        selects a scheduler arm so projected in-flight rollout spend is
+        reserved before the caller starts the rollout.
+        """
+
+        admission = await self.admit_rollout(
+            actor_id=actor_id,
+            configured_actor_count=configured_actor_count,
+            trajectory_queue_pressure=trajectory_queue_pressure,
+            apply_delay=apply_delay,
+        )
+        if not admission.admitted:
+            return ArtRolloutAssignment(
+                admission=admission,
+                metadata=admission.metadata,
+            )
+        if not self._should_continue_rollout_admission(
+            trajectory_queue_pressure=trajectory_queue_pressure,
+        ):
+            self._stopped_admissions += 1
+            metadata = {
+                **admission.metadata,
+                "scheduler/admitted": False,
+                "scheduler/stop_recommended": True,
+                "scheduler/stop_reason": "continuation_exhausted",
+            }
+            rejected = ArtRolloutAdmission(
+                actor_id=actor_id,
+                active_actor_count=0,
+                admitted=False,
+                delay_s=admission.delay_s,
+                delay_dollar_seconds=admission.delay_dollar_seconds,
+                metadata=metadata,
+            )
+            return ArtRolloutAssignment(admission=rejected, metadata=metadata)
+
+        decision = self.select_rollout(
+            scenarios=scenarios,
+            action_codec=action_codec,
+            action_codecs=action_codecs,
+            actor_id=actor_id,
+            trajectory_queue_pressure=trajectory_queue_pressure,
+        )
+        metadata = art_rollout_metadata(decision, extra=admission.metadata)
+        return ArtRolloutAssignment(
+            admission=admission,
+            decision=decision,
             metadata=metadata,
         )
 

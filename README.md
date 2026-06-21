@@ -200,24 +200,21 @@ result = await backend.train(art_model, art_groups)
 For scheduler-chosen ART rollout work, ask the backend for a decision and merge the metadata into the ART trajectory you produce:
 
 ```python
-from calm_puffer_art import Scenario, art_rollout_metadata
+from calm_puffer_art import Scenario
 
-admission = await backend.admit_rollout(
+assignment = await backend.admit_and_select_rollout(
+    scenarios=[Scenario(id="math")],
     actor_id=0,
     configured_actor_count=8,
     trajectory_queue_pressure=0.8,
 )
-if not admission.admitted:
+if not assignment.admitted:
     return None
-decision = backend.select_rollout(
-    scenarios=[Scenario(id="math")],
-    actor_id=0,
-)
-trajectory_metadata = art_rollout_metadata(decision, extra=admission.metadata)
+trajectory_metadata = assignment.metadata
 # Put trajectory_metadata into the ART Trajectory metadata before submit_group().
 ```
 
-`admit_rollout()` applies the scheduler's continuation, budget, active actor-count, and pre-rollout admission-delay controls for external ART actor pools. If the scheduler recommends stopping because ROI patience, `max_train_steps`, or `max_accounted_dollar_seconds` is exhausted, admission returns `admitted=False` before the actor spends on another rollout. When it sleeps, the delay cost is recorded once in scheduler admission telemetry and stamped into the returned metadata so the submitted trajectory can credit the chosen actor-count and admission-delay values. When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
+`admit_and_select_rollout()` applies the scheduler's continuation, budget, active actor-count, and pre-rollout admission-delay controls for external ART actor pools, then immediately selects and reserves a rollout arm when admitted. If the scheduler recommends stopping because ROI patience, `max_train_steps`, or projected `max_accounted_dollar_seconds` is exhausted, assignment returns `admitted=False` before the actor spends on another rollout. When it sleeps, the delay cost is recorded once in scheduler admission telemetry and stamped into the returned metadata so the submitted trajectory can credit the chosen actor-count and admission-delay values. When an `AdaptiveActionSpace` is attached, selection reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend. The lower-level `admit_rollout()` and `select_rollout()` methods remain available for custom producer loops, but the combined helper is the safer default for projected-budget accounting.
 
 For no-stop-the-world submission, use `submit_train()`:
 
