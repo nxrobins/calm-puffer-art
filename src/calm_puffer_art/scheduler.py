@@ -283,6 +283,7 @@ class ObjectiveScheduler:
         off_policy_lag_tightening_threshold: float = 0.0,
         confidence_penalty_weight: float = 0.0,
         control_exploration_bonus: float = 0.1,
+        rollout_cadence_lag_control_weight: float = 0.0,
         max_control_candidate_values: int = 8,
         min_rollout_coverage_fraction: float = 0.0,
         max_rollout_coverage_cost_fraction: float | None = None,
@@ -336,6 +337,10 @@ class ObjectiveScheduler:
             raise ValueError("confidence_penalty_weight must be non-negative")
         if control_exploration_bonus < 0:
             raise ValueError("control_exploration_bonus must be non-negative")
+        if rollout_cadence_lag_control_weight < 0:
+            raise ValueError(
+                "rollout_cadence_lag_control_weight must be non-negative"
+            )
         if max_control_candidate_values <= 0:
             raise ValueError("max_control_candidate_values must be positive")
         if not 0 <= min_rollout_coverage_fraction <= 1:
@@ -406,6 +411,9 @@ class ObjectiveScheduler:
         )
         self.confidence_penalty_weight = confidence_penalty_weight
         self.control_exploration_bonus = control_exploration_bonus
+        self.rollout_cadence_lag_control_weight = (
+            rollout_cadence_lag_control_weight
+        )
         self.max_control_candidate_values = max_control_candidate_values
         self.min_rollout_coverage_fraction = min_rollout_coverage_fraction
         self.max_rollout_coverage_cost_fraction = (
@@ -890,6 +898,18 @@ class ObjectiveScheduler:
             reward_efficiency,
             stats.pulls,
         )
+        if self.rollout_cadence_lag_control_weight > 0.0:
+            cadence_lag_objective = (
+                marginal_objective * self.rollout_cadence_lag_control_weight
+            )
+            self._credit_rollout_objective_to_cadence_control(
+                trajectory,
+                cadence_lag_objective,
+            )
+            self._credit_rollout_objective_to_lag_control(
+                trajectory,
+                cadence_lag_objective,
+            )
         self._credit_rollout_objective_to_admission_control(
             trajectory,
             marginal_objective,
@@ -1286,6 +1306,9 @@ class ObjectiveScheduler:
                 ),
                 "confidence_penalty_weight": self.confidence_penalty_weight,
                 "control_exploration_bonus": self.control_exploration_bonus,
+                "rollout_cadence_lag_control_weight": (
+                    self.rollout_cadence_lag_control_weight
+                ),
                 "max_control_candidate_values": (
                     self.max_control_candidate_values
                 ),
@@ -1588,6 +1611,13 @@ class ObjectiveScheduler:
             _state_float(
                 config.get("control_exploration_bonus"),
                 self.control_exploration_bonus,
+            ),
+        )
+        self.rollout_cadence_lag_control_weight = max(
+            0.0,
+            _state_float(
+                config.get("rollout_cadence_lag_control_weight"),
+                self.rollout_cadence_lag_control_weight,
             ),
         )
         self.max_control_candidate_values = max(
@@ -2162,6 +2192,9 @@ class ObjectiveScheduler:
             ),
             "scheduler/weights/control_exploration": (
                 self.control_exploration_bonus
+            ),
+            "scheduler/weights/rollout_cadence_lag_control": (
+                self.rollout_cadence_lag_control_weight
             ),
             "scheduler/reward_scale_normalization/arm_range": (
                 1.0
@@ -3303,22 +3336,14 @@ class ObjectiveScheduler:
         trajectory: Trajectory,
         objective: float,
     ) -> None:
-        value = _first_int_metadata(
-            trajectory.metadata,
-            (
+        self._credit_rollout_objective_to_control_family(
+            self._admission_controls,
+            trajectory,
+            objective,
+            keys=(
                 "scheduler/active_rollout_admission_delay_ms",
                 "scheduler/rollout_admission_delay_ms",
             ),
-        )
-        if value is None:
-            return
-        stats = self._admission_controls.setdefault(value, ControlStats())
-        stats.rollout_updates += 1
-        stats.total_objective += objective
-        stats.objective_ema = self._ema(
-            stats.objective_ema,
-            objective,
-            _control_feedback_updates(stats),
         )
 
     def _credit_rollout_objective_to_actor_count_control(
@@ -3326,16 +3351,61 @@ class ObjectiveScheduler:
         trajectory: Trajectory,
         objective: float,
     ) -> None:
-        value = _first_int_metadata(
-            trajectory.metadata,
-            (
+        self._credit_rollout_objective_to_control_family(
+            self._actor_count_controls,
+            trajectory,
+            objective,
+            keys=(
                 "scheduler/active_actor_count",
                 "scheduler/actor_count",
             ),
         )
+
+    def _credit_rollout_objective_to_cadence_control(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        self._credit_rollout_objective_to_control_family(
+            self._cadence_controls,
+            trajectory,
+            objective,
+            keys=(
+                "scheduler/active_target_train_batch_groups",
+                "scheduler/target_train_batch_groups",
+            ),
+        )
+
+    def _credit_rollout_objective_to_lag_control(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        self._credit_rollout_objective_to_control_family(
+            self._lag_controls,
+            trajectory,
+            objective,
+            keys=(
+                "scheduler/active_max_policy_lag",
+                "scheduler/max_policy_lag",
+            ),
+        )
+
+    def _credit_rollout_objective_to_control_family(
+        self,
+        controls: dict[int, ControlStats],
+        trajectory: Trajectory,
+        objective: float,
+        *,
+        keys: Sequence[str],
+    ) -> None:
+        value = _first_int_metadata(
+            trajectory.metadata,
+            keys,
+        )
         if value is None:
             return
-        stats = self._actor_count_controls.setdefault(value, ControlStats())
+        stats = controls.setdefault(value, ControlStats())
         stats.rollout_updates += 1
         stats.total_objective += objective
         stats.objective_ema = self._ema(

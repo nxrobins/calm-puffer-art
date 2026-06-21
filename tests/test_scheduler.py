@@ -1364,6 +1364,117 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/control/cadence_4/score"],
         )
 
+    def test_rollout_feedback_credits_and_reuses_cadence_and_lag_controls(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.1,
+            rollout_cadence_lag_control_weight=1.0,
+        )
+
+        first_target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        first_lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="controls",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={
+                    "scheduler/arm_id": "controls|token",
+                    "scheduler/active_target_train_batch_groups": first_target,
+                    "scheduler/active_max_policy_lag": first_lag,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        second_target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        second_lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="controls",
+                policy_step=1,
+                messages=[],
+                actions=[],
+                reward=5.0,
+                metadata={
+                    "scheduler/arm_id": "controls|token",
+                    "scheduler/active_target_train_batch_groups": second_target,
+                    "scheduler/active_max_policy_lag": second_lag,
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        third_target = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        third_lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=2,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(first_target, 3)
+        self.assertEqual(first_lag, 2)
+        self.assertNotEqual(second_target, first_target)
+        self.assertNotEqual(second_lag, first_lag)
+        self.assertEqual(third_target, second_target)
+        self.assertEqual(third_lag, second_lag)
+        self.assertEqual(
+            metrics[f"scheduler/control/cadence_{second_target}/rollout_updates"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/policy_lag_{second_lag}/rollout_updates"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/cadence_{second_target}/train_updates"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/policy_lag_{second_lag}/train_updates"],
+            0.0,
+        )
+        self.assertGreater(
+            metrics[f"scheduler/control/cadence_{second_target}/score"],
+            metrics[f"scheduler/control/cadence_{first_target}/score"],
+        )
+        self.assertGreater(
+            metrics[f"scheduler/control/policy_lag_{second_lag}/score"],
+            metrics[f"scheduler/control/policy_lag_{first_lag}/score"],
+        )
+
     def test_actor_count_control_explores_and_reuses_objective_values(self):
         scheduler = ObjectiveScheduler(
             min_actor_count=1,
@@ -3370,6 +3481,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             off_policy_lag_tightening_threshold=0.2,
             confidence_penalty_weight=0.25,
             control_exploration_bonus=0.15,
+            rollout_cadence_lag_control_weight=0.2,
             max_control_candidate_values=5,
             min_rollout_coverage_fraction=0.2,
             max_rollout_coverage_cost_fraction=0.4,
@@ -3455,6 +3567,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.off_policy_lag_tightening_threshold, 0.2)
         self.assertEqual(restored.confidence_penalty_weight, 0.25)
         self.assertEqual(restored.control_exploration_bonus, 0.15)
+        self.assertEqual(restored.rollout_cadence_lag_control_weight, 0.2)
         self.assertEqual(restored.max_control_candidate_values, 5)
         self.assertEqual(restored.min_rollout_coverage_fraction, 0.2)
         self.assertEqual(restored.max_rollout_coverage_cost_fraction, 0.4)
@@ -3526,6 +3639,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/arm/cheap_token/estimated_rollout_dollar_seconds",
             "scheduler/arm/cheap_token/unobserved_rollout_cost_penalty",
             "scheduler/weights/control_exploration",
+            "scheduler/weights/rollout_cadence_lag_control",
             "scheduler/weights/off_policy_priority",
             "scheduler/coverage/min_fraction",
             "scheduler/coverage/max_cost_fraction",
