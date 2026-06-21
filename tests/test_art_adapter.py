@@ -911,6 +911,78 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 1.0)
         self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
 
+    def test_async_art_backend_rejects_assignment_that_would_exceed_budget(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=2.5,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budget-art",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budget-art|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(train_batch_groups=1),
+            )
+
+            first = await async_backend.admit_and_select_rollout(
+                scenarios=[Scenario(id="budget-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=0,
+                configured_actor_count=4,
+                apply_delay=False,
+            )
+            second = await async_backend.admit_and_select_rollout(
+                scenarios=[Scenario(id="budget-art")],
+                action_codecs=[TokenActionCodec()],
+                actor_id=1,
+                configured_actor_count=4,
+                apply_delay=False,
+            )
+            stats = async_backend.stats()
+            await async_backend.close()
+            return first, second, stats
+
+        first, second, stats = asyncio.run(run())
+
+        self.assertTrue(first.admitted)
+        self.assertFalse(second.admitted)
+        self.assertIsNotNone(first.decision)
+        self.assertIsNone(second.decision)
+        self.assertEqual(
+            second.metadata["scheduler/stop_reason"],
+            "projected_budget_exhausted",
+        )
+        self.assertEqual(
+            stats["scheduler/total_rollout_decisions"],
+            1.0,
+        )
+        self.assertEqual(
+            stats["scheduler/total_inflight_rollouts"],
+            1.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/projected_accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 0.0)
+        self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
+
     def test_async_art_backend_records_failed_rollout_assignment(self):
         async def run():
             backend = FakeArtBackend()

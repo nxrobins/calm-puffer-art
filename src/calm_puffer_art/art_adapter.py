@@ -580,6 +580,24 @@ class AsyncArtBackend:
             actor_id=actor_id,
             trajectory_queue_pressure=trajectory_queue_pressure,
         )
+        if self._selected_rollout_exceeds_accounted_budget():
+            self._cancel_rollout_decision(decision)
+            self._stopped_admissions += 1
+            metadata = {
+                **admission.metadata,
+                "scheduler/admitted": False,
+                "scheduler/stop_recommended": True,
+                "scheduler/stop_reason": "projected_budget_exhausted",
+            }
+            rejected = ArtRolloutAdmission(
+                actor_id=actor_id,
+                active_actor_count=0,
+                admitted=False,
+                delay_s=admission.delay_s,
+                delay_dollar_seconds=admission.delay_dollar_seconds,
+                metadata=metadata,
+            )
+            return ArtRolloutAssignment(admission=rejected, metadata=metadata)
         metadata = art_rollout_metadata(decision, extra=admission.metadata)
         return ArtRolloutAssignment(
             admission=admission,
@@ -1260,6 +1278,29 @@ class AsyncArtBackend:
                 ),
             )
         )
+
+    def _selected_rollout_exceeds_accounted_budget(self) -> bool:
+        if self.scheduler is None:
+            return False
+        metrics = self.scheduler.metrics()
+        budget = _state_float(
+            metrics.get("scheduler/budget/max_accounted_dollar_seconds"),
+            0.0,
+        )
+        if budget <= 0.0:
+            return False
+        projected = _state_float(
+            metrics.get("scheduler/budget/projected_accounted_dollar_seconds"),
+            0.0,
+        )
+        return projected > budget
+
+    def _cancel_rollout_decision(self, decision: SchedulerDecision) -> None:
+        if self.scheduler is None:
+            return
+        cancel = getattr(self.scheduler, "cancel_rollout_decision", None)
+        if cancel is not None:
+            cancel(decision)
 
     def _accounted_dollar_seconds(
         self,

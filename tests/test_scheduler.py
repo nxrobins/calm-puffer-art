@@ -3614,6 +3614,55 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             4.0,
         )
 
+    def test_cancel_rollout_decision_releases_unspent_reservation(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            max_accounted_dollar_seconds=3.0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="budgeted",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={"scheduler/arm_id": "budgeted|token"},
+            ),
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="budgeted")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=3,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+
+        scheduler.cancel_rollout_decision(decision)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/total_rollout_decisions"], 0.0)
+        self.assertEqual(metrics["scheduler/total_inflight_rollouts"], 0.0)
+        self.assertEqual(
+            metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(metrics["scheduler/actor/actor_3/decisions"], 0.0)
+        self.assertEqual(metrics["scheduler/actor/actor_3/inflight"], 0.0)
+        self.assertEqual(
+            metrics["scheduler/arm/budgeted_token/reserved_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(metrics["scheduler/arm/budgeted_token/decisions"], 0.0)
+
     def test_positive_train_objective_resets_roi_patience(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,

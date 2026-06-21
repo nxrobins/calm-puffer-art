@@ -99,6 +99,9 @@ class AdaptiveScheduler(Protocol):
     ) -> None:
         ...
 
+    def cancel_rollout_decision(self, decision: SchedulerDecision) -> None:
+        ...
+
     def observe_train(
         self,
         *,
@@ -625,6 +628,30 @@ class ObjectiveScheduler:
         self._last_decision = decision
         self._last_decision_snapshot = _decision_to_state(decision)
         return decision
+
+    def cancel_rollout_decision(self, decision: SchedulerDecision) -> None:
+        """Cancel a selected rollout before any rollout work was produced."""
+
+        stats = self._arms.get(decision.arm_id)
+        if stats is not None:
+            reserved_cost = _decision_reserved_rollout_dollar_seconds(decision)
+            stats.inflight = max(0, stats.inflight - 1)
+            stats.reserved_rollout_dollar_seconds = max(
+                0.0,
+                stats.reserved_rollout_dollar_seconds - reserved_cost,
+            )
+            stats.decisions = max(0, stats.decisions - 1)
+        self._total_decisions = max(0, self._total_decisions - 1)
+
+        actor_id = _state_optional_int(decision.metadata.get("actor_id"), None)
+        actor_stats = self._actors.get(actor_id) if actor_id is not None else None
+        if actor_stats is not None:
+            actor_stats.inflight = max(0, actor_stats.inflight - 1)
+            actor_stats.decisions = max(0, actor_stats.decisions - 1)
+
+        if self._last_decision_snapshot == _decision_to_state(decision):
+            self._last_decision = None
+            self._last_decision_snapshot = None
 
     def target_train_batch_groups(
         self,
@@ -4610,6 +4637,18 @@ def _trajectory_reserved_rollout_dollar_seconds(trajectory: Trajectory) -> float
         ),
     )
     return explicit_cost or 0.0
+
+
+def _decision_reserved_rollout_dollar_seconds(
+    decision: SchedulerDecision,
+) -> float:
+    return max(
+        0.0,
+        _state_float(
+            _mapping_state(decision.metadata).get("reserved_rollout_dollar_seconds"),
+            0.0,
+        ),
+    )
 
 
 def _first_nonnegative_mapping_float(
