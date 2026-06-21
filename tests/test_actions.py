@@ -138,6 +138,26 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
 
+    def test_adaptive_action_space_can_skip_promotions_for_stale_feedback(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            },
+            allow_promotions=False,
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
+
     def test_adaptive_action_space_uses_scored_objective_for_promotion(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
 
@@ -715,6 +735,7 @@ class ActionCodecTests(unittest.TestCase):
             promotion_min_pulls=2,
             promotion_max_reconstruction_drift=0.03,
             demotion_max_reconstruction_drift=0.08,
+            demote_on_stale_feedback=True,
         )
         action_space.update_from_metrics(
             {
@@ -747,6 +768,8 @@ class ActionCodecTests(unittest.TestCase):
         self.assertEqual(restored.demotion_parent_margin, 0.25)
         self.assertEqual(restored.demotion_semantic_bandwidth_threshold, 1.0)
         self.assertEqual(restored.demotion_max_reconstruction_drift, 0.08)
+        self.assertTrue(restored.demote_on_stale_feedback)
+        self.assertEqual(metrics["action_space/demote_on_stale_feedback"], 1.0)
         self.assertTrue(restored.promote_latent_patches)
         self.assertEqual(restored.latent_patch_latent_size, 3)
         self.assertEqual(metrics["action_space/promotions"], 2.0)

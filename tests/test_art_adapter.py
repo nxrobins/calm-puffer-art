@@ -1089,6 +1089,89 @@ class ArtAdapterTests(unittest.TestCase):
             [{"groups": 1, "policy_step": 1, "reason": "art_sync_stale"}],
         )
 
+    def test_async_art_backend_synchronous_stale_demotes_action_space(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                min_policy_lag=0,
+                max_policy_lag=0,
+                exploration_bonus=0.0,
+                rollout_objective_weight=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=2,
+                demote_on_stale_feedback=True,
+            )
+            action_space.add_codec(ChunkActionCodec(chunk_size=4))
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                action_space=action_space,
+                config=AsyncArtBackendConfig(
+                    synchronous_fallback=True,
+                    max_policy_lag=0,
+                ),
+            )
+            async_backend._current_step = 1
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={
+                            "scenario_id": "stale-action",
+                            "scheduler/arm_id": (
+                                "stale-action|chunk(chunk_size=4)"
+                            ),
+                        },
+                    ),
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={
+                            "scenario_id": "stale-action",
+                            "scheduler/arm_id": (
+                                "stale-action|chunk(chunk_size=4)"
+                            ),
+                        },
+                    ),
+                ],
+                metadata={"scenario_id": "stale-action"},
+            )
+
+            future = await async_backend.submit_train("art-model", [art_group])
+            with self.assertRaises(StaleArtBatchError):
+                await future
+            stats = async_backend.stats()
+            await async_backend.close()
+            return backend, stats
+
+        backend, stats = asyncio.run(run())
+
+        self.assertEqual(len(backend.calls), 0)
+        self.assertEqual(stats["art_backend/stale_batches"], 1.0)
+        self.assertEqual(stats["action_space/demotions"], 1.0)
+        self.assertEqual(
+            stats["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            stats,
+        )
+        self.assertLess(
+            stats[
+                "scheduler/arm/stale_action_chunk_chunk_size_4/objective_score"
+            ],
+            0.0,
+        )
+
     def test_async_art_backend_uses_explicit_train_dollar_seconds(self):
         async def run():
             backend = CostedFakeArtBackend()

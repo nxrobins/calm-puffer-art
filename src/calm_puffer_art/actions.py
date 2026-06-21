@@ -419,6 +419,7 @@ class AdaptiveActionSpace:
     demotion_min_new_logprob_coverage: float = 0.0
     demotion_min_reference_logprob_coverage: float = 0.0
     demotion_min_pulls: int = 2
+    demote_on_stale_feedback: bool = False
     promote_latent_patches: bool = False
     latent_patch_latent_size: int = 8
     include_token: bool = True
@@ -493,11 +494,14 @@ class AdaptiveActionSpace:
         self,
         metrics: Mapping[str, float],
         *,
+        allow_promotions: bool = True,
         allow_demotions: bool = True,
     ) -> None:
         disabled_this_update = (
             self._demote_from_metrics(metrics) if allow_demotions else set()
         )
+        if not allow_promotions:
+            return
         for codec in tuple(self._codecs):
             if not isinstance(codec, ChunkActionCodec):
                 continue
@@ -757,6 +761,7 @@ class AdaptiveActionSpace:
                     self.demotion_min_reference_logprob_coverage
                 ),
                 "demotion_min_pulls": self.demotion_min_pulls,
+                "demote_on_stale_feedback": self.demote_on_stale_feedback,
                 "promote_latent_patches": self.promote_latent_patches,
                 "latent_patch_latent_size": self.latent_patch_latent_size,
                 "include_token": self.include_token,
@@ -861,6 +866,10 @@ class AdaptiveActionSpace:
         self.demotion_min_pulls = _state_int(
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
+        )
+        self.demote_on_stale_feedback = _state_bool(
+            config.get("demote_on_stale_feedback"),
+            self.demote_on_stale_feedback,
         )
         self.promote_latent_patches = _state_bool(
             config.get("promote_latent_patches"),
@@ -973,6 +982,9 @@ class AdaptiveActionSpace:
             ),
             "action_space/demotion_min_reference_logprob_coverage": (
                 self.demotion_min_reference_logprob_coverage
+            ),
+            "action_space/demote_on_stale_feedback": (
+                1.0 if self.demote_on_stale_feedback else 0.0
             ),
         }
         for codec in self._codecs:

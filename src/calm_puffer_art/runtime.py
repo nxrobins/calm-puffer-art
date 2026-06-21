@@ -1430,6 +1430,7 @@ class ControlPlane:
                         ),
                         on_discard=self._stale_batch_callback(
                             scheduler=scheduler,
+                            action_space=action_space,
                             train_ring=train_ring,
                             reason="runtime_train_ring_stale",
                         ),
@@ -1741,6 +1742,7 @@ class ControlPlane:
     def _stale_batch_callback(
         *,
         scheduler: AdaptiveScheduler | None,
+        action_space: AdaptiveActionSpace | None,
         train_ring: TrajectoryRingBuffer,
         reason: str,
     ) -> Callable[[VersionedTrajectoryBatch], None] | None:
@@ -1754,6 +1756,15 @@ class ControlPlane:
                 policy_step=train_ring.current_policy_step,
                 reason=reason,
             )
+            if (
+                action_space is not None
+                and action_space.demote_on_stale_feedback
+            ):
+                action_space.update_from_metrics(
+                    scheduler.metrics(),
+                    allow_promotions=False,
+                    allow_demotions=True,
+                )
 
         return on_discard
 

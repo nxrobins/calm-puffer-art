@@ -1718,6 +1718,77 @@ class RuntimeTests(unittest.TestCase):
         self.assertIs(discarded[0], stale)
         self.assertEqual(discarded[0].min_policy_step, 0)
 
+    def test_stale_batch_feedback_can_demote_action_space(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            rollout_objective_weight=0.0,
+        )
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            demotion_min_pulls=2,
+            demote_on_stale_feedback=True,
+        )
+        chunk4 = ChunkActionCodec(chunk_size=4)
+        action_space.add_codec(chunk4)
+        trajectories = tuple(
+            Trajectory(
+                scenario_id="stale-action",
+                policy_step=0,
+                messages=[],
+                actions=chunk4.encode("alpha beta gamma delta"),
+                reward=1.0,
+                metrics={"cost/dollar_seconds": 1.0},
+                metadata={
+                    "scheduler/arm_id": "stale-action|chunk(chunk_size=4)",
+                },
+            )
+            for _ in range(2)
+        )
+        group = TrajectoryGroup(
+            scenario_id="stale-action",
+            trajectories=trajectories,
+        )
+        for trajectory in trajectories:
+            scheduler.observe_rollout(
+                trajectory,
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+        ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=0)
+        ring.current_policy_step = 2
+        on_discard = ControlPlane._stale_batch_callback(
+            scheduler=scheduler,
+            action_space=action_space,
+            train_ring=ring,
+            reason="test_stale_action_space",
+        )
+
+        self.assertIsNotNone(on_discard)
+        on_discard(
+            VersionedTrajectoryBatch(
+                groups=(group,),
+                assembled_at_step=0,
+            )
+        )
+        metrics = action_space.metrics()
+
+        self.assertEqual(metrics["action_space/demotions"], 1.0)
+        self.assertEqual(
+            metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            metrics,
+        )
+        self.assertLess(
+            scheduler.metrics()[
+                "scheduler/arm/stale_action_chunk_chunk_size_4/objective_score"
+            ],
+            0.0,
+        )
+
     def test_ring_buffer_consumes_highest_priority_ready_batch(self):
         async def run():
             ring = TrajectoryRingBuffer(capacity=3, max_policy_lag=10)

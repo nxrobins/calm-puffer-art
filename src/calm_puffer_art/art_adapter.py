@@ -659,6 +659,10 @@ class AsyncArtBackend:
                     policy_step=self._current_step,
                     reason="art_sync_stale",
                 )
+                self._refresh_action_space_from_scheduler(
+                    allow_promotions=False,
+                    allow_demotions=True,
+                )
                 future.set_exception(
                     StaleArtBatchError(
                         "ART batch exceeded max_policy_lag before synchronous training"
@@ -1216,6 +1220,10 @@ class AsyncArtBackend:
             policy_step=self._current_step,
             reason=reason,
         )
+        self._refresh_action_space_from_scheduler(
+            allow_promotions=False,
+            allow_demotions=True,
+        )
         if not pending.future.done():
             pending.future.set_exception(
                 StaleArtBatchError(
@@ -1323,6 +1331,10 @@ class AsyncArtBackend:
             policy_step=self._current_step,
             reason="art_train_ring_stale",
         )
+        self._refresh_action_space_from_scheduler(
+            allow_promotions=False,
+            allow_demotions=True,
+        )
         for future in self._batch_futures(batch):
             if not future.done():
                 future.set_exception(
@@ -1330,6 +1342,26 @@ class AsyncArtBackend:
                         "ART batch exceeded max_policy_lag before training"
                     )
                 )
+
+    def _refresh_action_space_from_scheduler(
+        self,
+        *,
+        allow_promotions: bool,
+        allow_demotions: bool,
+    ) -> None:
+        if self.scheduler is None or self.action_space is None:
+            return
+        if (
+            allow_demotions
+            and not allow_promotions
+            and not self.action_space.demote_on_stale_feedback
+        ):
+            return
+        self.action_space.update_from_metrics(
+            self.scheduler.metrics(),
+            allow_promotions=allow_promotions,
+            allow_demotions=allow_demotions,
+        )
 
     @staticmethod
     def _tag_batch_control_metadata(
