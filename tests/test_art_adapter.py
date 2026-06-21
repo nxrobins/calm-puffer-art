@@ -765,6 +765,57 @@ class ArtAdapterTests(unittest.TestCase):
             admitted.delay_dollar_seconds,
         )
 
+    def test_async_art_backend_admission_stops_when_budget_exhausted(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=1.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=1,
+                    max_policy_lag=2,
+                ),
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metadata={"scenario_id": "budget-art"},
+                    )
+                ],
+                metadata={"scenario_id": "budget-art"},
+            )
+
+            await async_backend.train("art-model", [art_group])
+            admission = await async_backend.admit_rollout(
+                actor_id=0,
+                configured_actor_count=4,
+                trajectory_queue_pressure=0.0,
+                apply_delay=False,
+            )
+            stats = async_backend.stats()
+            await async_backend.close()
+            return admission, stats
+
+        admission, stats = asyncio.run(run())
+
+        self.assertFalse(admission.admitted)
+        self.assertEqual(admission.active_actor_count, 0)
+        self.assertEqual(admission.metadata["scheduler/stop_recommended"], True)
+        self.assertEqual(
+            admission.metadata["scheduler/stop_reason"],
+            "continuation_exhausted",
+        )
+        self.assertEqual(stats["art_backend/stopped_admissions"], 1.0)
+        self.assertEqual(stats["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(stats["scheduler/stop_recommended"], 1.0)
+
     def test_async_art_backend_select_rollout_uses_promoted_action_space_codecs(self):
         async def run():
             backend = FakeArtBackend()

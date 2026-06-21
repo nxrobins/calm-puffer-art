@@ -217,7 +217,7 @@ trajectory_metadata = art_rollout_metadata(decision, extra=admission.metadata)
 # Put trajectory_metadata into the ART Trajectory metadata before submit_group().
 ```
 
-`admit_rollout()` applies the scheduler's active actor-count and pre-rollout admission-delay controls for external ART actor pools. When it sleeps, the delay cost is recorded once in scheduler admission telemetry and stamped into the returned metadata so the submitted trajectory can credit the chosen actor-count and admission-delay values. When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
+`admit_rollout()` applies the scheduler's continuation, budget, active actor-count, and pre-rollout admission-delay controls for external ART actor pools. If the scheduler recommends stopping because ROI patience, `max_train_steps`, or `max_accounted_dollar_seconds` is exhausted, admission returns `admitted=False` before the actor spends on another rollout. When it sleeps, the delay cost is recorded once in scheduler admission telemetry and stamped into the returned metadata so the submitted trajectory can credit the chosen actor-count and admission-delay values. When an `AdaptiveActionSpace` is attached, `select_rollout()` reads its current codec set, so chunk or latent-patch codecs promoted from previous ART feedback become available to future ART rollout producers without restarting the backend.
 
 For no-stop-the-world submission, use `submit_train()`:
 

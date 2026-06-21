@@ -67,6 +67,7 @@ class AsyncArtBackendConfig:
     train_queue_capacity: int = 3
     train_batch_groups: int = 1
     max_policy_lag: int = 2
+    max_train_steps: int | None = None
     cost_per_second_usd: float = 1.0
     synchronous_fallback: bool = False
 
@@ -77,6 +78,8 @@ class AsyncArtBackendConfig:
             raise ValueError("train_batch_groups must be positive")
         if self.max_policy_lag < 0:
             raise ValueError("max_policy_lag must be non-negative")
+        if self.max_train_steps is not None and self.max_train_steps <= 0:
+            raise ValueError("max_train_steps must be positive when set")
         if self.cost_per_second_usd < 0:
             raise ValueError("cost_per_second_usd must be non-negative")
 
@@ -296,6 +299,7 @@ class AsyncArtBackend:
         self._completed_batches = 0
         self._failed_batches = 0
         self._stale_batches = 0
+        self._stopped_admissions = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
         self._trainer_dollar_seconds = 0.0
@@ -430,6 +434,22 @@ class AsyncArtBackend:
 
         configured = max(1, int(configured_actor_count))
         queue_pressure = max(0.0, float(trajectory_queue_pressure))
+        if not self._should_continue_rollout_admission(
+            trajectory_queue_pressure=queue_pressure,
+        ):
+            self._stopped_admissions += 1
+            return ArtRolloutAdmission(
+                actor_id=actor_id,
+                active_actor_count=0,
+                admitted=False,
+                metadata={
+                    "actor_id": actor_id,
+                    "scheduler/active_actor_count": 0,
+                    "scheduler/admitted": False,
+                    "scheduler/stop_recommended": True,
+                    "scheduler/stop_reason": "continuation_exhausted",
+                },
+            )
         active_count = self.active_actor_count(
             configured=configured,
             trajectory_queue_pressure=queue_pressure,
@@ -744,6 +764,7 @@ class AsyncArtBackend:
         stats["art_backend/completed_batches"] = float(self._completed_batches)
         stats["art_backend/failed_batches"] = float(self._failed_batches)
         stats["art_backend/stale_batches"] = float(self._stale_batches)
+        stats["art_backend/stopped_admissions"] = float(self._stopped_admissions)
         stats["art_backend/trainer_wait_s"] = self._trainer_wait_s
         stats["art_backend/trainer_wait_dollar_seconds"] = (
             self._trainer_wait_dollar_seconds
@@ -902,6 +923,34 @@ class AsyncArtBackend:
         )
         self._last_published_policy_score = score
         self._latest_published_policy_score = score
+
+    def _should_continue_rollout_admission(
+        self,
+        *,
+        trajectory_queue_pressure: float,
+    ) -> bool:
+        if self.scheduler is None:
+            return True
+        should_continue = getattr(self.scheduler, "should_continue_training", None)
+        if should_continue is None:
+            return True
+        max_train_steps = (
+            self.config.max_train_steps
+            if self.config.max_train_steps is not None
+            else max(self._current_step + 1, 1_000_000_000)
+        )
+        return bool(
+            should_continue(
+                policy_step=self._current_step,
+                max_train_steps=max_train_steps,
+                pending_train_batches=self.ring.pending_batches
+                + len(self._pending_groups),
+                train_queue_pressure=max(
+                    self._train_queue_pressure(),
+                    max(0.0, min(1.0, trajectory_queue_pressure)),
+                ),
+            )
+        )
 
     def _accounted_dollar_seconds(
         self,
