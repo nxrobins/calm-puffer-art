@@ -58,7 +58,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when objective, quality, observed semantic-bandwidth, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, failure-rate, safety, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when observed pulls, objective, quality, observed semantic-bandwidth, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, failure-rate, safety, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory, including runtime-control scores and exploration configuration, through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
@@ -144,7 +144,7 @@ Phase 1: Runtime bridge
 - Feed stale train-batch drops back into scheduler arm, cadence, and policy-lag objective memory as negative experience.
 - Gate checkpoint publication on programmable promotion decisions and feed the promotion-effective score into scheduler train credit.
 - Make cadence pressure-aware so saturated trainers receive larger batches unless the objective signal justifies tighter updates.
-- Promote larger chunk codecs online when smaller chunks show positive objective signal, observed semantic bandwidth, and acceptable quality.
+- Promote larger chunk codecs online when smaller chunks have live pull evidence, positive objective signal, observed semantic bandwidth, and acceptable quality.
 - Add ROI patience so the runtime stops spending after repeated low-value training steps instead of blindly exhausting `max_train_steps`.
 
 Phase 2: ART adapter

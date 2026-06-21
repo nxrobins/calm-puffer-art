@@ -244,6 +244,7 @@ class AdaptiveActionSpace:
     promotion_parent_margin: float = 0.0
     promotion_quality_threshold: float = 0.95
     promotion_semantic_bandwidth_threshold: float = 1.0
+    promotion_min_pulls: int = 1
     unsafe_rate_threshold: float = 0.0
     demotion_objective_threshold: float = 0.0
     demotion_parent_margin: float = 0.0
@@ -272,6 +273,8 @@ class AdaptiveActionSpace:
             raise ValueError(
                 "promotion_semantic_bandwidth_threshold must be non-negative"
             )
+        if self.promotion_min_pulls < 0:
+            raise ValueError("promotion_min_pulls must be non-negative")
         if self.unsafe_rate_threshold < 0:
             raise ValueError("unsafe_rate_threshold must be non-negative")
         if self.demotion_quality_threshold < 0:
@@ -310,6 +313,8 @@ class AdaptiveActionSpace:
             if not isinstance(codec, ChunkActionCodec):
                 continue
             signal = self._codec_signal(codec, metrics)
+            if signal.pulls < self.promotion_min_pulls:
+                continue
             if signal.objective <= self.promotion_objective_threshold:
                 continue
             if signal.quality < self.promotion_quality_threshold:
@@ -502,6 +507,7 @@ class AdaptiveActionSpace:
                 "promotion_semantic_bandwidth_threshold": (
                     self.promotion_semantic_bandwidth_threshold
                 ),
+                "promotion_min_pulls": self.promotion_min_pulls,
                 "unsafe_rate_threshold": self.unsafe_rate_threshold,
                 "demotion_objective_threshold": self.demotion_objective_threshold,
                 "demotion_parent_margin": self.demotion_parent_margin,
@@ -555,6 +561,10 @@ class AdaptiveActionSpace:
             config.get("promotion_semantic_bandwidth_threshold"),
             self.promotion_semantic_bandwidth_threshold,
         )
+        self.promotion_min_pulls = _state_int(
+            config.get("promotion_min_pulls"),
+            self.promotion_min_pulls,
+        )
         self.unsafe_rate_threshold = _state_float(
             config.get("unsafe_rate_threshold"),
             self.unsafe_rate_threshold,
@@ -598,6 +608,7 @@ class AdaptiveActionSpace:
             self.promotion_semantic_bandwidth_threshold,
         )
         self.promotion_parent_margin = max(0.0, self.promotion_parent_margin)
+        self.promotion_min_pulls = max(0, self.promotion_min_pulls)
         self.demotion_semantic_bandwidth_threshold = max(
             0.0,
             self.demotion_semantic_bandwidth_threshold,
