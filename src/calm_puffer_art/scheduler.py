@@ -3650,6 +3650,8 @@ def action_quality(trajectory: Trajectory) -> float:
     for key in ("action/safe", "reconstruction/safe", "verifier/passed"):
         if metadata.get(key) is False:
             return 0.0
+    if _custom_failure_modes(metadata):
+        return 0.0
     candidates = []
     for key in (
         "action/quality",
@@ -3698,6 +3700,7 @@ def trajectory_failure_modes(
         modes.append("reconstruction_unsafe")
     if metadata.get("verifier/passed") is False:
         modes.append("verifier_failed")
+    modes.extend(_custom_failure_modes(metadata))
 
     reconstruction_accuracy = trajectory_reconstruction_accuracy(trajectory)
     if (
@@ -3706,3 +3709,33 @@ def trajectory_failure_modes(
     ):
         modes.append("reconstruction_drift")
     return tuple(dict.fromkeys(modes))
+
+
+def _custom_failure_modes(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    modes: list[str] = []
+    for key in (
+        "failure/mode",
+        "failure/modes",
+        "verifier/failure_mode",
+        "verifier/failure_modes",
+        "action/failure_mode",
+        "action/failure_modes",
+        "rollout/failure_mode",
+        "rollout/failure_modes",
+    ):
+        modes.extend(_failure_modes_from_value(metadata.get(key)))
+    return tuple(dict.fromkeys(modes))
+
+
+def _failure_modes_from_value(value: Any) -> tuple[str, ...]:
+    if value is None or value is False:
+        return ()
+    if isinstance(value, str):
+        mode = _safe_metric_key(value.strip())
+        return (mode,) if mode else ()
+    if isinstance(value, (list, tuple, set)) and not isinstance(value, (str, bytes)):
+        modes: list[str] = []
+        for item in value:
+            modes.extend(_failure_modes_from_value(item))
+        return tuple(modes)
+    return ()

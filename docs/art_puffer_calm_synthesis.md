@@ -52,7 +52,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It credits reward improvement back to active actor-count, cadence, policy-lag, and actor-admission delay values, reports their objective/exploration scores under `scheduler/control/*`, and reuses the higher-value runtime controls.
 - It attributes rollout, train, stale, queue-wait, admission cost, semantic bandwidth, and objective back to individual actor slots under `scheduler/actor/*`, so actor-count control can be audited by marginal actor-slot contribution.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
-- It records verifier failures, reconstruction safety failures, reconstruction drift failure modes, and numeric reconstruction drift summaries as checkpointed scheduler evidence.
+- It records verifier failures, user-defined verifier failure modes, reconstruction safety failures, reconstruction drift failure modes, and numeric reconstruction drift summaries as checkpointed scheduler evidence.
 - It explores train-batch cadence candidates after the configured default, then tightens or widens cadence according to reward-improving experience per dollar-second.
 - It widens train-batch cadence under trainer saturation when there is no positive objective signal, reducing low-ROI tiny-batch churn.
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
@@ -74,7 +74,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 - It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
 
-This is still a local bandit controller, not the final supremum. The next version should add richer diagnostics for domain-specific verifier failures and stronger policy-level safeguards around tasks whose rewards are not directly comparable.
+This is still a local bandit controller, not the final supremum. The next version should add stronger policy-level safeguards around tasks whose rewards are not directly comparable.
 
 ## Bounded Staleness
 

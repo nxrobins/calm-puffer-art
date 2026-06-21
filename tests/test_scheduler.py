@@ -9,6 +9,7 @@ from calm_puffer_art import (
     Trajectory,
     TrajectoryGroup,
     TrainResult,
+    action_quality,
     trajectory_failure_modes,
     trajectory_reconstruction_accuracy,
 )
@@ -761,6 +762,63 @@ class ObjectiveSchedulerTests(unittest.TestCase):
                 "scheduler/arm/code_chunk_chunk_size_4/reconstruction_max_drift"
             ],
             0.1,
+        )
+
+    def test_rollout_failure_modes_accept_domain_verifier_modes(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        trajectory = Trajectory(
+            scenario_id="tool",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "tool|chunk(chunk_size=2)",
+                "verifier/failure_mode": "Tool timeout",
+                "failure/modes": ["syntax_error", "Tool timeout", ""],
+            },
+        )
+
+        self.assertEqual(
+            trajectory_failure_modes(trajectory),
+            ("syntax_error", "Tool_timeout"),
+        )
+        self.assertEqual(action_quality(trajectory), 0.0)
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/failure_rollouts"], 1.0)
+        self.assertEqual(metrics["scheduler/failure/Tool_timeout"], 1.0)
+        self.assertEqual(metrics["scheduler/failure/syntax_error"], 1.0)
+        self.assertEqual(
+            metrics[
+                "scheduler/arm/tool_chunk_chunk_size_2/failure/Tool_timeout"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/tool_chunk_chunk_size_2/action_quality_ema"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/arm/tool_chunk_chunk_size_2/effective_reward_ema"],
+            0.0,
+        )
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(
+            restored_metrics[
+                "scheduler/arm/tool_chunk_chunk_size_2/failure/syntax_error"
+            ],
+            1.0,
         )
 
     def test_positive_objective_tightens_cadence_and_policy_lag(self):
