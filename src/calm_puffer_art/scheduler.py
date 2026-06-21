@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Protocol, Sequence
 
-from .actions import ActionCodec
+from .actions import ActionCodec, action_logprob_stats
 from .types import Scenario, TrainResult, Trajectory, TrajectoryGroup, mean
 
 
@@ -192,6 +192,17 @@ class ArmStats:
     admission_dollar_seconds: float = 0.0
     action_units: int = 0
     source_tokens: int = 0
+    old_logprob_units: int = 0
+    new_logprob_units: int = 0
+    reference_logprob_units: int = 0
+    old_new_logprob_pairs: int = 0
+    old_reference_logprob_pairs: int = 0
+    old_logprob_sum: float = 0.0
+    new_logprob_sum: float = 0.0
+    reference_logprob_sum: float = 0.0
+    old_new_logprob_delta_sum: float = 0.0
+    old_reference_logprob_delta_sum: float = 0.0
+    importance_ratio_sum: float = 0.0
     stale_experience: float = 0.0
 
 
@@ -757,6 +768,22 @@ class ObjectiveScheduler:
         stats.admission_dollar_seconds += admission_cost
         stats.action_units += trajectory.action_units
         stats.source_tokens += trajectory.token_count
+        logprob_stats = action_logprob_stats(trajectory.actions)
+        stats.old_logprob_units += logprob_stats.old_logprob_units
+        stats.new_logprob_units += logprob_stats.new_logprob_units
+        stats.reference_logprob_units += logprob_stats.reference_logprob_units
+        stats.old_new_logprob_pairs += logprob_stats.old_new_pairs
+        stats.old_reference_logprob_pairs += logprob_stats.old_reference_pairs
+        stats.old_logprob_sum += logprob_stats.old_logprob_sum
+        stats.new_logprob_sum += logprob_stats.new_logprob_sum
+        stats.reference_logprob_sum += logprob_stats.reference_logprob_sum
+        stats.old_new_logprob_delta_sum += (
+            logprob_stats.old_new_logprob_delta_sum
+        )
+        stats.old_reference_logprob_delta_sum += (
+            logprob_stats.old_reference_logprob_delta_sum
+        )
+        stats.importance_ratio_sum += logprob_stats.importance_ratio_sum
         stats.dollar_seconds_ema = self._ema(
             stats.dollar_seconds_ema,
             cost,
@@ -2133,6 +2160,37 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/semantic_bandwidth_tokens_per_decision"] = (
                 stats.source_tokens / stats.action_units
                 if stats.action_units
+                else 0.0
+            )
+            metrics[f"{prefix}/old_logprob_coverage"] = (
+                stats.old_logprob_units / stats.action_units
+                if stats.action_units
+                else 0.0
+            )
+            metrics[f"{prefix}/new_logprob_coverage"] = (
+                stats.new_logprob_units / stats.action_units
+                if stats.action_units
+                else 0.0
+            )
+            metrics[f"{prefix}/reference_logprob_coverage"] = (
+                stats.reference_logprob_units / stats.action_units
+                if stats.action_units
+                else 0.0
+            )
+            metrics[f"{prefix}/old_new_logprob_delta_mean"] = (
+                stats.old_new_logprob_delta_sum / stats.old_new_logprob_pairs
+                if stats.old_new_logprob_pairs
+                else 0.0
+            )
+            metrics[f"{prefix}/importance_ratio_mean"] = (
+                stats.importance_ratio_sum / stats.old_new_logprob_pairs
+                if stats.old_new_logprob_pairs
+                else 0.0
+            )
+            metrics[f"{prefix}/old_reference_logprob_delta_mean"] = (
+                stats.old_reference_logprob_delta_sum
+                / stats.old_reference_logprob_pairs
+                if stats.old_reference_logprob_pairs
                 else 0.0
             )
             metrics[f"{prefix}/action_units_per_dollar_second"] = (
@@ -3625,6 +3683,50 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
         source_tokens=_state_int(
             state.get("source_tokens"),
             default.source_tokens,
+        ),
+        old_logprob_units=_state_int(
+            state.get("old_logprob_units"),
+            default.old_logprob_units,
+        ),
+        new_logprob_units=_state_int(
+            state.get("new_logprob_units"),
+            default.new_logprob_units,
+        ),
+        reference_logprob_units=_state_int(
+            state.get("reference_logprob_units"),
+            default.reference_logprob_units,
+        ),
+        old_new_logprob_pairs=_state_int(
+            state.get("old_new_logprob_pairs"),
+            default.old_new_logprob_pairs,
+        ),
+        old_reference_logprob_pairs=_state_int(
+            state.get("old_reference_logprob_pairs"),
+            default.old_reference_logprob_pairs,
+        ),
+        old_logprob_sum=_state_float(
+            state.get("old_logprob_sum"),
+            default.old_logprob_sum,
+        ),
+        new_logprob_sum=_state_float(
+            state.get("new_logprob_sum"),
+            default.new_logprob_sum,
+        ),
+        reference_logprob_sum=_state_float(
+            state.get("reference_logprob_sum"),
+            default.reference_logprob_sum,
+        ),
+        old_new_logprob_delta_sum=_state_float(
+            state.get("old_new_logprob_delta_sum"),
+            default.old_new_logprob_delta_sum,
+        ),
+        old_reference_logprob_delta_sum=_state_float(
+            state.get("old_reference_logprob_delta_sum"),
+            default.old_reference_logprob_delta_sum,
+        ),
+        importance_ratio_sum=_state_float(
+            state.get("importance_ratio_sum"),
+            default.importance_ratio_sum,
         ),
         stale_experience=_state_float(
             state.get("stale_experience"),

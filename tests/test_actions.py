@@ -9,9 +9,11 @@ from calm_puffer_art.actions import (
     ReasoningStepCodec,
     TokenActionCodec,
     action_codec_key,
+    action_logprob_stats,
     action_space_checkpoint_metadata,
     semantic_bandwidth,
 )
+from calm_puffer_art.types import ActionUnit
 
 
 class ActionCodecTests(unittest.TestCase):
@@ -47,6 +49,39 @@ class ActionCodecTests(unittest.TestCase):
 
         self.assertEqual(len(actions), 3)
         self.assertEqual(actions[1].payload, "Act")
+
+    def test_action_logprob_stats_reads_typed_fields_and_metadata(self):
+        actions = [
+            ActionUnit(
+                kind="chunk",
+                payload=("alpha", "beta"),
+                token_count=2,
+                old_logprob=-2.0,
+                new_logprob=-1.5,
+                reference_logprob=-2.5,
+            ),
+            ActionUnit(
+                kind="latent_patch",
+                payload=(0.1, 0.2),
+                token_count=2,
+                metadata={
+                    "logprob": -1.0,
+                    "train/logprob": -0.7,
+                    "ref/logprob": -1.2,
+                },
+            ),
+            ActionUnit(kind="command", payload={"name": "noop"}, token_count=1),
+        ]
+
+        stats = action_logprob_stats(actions)
+
+        self.assertEqual(stats.action_units, 3)
+        self.assertAlmostEqual(stats.old_logprob_coverage, 2 / 3)
+        self.assertAlmostEqual(stats.new_logprob_coverage, 2 / 3)
+        self.assertAlmostEqual(stats.reference_logprob_coverage, 2 / 3)
+        self.assertAlmostEqual(stats.old_new_logprob_delta_mean, 0.4)
+        self.assertAlmostEqual(stats.old_reference_logprob_delta_mean, 0.35)
+        self.assertGreater(stats.importance_ratio_mean, 1.0)
 
     def test_adaptive_action_space_promotes_larger_chunks_from_objective_signal(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
@@ -220,6 +255,42 @@ class ActionCodecTests(unittest.TestCase):
             [action_codec_key(codec) for codec in action_space.codecs],
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
+
+    def test_adaptive_action_space_can_require_logprob_coverage_for_promotion(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            promotion_min_old_logprob_coverage=1.0,
+            promotion_min_new_logprob_coverage=1.0,
+        )
+        base_metrics = {
+            "scheduler/arm/task_chunk_chunk_size_2/pulls": 1.0,
+            "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 1.0,
+            "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+            "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+            "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+        }
+
+        action_space.update_from_metrics(base_metrics)
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                **base_metrics,
+                "scheduler/arm/task_chunk_chunk_size_2/old_logprob_coverage": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/new_logprob_coverage": 1.0,
+            }
+        )
+
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
 
     def test_adaptive_action_space_does_not_promote_unsafe_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)

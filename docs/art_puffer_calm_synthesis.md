@@ -60,7 +60,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold, or when `max_accounted_dollar_seconds` exhausts the configured rollout/train/promotion spend envelope.
-- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when observed pulls, objective, quality, reconstruction drift, observed semantic-bandwidth, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, drift, failure-rate, safety, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
+- It can feed an `AdaptiveActionSpace` that promotes larger chunk codecs and opt-in latent-patch candidates when observed pulls, objective, quality, reconstruction drift, observed semantic-bandwidth, optional old/new/reference logprob coverage, and active-parent objective-margin signals make higher-bandwidth actions worth trying, retires promoted codecs after enough bad objective, bandwidth, quality, drift, failure-rate, safety, missing configured logprob coverage, or lower-than-parent objective evidence, retires dependent latent patches when a chunk branch fails, and snapshots that action-space state under `action_space/state`.
 - It makes raw reward efficiency an explicit scoring weight instead of a hidden default, so the default controller prioritizes marginal rollout and train-improvement objective.
 - It snapshots and restores scheduler numeric control memory, including runtime-control scores and exploration configuration, through `state_dict()` / `load_state_dict()`, and checkpoint updates carry that state under `scheduler/state` after train feedback is credited.
 - It snapshots adaptive action-space state under `action_space/state` and built-in promotion evaluator state under `promotion/state`, preserving discovered semantic bandwidth and promotion baselines across accepted checkpoints.
@@ -124,7 +124,7 @@ The torch-backed CALM path should be optional and later. Before it is used for r
 - a frozen pretrained autoencoder checkpoint;
 - tokenizer-specific chunking and padding;
 - reconstruction verification for the target domain;
-- old/new chunk logprob semantics that are compatible with ART's GRPO/CISPO ratios;
+- learned old/new chunk logprob producers that satisfy the explicit `ActionUnit` old/new/reference logprob contract used by scheduler metrics;
 - a fallback path for code or tool calls when reconstruction fails.
 
 For code-generation tasks, the conservative plan is `K=2` or `K=4`, syntax-aware chunking, and token-level fallback after verifier failure.

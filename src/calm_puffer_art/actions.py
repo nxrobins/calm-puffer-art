@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
-from math import isfinite
+from math import exp, isfinite
 from typing import Any, Mapping, Protocol, Sequence
 
 from .types import ActionUnit
@@ -31,6 +31,154 @@ def semantic_bandwidth(actions: Sequence[ActionUnit]) -> float:
     if not actions:
         return 0.0
     return sum(max(0, action.token_count) for action in actions) / len(actions)
+
+
+@dataclass(frozen=True)
+class ActionLogprobStats:
+    """Aggregated policy-probability evidence for action-unit training."""
+
+    action_units: int = 0
+    old_logprob_units: int = 0
+    new_logprob_units: int = 0
+    reference_logprob_units: int = 0
+    old_logprob_sum: float = 0.0
+    new_logprob_sum: float = 0.0
+    reference_logprob_sum: float = 0.0
+    old_new_pairs: int = 0
+    old_reference_pairs: int = 0
+    old_new_logprob_delta_sum: float = 0.0
+    old_reference_logprob_delta_sum: float = 0.0
+    importance_ratio_sum: float = 0.0
+
+    @property
+    def old_logprob_coverage(self) -> float:
+        return self.old_logprob_units / self.action_units if self.action_units else 0.0
+
+    @property
+    def new_logprob_coverage(self) -> float:
+        return self.new_logprob_units / self.action_units if self.action_units else 0.0
+
+    @property
+    def reference_logprob_coverage(self) -> float:
+        return (
+            self.reference_logprob_units / self.action_units
+            if self.action_units
+            else 0.0
+        )
+
+    @property
+    def old_new_logprob_delta_mean(self) -> float:
+        return (
+            self.old_new_logprob_delta_sum / self.old_new_pairs
+            if self.old_new_pairs
+            else 0.0
+        )
+
+    @property
+    def old_reference_logprob_delta_mean(self) -> float:
+        return (
+            self.old_reference_logprob_delta_sum / self.old_reference_pairs
+            if self.old_reference_pairs
+            else 0.0
+        )
+
+    @property
+    def importance_ratio_mean(self) -> float:
+        return self.importance_ratio_sum / self.old_new_pairs if self.old_new_pairs else 0.0
+
+
+def action_logprob_stats(actions: Sequence[ActionUnit]) -> ActionLogprobStats:
+    """Summarize old/new/reference logprobs carried by action units.
+
+    The typed fields are preferred. Metadata keys are accepted so ART adapters
+    can preserve backend-specific logprob payloads without schema rewriting.
+    """
+
+    old_units = 0
+    new_units = 0
+    reference_units = 0
+    old_sum = 0.0
+    new_sum = 0.0
+    reference_sum = 0.0
+    old_new_pairs = 0
+    old_reference_pairs = 0
+    old_new_delta_sum = 0.0
+    old_reference_delta_sum = 0.0
+    ratio_sum = 0.0
+    for action in actions:
+        old = _action_logprob(
+            action,
+            "old_logprob",
+            (
+                "old_logprob",
+                "policy/old_logprob",
+                "behavior/logprob",
+                "sampling/logprob",
+                "logprob",
+            ),
+        )
+        new = _action_logprob(
+            action,
+            "new_logprob",
+            ("new_logprob", "policy/new_logprob", "train/logprob"),
+        )
+        reference = _action_logprob(
+            action,
+            "reference_logprob",
+            (
+                "reference_logprob",
+                "ref_logprob",
+                "reference/logprob",
+                "ref/logprob",
+            ),
+        )
+        if old is not None:
+            old_units += 1
+            old_sum += old
+        if new is not None:
+            new_units += 1
+            new_sum += new
+        if reference is not None:
+            reference_units += 1
+            reference_sum += reference
+        if old is not None and new is not None:
+            delta = new - old
+            old_new_pairs += 1
+            old_new_delta_sum += delta
+            ratio_sum += exp(max(-60.0, min(60.0, delta)))
+        if old is not None and reference is not None:
+            old_reference_pairs += 1
+            old_reference_delta_sum += old - reference
+    return ActionLogprobStats(
+        action_units=len(actions),
+        old_logprob_units=old_units,
+        new_logprob_units=new_units,
+        reference_logprob_units=reference_units,
+        old_logprob_sum=old_sum,
+        new_logprob_sum=new_sum,
+        reference_logprob_sum=reference_sum,
+        old_new_pairs=old_new_pairs,
+        old_reference_pairs=old_reference_pairs,
+        old_new_logprob_delta_sum=old_new_delta_sum,
+        old_reference_logprob_delta_sum=old_reference_delta_sum,
+        importance_ratio_sum=ratio_sum,
+    )
+
+
+def _action_logprob(
+    action: ActionUnit,
+    attribute: str,
+    metadata_keys: Sequence[str],
+) -> float | None:
+    value = getattr(action, attribute, None)
+    parsed = _finite_float(value)
+    if parsed is not None:
+        return parsed
+    for key in metadata_keys:
+        parsed = _finite_float(action.metadata.get(key))
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def action_codec_key(codec: ActionCodec) -> str:
@@ -245,6 +393,9 @@ class AdaptiveActionSpace:
     promotion_quality_threshold: float = 0.95
     promotion_semantic_bandwidth_threshold: float = 1.0
     promotion_max_reconstruction_drift: float = 0.05
+    promotion_min_old_logprob_coverage: float = 0.0
+    promotion_min_new_logprob_coverage: float = 0.0
+    promotion_min_reference_logprob_coverage: float = 0.0
     promotion_min_pulls: int = 1
     unsafe_rate_threshold: float = 0.0
     demotion_objective_threshold: float = 0.0
@@ -252,6 +403,9 @@ class AdaptiveActionSpace:
     demotion_quality_threshold: float = 0.5
     demotion_semantic_bandwidth_threshold: float = 1.0
     demotion_max_reconstruction_drift: float = 0.05
+    demotion_min_old_logprob_coverage: float = 0.0
+    demotion_min_new_logprob_coverage: float = 0.0
+    demotion_min_reference_logprob_coverage: float = 0.0
     demotion_min_pulls: int = 2
     promote_latent_patches: bool = False
     latent_patch_latent_size: int = 8
@@ -277,6 +431,16 @@ class AdaptiveActionSpace:
             )
         if self.promotion_max_reconstruction_drift < 0:
             raise ValueError("promotion_max_reconstruction_drift must be non-negative")
+        for name in (
+            "promotion_min_old_logprob_coverage",
+            "promotion_min_new_logprob_coverage",
+            "promotion_min_reference_logprob_coverage",
+            "demotion_min_old_logprob_coverage",
+            "demotion_min_new_logprob_coverage",
+            "demotion_min_reference_logprob_coverage",
+        ):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
         if self.promotion_min_pulls < 0:
             raise ValueError("promotion_min_pulls must be non-negative")
         if self.unsafe_rate_threshold < 0:
@@ -331,6 +495,21 @@ class AdaptiveActionSpace:
             ):
                 continue
             if signal.reconstruction_drift > self.promotion_max_reconstruction_drift:
+                continue
+            if (
+                signal.old_logprob_coverage
+                < self.promotion_min_old_logprob_coverage
+            ):
+                continue
+            if (
+                signal.new_logprob_coverage
+                < self.promotion_min_new_logprob_coverage
+            ):
+                continue
+            if (
+                signal.reference_logprob_coverage
+                < self.promotion_min_reference_logprob_coverage
+            ):
                 continue
             if signal.unsafe_rate > self.unsafe_rate_threshold:
                 continue
@@ -411,6 +590,15 @@ class AdaptiveActionSpace:
         if signal.semantic_bandwidth < self.demotion_semantic_bandwidth_threshold:
             return True
         if signal.reconstruction_drift > self.demotion_max_reconstruction_drift:
+            return True
+        if signal.old_logprob_coverage < self.demotion_min_old_logprob_coverage:
+            return True
+        if signal.new_logprob_coverage < self.demotion_min_new_logprob_coverage:
+            return True
+        if (
+            signal.reference_logprob_coverage
+            < self.demotion_min_reference_logprob_coverage
+        ):
             return True
         if self._parent_outperforms(codec, signal, metrics):
             return True
@@ -520,6 +708,15 @@ class AdaptiveActionSpace:
                 "promotion_max_reconstruction_drift": (
                     self.promotion_max_reconstruction_drift
                 ),
+                "promotion_min_old_logprob_coverage": (
+                    self.promotion_min_old_logprob_coverage
+                ),
+                "promotion_min_new_logprob_coverage": (
+                    self.promotion_min_new_logprob_coverage
+                ),
+                "promotion_min_reference_logprob_coverage": (
+                    self.promotion_min_reference_logprob_coverage
+                ),
                 "promotion_min_pulls": self.promotion_min_pulls,
                 "unsafe_rate_threshold": self.unsafe_rate_threshold,
                 "demotion_objective_threshold": self.demotion_objective_threshold,
@@ -530,6 +727,15 @@ class AdaptiveActionSpace:
                 ),
                 "demotion_max_reconstruction_drift": (
                     self.demotion_max_reconstruction_drift
+                ),
+                "demotion_min_old_logprob_coverage": (
+                    self.demotion_min_old_logprob_coverage
+                ),
+                "demotion_min_new_logprob_coverage": (
+                    self.demotion_min_new_logprob_coverage
+                ),
+                "demotion_min_reference_logprob_coverage": (
+                    self.demotion_min_reference_logprob_coverage
                 ),
                 "demotion_min_pulls": self.demotion_min_pulls,
                 "promote_latent_patches": self.promote_latent_patches,
@@ -581,6 +787,18 @@ class AdaptiveActionSpace:
             config.get("promotion_max_reconstruction_drift"),
             self.promotion_max_reconstruction_drift,
         )
+        self.promotion_min_old_logprob_coverage = _state_float(
+            config.get("promotion_min_old_logprob_coverage"),
+            self.promotion_min_old_logprob_coverage,
+        )
+        self.promotion_min_new_logprob_coverage = _state_float(
+            config.get("promotion_min_new_logprob_coverage"),
+            self.promotion_min_new_logprob_coverage,
+        )
+        self.promotion_min_reference_logprob_coverage = _state_float(
+            config.get("promotion_min_reference_logprob_coverage"),
+            self.promotion_min_reference_logprob_coverage,
+        )
         self.promotion_min_pulls = _state_int(
             config.get("promotion_min_pulls"),
             self.promotion_min_pulls,
@@ -609,6 +827,18 @@ class AdaptiveActionSpace:
             config.get("demotion_max_reconstruction_drift"),
             self.demotion_max_reconstruction_drift,
         )
+        self.demotion_min_old_logprob_coverage = _state_float(
+            config.get("demotion_min_old_logprob_coverage"),
+            self.demotion_min_old_logprob_coverage,
+        )
+        self.demotion_min_new_logprob_coverage = _state_float(
+            config.get("demotion_min_new_logprob_coverage"),
+            self.demotion_min_new_logprob_coverage,
+        )
+        self.demotion_min_reference_logprob_coverage = _state_float(
+            config.get("demotion_min_reference_logprob_coverage"),
+            self.demotion_min_reference_logprob_coverage,
+        )
         self.demotion_min_pulls = _state_int(
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
@@ -636,6 +866,15 @@ class AdaptiveActionSpace:
             0.0,
             self.promotion_max_reconstruction_drift,
         )
+        self.promotion_min_old_logprob_coverage = _clamp_fraction(
+            self.promotion_min_old_logprob_coverage
+        )
+        self.promotion_min_new_logprob_coverage = _clamp_fraction(
+            self.promotion_min_new_logprob_coverage
+        )
+        self.promotion_min_reference_logprob_coverage = _clamp_fraction(
+            self.promotion_min_reference_logprob_coverage
+        )
         self.promotion_min_pulls = max(0, self.promotion_min_pulls)
         self.demotion_semantic_bandwidth_threshold = max(
             0.0,
@@ -645,6 +884,15 @@ class AdaptiveActionSpace:
         self.demotion_max_reconstruction_drift = max(
             0.0,
             self.demotion_max_reconstruction_drift,
+        )
+        self.demotion_min_old_logprob_coverage = _clamp_fraction(
+            self.demotion_min_old_logprob_coverage
+        )
+        self.demotion_min_new_logprob_coverage = _clamp_fraction(
+            self.demotion_min_new_logprob_coverage
+        )
+        self.demotion_min_reference_logprob_coverage = _clamp_fraction(
+            self.demotion_min_reference_logprob_coverage
         )
         self.latent_patch_latent_size = max(1, self.latent_patch_latent_size)
 
@@ -689,6 +937,24 @@ class AdaptiveActionSpace:
             "action_space/demotions": float(self._demotions),
             "action_space/disabled_codecs": float(len(self._disabled_codec_keys)),
             "action_space/max_chunk_size": float(self._active_max_chunk_size()),
+            "action_space/promotion_min_old_logprob_coverage": (
+                self.promotion_min_old_logprob_coverage
+            ),
+            "action_space/promotion_min_new_logprob_coverage": (
+                self.promotion_min_new_logprob_coverage
+            ),
+            "action_space/promotion_min_reference_logprob_coverage": (
+                self.promotion_min_reference_logprob_coverage
+            ),
+            "action_space/demotion_min_old_logprob_coverage": (
+                self.demotion_min_old_logprob_coverage
+            ),
+            "action_space/demotion_min_new_logprob_coverage": (
+                self.demotion_min_new_logprob_coverage
+            ),
+            "action_space/demotion_min_reference_logprob_coverage": (
+                self.demotion_min_reference_logprob_coverage
+            ),
         }
         for codec in self._codecs:
             values[
@@ -719,6 +985,9 @@ class AdaptiveActionSpace:
         pull_values: list[float] = []
         semantic_bandwidth_values: list[float] = []
         reconstruction_drift_values: list[float] = []
+        old_logprob_coverage_values: list[float] = []
+        new_logprob_coverage_values: list[float] = []
+        reference_logprob_coverage_values: list[float] = []
         for key, value in metrics.items():
             if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
                 continue
@@ -742,6 +1011,12 @@ class AdaptiveActionSpace:
                 reconstruction_drift_values.append(float(value))
             elif key.endswith("/reconstruction_drift_ema"):
                 reconstruction_drift_values.append(float(value))
+            elif key.endswith("/old_logprob_coverage"):
+                old_logprob_coverage_values.append(float(value))
+            elif key.endswith("/new_logprob_coverage"):
+                new_logprob_coverage_values.append(float(value))
+            elif key.endswith("/reference_logprob_coverage"):
+                reference_logprob_coverage_values.append(float(value))
         return _CodecSignal(
             objective=max(objective_values) if objective_values else 0.0,
             quality=min(quality_values) if quality_values else 0.0,
@@ -759,6 +1034,21 @@ class AdaptiveActionSpace:
                 if reconstruction_drift_values
                 else 0.0
             ),
+            old_logprob_coverage=(
+                min(old_logprob_coverage_values)
+                if old_logprob_coverage_values
+                else 0.0
+            ),
+            new_logprob_coverage=(
+                min(new_logprob_coverage_values)
+                if new_logprob_coverage_values
+                else 0.0
+            ),
+            reference_logprob_coverage=(
+                min(reference_logprob_coverage_values)
+                if reference_logprob_coverage_values
+                else 0.0
+            ),
         )
 
 
@@ -770,6 +1060,9 @@ class _CodecSignal:
     pulls: float
     semantic_bandwidth: float
     reconstruction_drift: float
+    old_logprob_coverage: float
+    new_logprob_coverage: float
+    reference_logprob_coverage: float
 
 
 def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:
@@ -855,13 +1148,22 @@ def _state_int(value: Any, default: int) -> int:
 
 
 def _state_float(value: Any, default: float) -> float:
+    parsed = _finite_float(value)
+    return default if parsed is None else parsed
+
+
+def _clamp_fraction(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _finite_float(value: Any) -> float | None:
     if isinstance(value, bool):
-        return default
+        return None
     try:
         candidate = float(value)
     except (TypeError, ValueError):
-        return default
-    return candidate if isfinite(candidate) else default
+        return None
+    return candidate if isfinite(candidate) else None
 
 
 def _state_bool(value: Any, default: bool) -> bool:

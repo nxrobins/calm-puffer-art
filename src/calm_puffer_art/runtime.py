@@ -16,6 +16,7 @@ from .actions import (
     ActionCodec,
     AdaptiveActionSpace,
     action_codec_key,
+    action_logprob_stats,
     action_space_checkpoint_metadata,
     semantic_bandwidth,
 )
@@ -774,6 +775,14 @@ class RuntimeTelemetry:
         self.train_steps = 0
         self.action_units = 0
         self.source_tokens = 0
+        self.old_logprob_units = 0
+        self.new_logprob_units = 0
+        self.reference_logprob_units = 0
+        self.old_new_logprob_pairs = 0
+        self.old_reference_logprob_pairs = 0
+        self.old_new_logprob_delta_sum = 0.0
+        self.old_reference_logprob_delta_sum = 0.0
+        self.importance_ratio_sum = 0.0
         self.rollout_s = 0.0
         self.rollout_dollar_seconds = 0.0
         self.actor_admission_delay_s = 0.0
@@ -830,6 +839,23 @@ class RuntimeTelemetry:
             self.trajectories_accepted += 1
             self.action_units += trajectory.action_units
             self.source_tokens += trajectory.token_count
+            logprob_stats = action_logprob_stats(trajectory.actions)
+            self.old_logprob_units += logprob_stats.old_logprob_units
+            self.new_logprob_units += logprob_stats.new_logprob_units
+            self.reference_logprob_units += (
+                logprob_stats.reference_logprob_units
+            )
+            self.old_new_logprob_pairs += logprob_stats.old_new_pairs
+            self.old_reference_logprob_pairs += (
+                logprob_stats.old_reference_pairs
+            )
+            self.old_new_logprob_delta_sum += (
+                logprob_stats.old_new_logprob_delta_sum
+            )
+            self.old_reference_logprob_delta_sum += (
+                logprob_stats.old_reference_logprob_delta_sum
+            )
+            self.importance_ratio_sum += logprob_stats.importance_ratio_sum
             effective_reward = trajectory.reward * quality
             if isfinite(effective_reward):
                 self.rewards.append(effective_reward)
@@ -963,6 +989,34 @@ class RuntimeTelemetry:
             / self.action_units
             if self.action_units
             else 0.0,
+            "actions/old_logprob_coverage": self.old_logprob_units
+            / self.action_units
+            if self.action_units
+            else 0.0,
+            "actions/new_logprob_coverage": self.new_logprob_units
+            / self.action_units
+            if self.action_units
+            else 0.0,
+            "actions/reference_logprob_coverage": self.reference_logprob_units
+            / self.action_units
+            if self.action_units
+            else 0.0,
+            "actions/old_new_logprob_delta_mean": (
+                self.old_new_logprob_delta_sum / self.old_new_logprob_pairs
+                if self.old_new_logprob_pairs
+                else 0.0
+            ),
+            "actions/importance_ratio_mean": (
+                self.importance_ratio_sum / self.old_new_logprob_pairs
+                if self.old_new_logprob_pairs
+                else 0.0
+            ),
+            "actions/old_reference_logprob_delta_mean": (
+                self.old_reference_logprob_delta_sum
+                / self.old_reference_logprob_pairs
+                if self.old_reference_logprob_pairs
+                else 0.0
+            ),
             "actions/quality_mean": self.action_quality_total
             / self.action_quality_count
             if self.action_quality_count

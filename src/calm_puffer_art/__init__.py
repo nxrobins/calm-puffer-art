@@ -3,6 +3,7 @@
 from .actions import (
     ACTION_SPACE_STATE_KEY,
     ActionCodec,
+    ActionLogprobStats,
     AdaptiveActionSpace,
     ChunkActionCodec,
     CommandActionCodec,
@@ -10,6 +11,7 @@ from .actions import (
     ReasoningStepCodec,
     TokenActionCodec,
     action_codec_key,
+    action_logprob_stats,
     action_space_checkpoint_metadata,
     semantic_bandwidth,
 )
@@ -89,6 +91,7 @@ from .types import (
 
 __all__ = [
     "ActionCodec",
+    "ActionLogprobStats",
     "ActionUnit",
     "AdaptiveActionSpace",
     "AdaptiveScheduler",
@@ -138,6 +141,7 @@ __all__ = [
     "WeightUpdate",
     "action_quality",
     "action_codec_key",
+    "action_logprob_stats",
     "action_space_checkpoint_metadata",
     "art_rollout_metadata",
     "art_group_to_local",

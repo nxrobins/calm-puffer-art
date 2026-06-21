@@ -31,6 +31,9 @@ class ActionUnit:
     token_count: int
     text: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    old_logprob: float | None = None
+    new_logprob: float | None = None
+    reference_logprob: float | None = None
 
 
 @dataclass

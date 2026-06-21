@@ -85,6 +85,8 @@ The action space starts with token and small chunk codecs. After train feedback 
 
 Action-space state is checkpointable. `AdaptiveActionSpace.state_dict()` captures active codecs, disabled codec keys, promotion/demotion counters, and configuration. `load_state_dict()` restores built-in token, chunk, latent-patch, command, and reasoning-step codecs directly; unknown custom codecs are restored only when an equivalent codec is already present on the action space. `ControlPlane` writes this state under `action_space/state` after scheduler feedback has promoted or retired codecs for the train step.
 
+Action units make probability accounting explicit. `ActionUnit` can carry `old_logprob`, `new_logprob`, and `reference_logprob` fields, or equivalent metadata keys preserved from ART backends. Runtime telemetry and per-arm scheduler metrics report old/new/reference coverage, old-new logprob deltas, sampled reference deltas, and importance-ratio means. `AdaptiveActionSpace` can require those coverage metrics before promotion or demote codecs whose configured probability-accounting coverage disappears, so chunk and latent-patch experiments can be kept inside a trainable GRPO/CISPO contract instead of only measuring semantic bandwidth.
+
 The control loop is online:
 
 1. Actors ask the scheduler whether they are inside the active actor cap and whether saturated downstream queues warrant pre-rollout admission delay, then request a scenario and action codec, reserving that arm as in-flight until the rollout is observed.
@@ -211,7 +213,7 @@ The runtime treats action granularity as a codec choice:
 
 The codec interface deliberately preserves decoded text for compatibility with existing ART-like message trajectories while exposing `action_units`, `token_count`, and `semantic_bandwidth` for metrics.
 
-The torch-backed CALM autoencoder sketch is intentionally not imported into the default package. It should land behind an optional integration layer after the runtime contract is stable, because chunk-level latent logprobs need careful old/new policy-ratio semantics before they are safe to feed into GRPO.
+The torch-backed CALM autoencoder sketch is intentionally not imported into the default package. It should land behind an optional integration layer after the runtime contract is stable; the default package now exposes the old/new/reference action-logprob contract that such a learned latent layer must satisfy before feeding chunk-level ratios into GRPO.
 
 For CALM-like codecs, verifier and reconstruction feedback should be written into trajectory metadata:
 
@@ -229,7 +231,7 @@ Trajectory(
 
 The runtime and scheduler use the minimum available quality signal as the effective-reward multiplier. The scheduler also records categorical failure modes such as exceptions, unsafe action outputs, reconstruction safety failures, verifier failures, and reconstruction drift below `reconstruction_drift_threshold`.
 
-`AdaptiveActionSpace` uses the same scheduler metrics for promotion and retirement, so unobserved, unsafe, low-bandwidth, or poor-reconstruction chunk arms do not unlock larger chunks and promoted arms with enough bad evidence stop competing for rollout slots. Scheduler failure rate is treated as a safety signal alongside unsafe rate, so reconstruction drift can retire a higher-bandwidth chunk even when raw reward and aggregate quality still look high. Token and the minimum chunk size remain active as comparison baselines. This is a runtime control surface, not a learned CALM encoder; learned latent policies remain deferred until old/new logprob semantics are explicit.
+`AdaptiveActionSpace` uses the same scheduler metrics for promotion and retirement, so unobserved, unsafe, low-bandwidth, poor-reconstruction, or insufficiently probability-accounted chunk arms do not unlock larger chunks and promoted arms with enough bad evidence stop competing for rollout slots. Scheduler failure rate is treated as a safety signal alongside unsafe rate, so reconstruction drift can retire a higher-bandwidth chunk even when raw reward and aggregate quality still look high. Token and the minimum chunk size remain active as comparison baselines. This is a runtime control surface, not a learned CALM encoder; learned latent policies remain deferred until they produce the explicit action-logprob evidence exposed by this contract.
 
 ## North-Star Metric
 

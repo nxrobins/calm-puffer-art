@@ -8,6 +8,7 @@ from typing import Sequence
 from calm_puffer_art import (
     ACTION_SPACE_STATE_KEY,
     ActionCodec,
+    ActionUnit,
     AdaptiveActionSpace,
     ChunkActionCodec,
     ControlPlane,
@@ -1237,6 +1238,41 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["actions/quality_mean"], 0.0)
         self.assertEqual(metrics["data/unsafe_trajectories"], 1.0)
         self.assertEqual(metrics["reward/last_window_mean"], 0.0)
+
+    def test_runtime_telemetry_reports_action_logprob_contract(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=1.0)
+        telemetry.record_trajectory(
+            Trajectory(
+                scenario_id="prob",
+                policy_step=0,
+                messages=[],
+                actions=[
+                    ActionUnit(
+                        kind="latent_patch",
+                        payload=(0.1, 0.2),
+                        token_count=2,
+                        old_logprob=-2.0,
+                        new_logprob=-1.5,
+                        reference_logprob=-2.25,
+                    ),
+                    ActionUnit(kind="latent_patch", payload=(0.3, 0.4), token_count=2),
+                ],
+                reward=1.0,
+            ),
+            accepted=True,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["actions/old_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/new_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/reference_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/old_new_logprob_delta_mean"], 0.5)
+        self.assertEqual(
+            metrics["actions/old_reference_logprob_delta_mean"],
+            0.25,
+        )
+        self.assertGreater(metrics["actions/importance_ratio_mean"], 1.0)
 
     def test_runtime_telemetry_attributes_accounted_costs(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=2.0)

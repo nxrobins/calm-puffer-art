@@ -268,6 +268,57 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1010.0,
         )
 
+    def test_scheduler_reports_action_logprob_contract_metrics(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        trajectory = Trajectory(
+            scenario_id="prob",
+            policy_step=0,
+            messages=[],
+            actions=[
+                ActionUnit(
+                    kind="chunk",
+                    payload=("alpha", "beta"),
+                    token_count=2,
+                    old_logprob=-2.0,
+                    new_logprob=-1.75,
+                    reference_logprob=-2.25,
+                ),
+                ActionUnit(
+                    kind="chunk",
+                    payload=("gamma", "delta"),
+                    token_count=2,
+                ),
+            ],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "prob|chunk(chunk_size=2)"},
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        metrics = restored.metrics()
+        prefix = "scheduler/arm/prob_chunk_chunk_size_2"
+
+        self.assertAlmostEqual(metrics[f"{prefix}/old_logprob_coverage"], 0.5)
+        self.assertAlmostEqual(metrics[f"{prefix}/new_logprob_coverage"], 0.5)
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/reference_logprob_coverage"],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/old_new_logprob_delta_mean"],
+            0.25,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/old_reference_logprob_delta_mean"],
+            0.25,
+        )
+        self.assertGreater(metrics[f"{prefix}/importance_ratio_mean"], 1.0)
+
     def test_scheduler_reserves_inflight_untried_arms_for_async_actors(self):
         scenarios = [Scenario(id="easy"), Scenario(id="hard")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
