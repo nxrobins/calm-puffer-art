@@ -2345,6 +2345,75 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/continuation/objective_accounted"], 1.0)
         self.assertEqual(metrics["scheduler/stop_recommended"], 1.0)
 
+    def test_accounted_budget_stops_after_dollar_second_limit(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            max_accounted_dollar_seconds=3.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="budgeted",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "budgeted|token"},
+        )
+        group = TrajectoryGroup(
+            scenario_id="budgeted",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        scheduler.observe_train(
+            groups=[group],
+            result=TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=1.0,
+            dollar_seconds=1.5,
+            policy_step=0,
+        )
+
+        self.assertFalse(
+            scheduler.should_continue_training(
+                policy_step=1,
+                max_train_steps=10,
+                pending_train_batches=0,
+                train_queue_pressure=0.0,
+            )
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/budget/max_accounted_dollar_seconds"], 3.0)
+        self.assertEqual(metrics["scheduler/budget/accounted_dollar_seconds"], 3.5)
+        self.assertEqual(
+            metrics["scheduler/budget/remaining_accounted_dollar_seconds"],
+            0.0,
+        )
+        self.assertGreater(metrics["scheduler/budget/accounted_fraction"], 1.0)
+        self.assertEqual(metrics["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(metrics["scheduler/stop_recommended"], 1.0)
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(restored.max_accounted_dollar_seconds, 3.0)
+        self.assertEqual(
+            restored_metrics["scheduler/budget/accounted_exhausted"],
+            1.0,
+        )
+        self.assertFalse(
+            restored.should_continue_training(
+                policy_step=1,
+                max_train_steps=10,
+                pending_train_batches=0,
+                train_queue_pressure=0.0,
+            )
+        )
+
     def test_positive_train_objective_resets_roi_patience(self):
         scheduler = ObjectiveScheduler(
             exploration_bonus=0.0,
@@ -2406,6 +2475,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             roi_patience=3,
             min_train_objective=0.01,
             continuation_objective="accounted",
+            max_accounted_dollar_seconds=100.0,
         )
         cheap = Trajectory(
             scenario_id="cheap",
@@ -2468,6 +2538,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored.max_actor_count_limit, 4)
         self.assertEqual(restored.continuation_objective, "accounted")
         self.assertEqual(restored.control_train_objective, "accounted")
+        self.assertEqual(restored.max_accounted_dollar_seconds, 100.0)
         self.assertEqual(restored.roi_patience, 3)
         for key in (
             "scheduler/arm/cheap_token/pulls",
@@ -2497,6 +2568,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/accounted_last_dollar_seconds",
             "scheduler/continuation_last_objective",
             "scheduler/continuation/objective_accounted",
+            "scheduler/budget/max_accounted_dollar_seconds",
+            "scheduler/budget/accounted_dollar_seconds",
+            "scheduler/budget/remaining_accounted_dollar_seconds",
+            "scheduler/budget/accounted_fraction",
+            "scheduler/budget/accounted_exhausted",
             "scheduler/control/train_objective_accounted",
             "scheduler/train_last_experience_count",
             "scheduler/train_last_reward_improving_experience",

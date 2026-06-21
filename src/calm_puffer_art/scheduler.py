@@ -255,6 +255,7 @@ class ObjectiveScheduler:
         min_train_objective: float = 0.0,
         continuation_objective: str = "train",
         control_train_objective: str = "accounted",
+        max_accounted_dollar_seconds: float | None = None,
         max_rollout_admission_delay_s: float = 0.0,
         rollout_admission_pressure_threshold: float = 0.75,
         rollout_admission_positive_signal_scale: float = 0.25,
@@ -304,6 +305,13 @@ class ObjectiveScheduler:
             raise ValueError(
                 "control_train_objective must be 'train' or 'accounted'"
             )
+        if (
+            max_accounted_dollar_seconds is not None
+            and max_accounted_dollar_seconds <= 0
+        ):
+            raise ValueError(
+                "max_accounted_dollar_seconds must be positive when set"
+            )
         if max_rollout_admission_delay_s < 0:
             raise ValueError("max_rollout_admission_delay_s must be non-negative")
         if not 0 <= rollout_admission_pressure_threshold < 1:
@@ -340,6 +348,7 @@ class ObjectiveScheduler:
         self.min_train_objective = min_train_objective
         self.continuation_objective = continuation_objective
         self.control_train_objective = control_train_objective
+        self.max_accounted_dollar_seconds = max_accounted_dollar_seconds
         self.max_rollout_admission_delay_s = max_rollout_admission_delay_s
         self.rollout_admission_pressure_threshold = (
             rollout_admission_pressure_threshold
@@ -995,6 +1004,9 @@ class ObjectiveScheduler:
         if policy_step >= max_train_steps:
             self._stop_recommended = True
             return False
+        if self._accounted_budget_exhausted():
+            self._stop_recommended = True
+            return False
         if self.roi_patience is None:
             return True
         if policy_step < self.min_train_steps:
@@ -1040,6 +1052,9 @@ class ObjectiveScheduler:
                 "min_train_objective": self.min_train_objective,
                 "continuation_objective": self.continuation_objective,
                 "control_train_objective": self.control_train_objective,
+                "max_accounted_dollar_seconds": (
+                    self.max_accounted_dollar_seconds
+                ),
                 "max_rollout_admission_delay_s": (
                     self.max_rollout_admission_delay_s
                 ),
@@ -1296,6 +1311,13 @@ class ObjectiveScheduler:
         )
         if control_train_objective in {"train", "accounted"}:
             self.control_train_objective = control_train_objective
+        restored_budget = _state_optional_float(
+            config.get("max_accounted_dollar_seconds"),
+            self.max_accounted_dollar_seconds,
+        )
+        if restored_budget is not None and restored_budget <= 0.0:
+            restored_budget = None
+        self.max_accounted_dollar_seconds = restored_budget
         self.max_rollout_admission_delay_s = _state_float(
             config.get("max_rollout_admission_delay_s"),
             self.max_rollout_admission_delay_s,
@@ -1553,6 +1575,18 @@ class ObjectiveScheduler:
         failure_rollouts = sum(
             stats.failed_rollouts for stats in self._arms.values()
         )
+        accounted_dollar_seconds = self._accounted_dollar_seconds()
+        budget_limit = self.max_accounted_dollar_seconds or 0.0
+        budget_remaining = (
+            max(0.0, budget_limit - accounted_dollar_seconds)
+            if self.max_accounted_dollar_seconds is not None
+            else 0.0
+        )
+        budget_fraction = (
+            accounted_dollar_seconds / budget_limit
+            if budget_limit > 0.0
+            else 0.0
+        )
         failure_modes: dict[str, int] = {}
         for stats in self._arms.values():
             for mode, count in stats.failure_modes.items():
@@ -1593,6 +1627,15 @@ class ObjectiveScheduler:
             ),
             "scheduler/continuation/objective_accounted": (
                 1.0 if self.continuation_objective == "accounted" else 0.0
+            ),
+            "scheduler/budget/max_accounted_dollar_seconds": budget_limit,
+            "scheduler/budget/accounted_dollar_seconds": accounted_dollar_seconds,
+            "scheduler/budget/remaining_accounted_dollar_seconds": (
+                budget_remaining
+            ),
+            "scheduler/budget/accounted_fraction": budget_fraction,
+            "scheduler/budget/accounted_exhausted": (
+                1.0 if self._accounted_budget_exhausted() else 0.0
             ),
             "scheduler/control/train_objective_accounted": (
                 1.0 if self.control_train_objective == "accounted" else 0.0
@@ -1684,12 +1727,7 @@ class ObjectiveScheduler:
                 self._rollout_admission_dollar_seconds
             ),
             "scheduler/costs/train_dollar_seconds": self._train_dollar_seconds,
-            "scheduler/costs/total_dollar_seconds": (
-                self._rollout_dollar_seconds
-                + self._queue_wait_dollar_seconds
-                + self._rollout_admission_dollar_seconds
-                + self._train_dollar_seconds
-            ),
+            "scheduler/costs/total_dollar_seconds": accounted_dollar_seconds,
         }
         if self._last_decision_snapshot is not None:
             last_arm_id = str(self._last_decision_snapshot.get("arm_id", ""))
@@ -2733,6 +2771,11 @@ class ObjectiveScheduler:
             + self._train_dollar_seconds
         )
 
+    def _accounted_budget_exhausted(self) -> bool:
+        if self.max_accounted_dollar_seconds is None:
+            return False
+        return self._accounted_dollar_seconds() >= self.max_accounted_dollar_seconds
+
     def _ema(self, current: float, value: float, count: int) -> float:
         if count <= 1:
             return value
@@ -3231,6 +3274,18 @@ def _state_optional_int(value: Any, default: int | None) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _state_optional_float(value: Any, default: float | None) -> float | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return default
+    return candidate if math.isfinite(candidate) else default
 
 
 def _state_float(value: Any, default: float) -> float:

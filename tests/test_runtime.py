@@ -1034,6 +1034,54 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(summary.latest_step, 1)
         self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
 
+    def test_control_plane_stops_when_scheduler_accounted_budget_is_exhausted(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=4.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="budgeted")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=FixedCostTrainer(score=0.0, dollar_seconds=5.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/max_accounted_dollar_seconds"],
+            4.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_exhausted"],
+            1.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            5.0,
+        )
+
     def test_control_plane_uses_explicit_train_dollar_seconds(self):
         async def run():
             scheduler = ObjectiveScheduler(
