@@ -2052,6 +2052,45 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0,
         )
 
+    def test_policy_lag_feedback_overrides_unaccepted_arm_protection(self):
+        scheduler = ObjectiveScheduler(
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+        )
+        stale = Trajectory(
+            scenario_id="lag",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "lag|token",
+                "scheduler/active_max_policy_lag": 3,
+            },
+        )
+
+        scheduler.observe_stale_batch(
+            groups=[TrajectoryGroup(scenario_id="lag", trajectories=(stale,))],
+            policy_step=4,
+            reason="lag_feedback",
+        )
+        lag = scheduler.max_policy_lag(
+            configured=3,
+            train_queue_pressure=0.0,
+            policy_step=4,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertNotEqual(lag, 3)
+        self.assertEqual(metrics["scheduler/arm/lag_token/accepted"], 0.0)
+        self.assertEqual(metrics["scheduler/control/policy_lag_3/stale_updates"], 1.0)
+        self.assertLess(metrics["scheduler/control/policy_lag_3/objective_ema"], 0.0)
+        self.assertEqual(
+            metrics[f"scheduler/control/policy_lag_{lag}/decisions"],
+            1.0,
+        )
+
     def test_stale_penalty_uses_estimated_lost_objective_when_available(self):
         scheduler = ObjectiveScheduler(
             ema_alpha=1.0,

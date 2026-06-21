@@ -676,9 +676,10 @@ class ObjectiveScheduler:
         off_policy_penalty = self._last_train_batch_off_policy_penalty
         self._last_policy_lag_off_policy_penalty = off_policy_penalty
         self._last_policy_lag_off_policy_tightened = False
-        if self._has_unaccepted_known_arm():
-            return self._record_control_decision(self._lag_controls, configured)
-        if train_queue_pressure >= 0.75:
+        protecting_unaccepted_arm = self._has_unaccepted_known_arm()
+        if protecting_unaccepted_arm:
+            preferred = configured
+        elif train_queue_pressure >= 0.75:
             preferred = self.min_policy_lag
         elif off_policy_penalty > self.off_policy_lag_tightening_threshold:
             preferred = self.min_policy_lag
@@ -687,6 +688,14 @@ class ObjectiveScheduler:
             preferred = self.min_policy_lag
         else:
             preferred = configured
+        if (
+            protecting_unaccepted_arm
+            and not self._control_family_has_feedback(
+                self._lag_controls,
+                candidates,
+            )
+        ):
+            return self._record_control_decision(self._lag_controls, configured)
         return self._record_control_decision(
             self._lag_controls,
             self._select_control_value(
