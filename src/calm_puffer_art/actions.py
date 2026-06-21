@@ -997,7 +997,8 @@ class AdaptiveActionSpace:
         metrics: Mapping[str, float],
     ) -> "_CodecSignal":
         fragment = safe_metric_key(action_codec_key(codec))
-        objective_values: list[float] = []
+        scored_objective_values: list[float] = []
+        fallback_objective_values: list[float] = []
         quality_values: list[float] = []
         unsafe_values: list[float] = []
         failure_values: list[float] = []
@@ -1011,11 +1012,11 @@ class AdaptiveActionSpace:
             if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
                 continue
             if key.endswith("/policy_improvement_objective_ema"):
-                objective_values.append(float(value))
+                fallback_objective_values.append(float(value))
             elif key.endswith("/objective_score"):
-                objective_values.append(float(value))
+                scored_objective_values.append(float(value))
             elif key.endswith("/marginal_objective_ema"):
-                objective_values.append(float(value))
+                fallback_objective_values.append(float(value))
             elif key.endswith("/action_quality_ema"):
                 quality_values.append(float(value))
             elif key.endswith("/unsafe_rate"):
@@ -1037,7 +1038,10 @@ class AdaptiveActionSpace:
             elif key.endswith("/reference_logprob_coverage"):
                 reference_logprob_coverage_values.append(float(value))
         return _CodecSignal(
-            objective=max(objective_values) if objective_values else 0.0,
+            objective=self._codec_objective(
+                scored_objective_values,
+                fallback_objective_values,
+            ),
             quality=min(quality_values) if quality_values else 0.0,
             unsafe_rate=max(unsafe_values + failure_values)
             if unsafe_values or failure_values
@@ -1069,6 +1073,17 @@ class AdaptiveActionSpace:
                 else 0.0
             ),
         )
+
+    @staticmethod
+    def _codec_objective(
+        scored_values: Sequence[float],
+        fallback_values: Sequence[float],
+    ) -> float:
+        if scored_values:
+            return max(scored_values)
+        if fallback_values:
+            return max(fallback_values)
+        return 0.0
 
 
 @dataclass(frozen=True)

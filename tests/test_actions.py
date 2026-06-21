@@ -138,6 +138,27 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
 
+    def test_adaptive_action_space_uses_scored_objective_for_promotion(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/policy_improvement_objective_ema": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/marginal_objective_ema": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 0.0)
+
     def test_adaptive_action_space_requires_parent_margin_for_promotion(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -393,6 +414,28 @@ class ActionCodecTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(metrics["action_space/max_chunk_size"], 2.0)
+
+    def test_adaptive_action_space_uses_scored_objective_for_demotion(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
+        action_space.add_codec(ChunkActionCodec(chunk_size=4))
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/policy_improvement_objective_ema": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/marginal_objective_ema": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/demotions"], 1.0)
 
     def test_adaptive_action_space_can_skip_demotions_for_rollout_feedback(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
