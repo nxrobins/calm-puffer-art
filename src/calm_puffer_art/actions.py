@@ -47,6 +47,7 @@ class ActionLogprobStats:
     old_new_pairs: int = 0
     old_reference_pairs: int = 0
     old_new_logprob_delta_sum: float = 0.0
+    old_new_logprob_abs_delta_sum: float = 0.0
     old_reference_logprob_delta_sum: float = 0.0
     importance_ratio_sum: float = 0.0
 
@@ -70,6 +71,14 @@ class ActionLogprobStats:
     def old_new_logprob_delta_mean(self) -> float:
         return (
             self.old_new_logprob_delta_sum / self.old_new_pairs
+            if self.old_new_pairs
+            else 0.0
+        )
+
+    @property
+    def old_new_logprob_abs_delta_mean(self) -> float:
+        return (
+            self.old_new_logprob_abs_delta_sum / self.old_new_pairs
             if self.old_new_pairs
             else 0.0
         )
@@ -103,6 +112,7 @@ def action_logprob_stats(actions: Sequence[ActionUnit]) -> ActionLogprobStats:
     old_new_pairs = 0
     old_reference_pairs = 0
     old_new_delta_sum = 0.0
+    old_new_abs_delta_sum = 0.0
     old_reference_delta_sum = 0.0
     ratio_sum = 0.0
     for action in actions:
@@ -145,6 +155,7 @@ def action_logprob_stats(actions: Sequence[ActionUnit]) -> ActionLogprobStats:
             delta = new - old
             old_new_pairs += 1
             old_new_delta_sum += delta
+            old_new_abs_delta_sum += abs(delta)
             ratio_sum += exp(max(-60.0, min(60.0, delta)))
         if old is not None and reference is not None:
             old_reference_pairs += 1
@@ -160,6 +171,7 @@ def action_logprob_stats(actions: Sequence[ActionUnit]) -> ActionLogprobStats:
         old_new_pairs=old_new_pairs,
         old_reference_pairs=old_reference_pairs,
         old_new_logprob_delta_sum=old_new_delta_sum,
+        old_new_logprob_abs_delta_sum=old_new_abs_delta_sum,
         old_reference_logprob_delta_sum=old_reference_delta_sum,
         importance_ratio_sum=ratio_sum,
     )
@@ -477,8 +489,15 @@ class AdaptiveActionSpace:
         self._codecs.append(codec)
         return True
 
-    def update_from_metrics(self, metrics: Mapping[str, float]) -> None:
-        disabled_this_update = self._demote_from_metrics(metrics)
+    def update_from_metrics(
+        self,
+        metrics: Mapping[str, float],
+        *,
+        allow_demotions: bool = True,
+    ) -> None:
+        disabled_this_update = (
+            self._demote_from_metrics(metrics) if allow_demotions else set()
+        )
         for codec in tuple(self._codecs):
             if not isinstance(codec, ChunkActionCodec):
                 continue

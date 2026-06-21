@@ -80,6 +80,7 @@ class ActionCodecTests(unittest.TestCase):
         self.assertAlmostEqual(stats.new_logprob_coverage, 2 / 3)
         self.assertAlmostEqual(stats.reference_logprob_coverage, 2 / 3)
         self.assertAlmostEqual(stats.old_new_logprob_delta_mean, 0.4)
+        self.assertAlmostEqual(stats.old_new_logprob_abs_delta_mean, 0.4)
         self.assertAlmostEqual(stats.old_reference_logprob_delta_mean, 0.35)
         self.assertGreater(stats.importance_ratio_mean, 1.0)
 
@@ -392,6 +393,34 @@ class ActionCodecTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(metrics["action_space/max_chunk_size"], 2.0)
+
+    def test_adaptive_action_space_can_skip_demotions_for_rollout_feedback(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 1.0,
+            },
+            allow_demotions=False,
+        )
+
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/demotions"], 0.0)
 
     def test_adaptive_action_space_demotes_drifty_promoted_chunks(self):
         action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=8)

@@ -656,13 +656,14 @@ class RuntimeTests(unittest.TestCase):
             action_space = AdaptiveActionSpace(
                 min_chunk_size=2,
                 max_chunk_size=4,
+                demotion_min_pulls=999,
             )
             runtime = ControlPlane(
                 ControlPlaneConfig(
                     num_actors=1,
                     group_size=1,
                     train_batch_groups=1,
-                    max_train_steps=6,
+                    max_train_steps=8,
                     queue_max_trajectories=4,
                     train_queue_capacity=2,
                     max_policy_lag=2,
@@ -706,6 +707,92 @@ class RuntimeTests(unittest.TestCase):
             action_space_state["learning_state"]["promotions"],
         )
 
+    def test_control_plane_promotes_action_codecs_from_rollout_feedback(self):
+        async def run():
+            saw_chunk4 = asyncio.Event()
+
+            class WaitingTrainer:
+                async def train(
+                    self,
+                    current: PolicySnapshot,
+                    groups: Sequence[TrajectoryGroup],
+                ) -> TrainResult:
+                    try:
+                        await asyncio.wait_for(saw_chunk4.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    rewards = [
+                        trajectory.reward
+                        for group in groups
+                        for trajectory in group.trajectories
+                    ]
+                    return TrainResult(
+                        policy=current.policy,
+                        checkpoint_id=f"step-{current.step + 1}",
+                        metrics={"train/reward": fmean(rewards)},
+                    )
+
+            async def rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                chunk_size = int(getattr(context.action_codec, "chunk_size", 1))
+                if chunk_size == 4:
+                    saw_chunk4.set()
+                actions = context.action_codec.encode("alpha beta gamma delta")
+                reward = {1: 0.1, 2: 1.0, 4: 1.2}.get(chunk_size, 0.0)
+                return Trajectory(
+                    scenario_id=scenario.id,
+                    policy_step=context.policy_step,
+                    messages=[Message(role="user", content="adapt chunks")],
+                    actions=actions,
+                    reward=reward,
+                )
+
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=999,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=3,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=WaitingTrainer(),
+                workflow=rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+            return saw_chunk4.is_set(), summary
+
+        saw_chunk4, summary = asyncio.run(run())
+
+        self.assertTrue(saw_chunk4)
+        self.assertIn("scheduler/arm/adapt_chunk_chunk_size_4/pulls", summary.metrics)
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+
     def test_control_plane_demotes_promoted_chunk_when_parent_has_better_objective(self):
         async def low_value_promoted_chunk_rollout(
             policy: CountingPolicy,
@@ -741,7 +828,7 @@ class RuntimeTests(unittest.TestCase):
                     num_actors=1,
                     group_size=1,
                     train_batch_groups=1,
-                    max_train_steps=10,
+                    max_train_steps=14,
                     queue_max_trajectories=4,
                     train_queue_capacity=2,
                     max_policy_lag=2,
@@ -815,7 +902,7 @@ class RuntimeTests(unittest.TestCase):
                     num_actors=1,
                     group_size=1,
                     train_batch_groups=1,
-                    max_train_steps=10,
+                    max_train_steps=14,
                     queue_max_trajectories=4,
                     train_queue_capacity=2,
                     max_policy_lag=2,
@@ -1268,6 +1355,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["actions/new_logprob_coverage"], 0.5)
         self.assertEqual(metrics["actions/reference_logprob_coverage"], 0.5)
         self.assertEqual(metrics["actions/old_new_logprob_delta_mean"], 0.5)
+        self.assertEqual(metrics["actions/old_new_logprob_abs_delta_mean"], 0.5)
         self.assertEqual(
             metrics["actions/old_reference_logprob_delta_mean"],
             0.25,

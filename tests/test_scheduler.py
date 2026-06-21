@@ -314,6 +314,10 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0.25,
         )
         self.assertAlmostEqual(
+            metrics[f"{prefix}/old_new_logprob_abs_delta_mean"],
+            0.25,
+        )
+        self.assertAlmostEqual(
             metrics[f"{prefix}/old_reference_logprob_delta_mean"],
             0.25,
         )
@@ -2130,6 +2134,200 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_train_group_scoring_penalizes_off_policy_action_drift(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            off_policy_priority_weight=1.0,
+            staleness_priority_weight=0.0,
+        )
+        low_drift = Trajectory(
+            scenario_id="drift",
+            policy_step=0,
+            messages=[],
+            actions=[
+                ActionUnit(
+                    kind="chunk",
+                    payload=("alpha",),
+                    token_count=1,
+                    old_logprob=-2.0,
+                    new_logprob=-1.9,
+                )
+            ],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "drift|chunk(chunk_size=1)"},
+        )
+        high_drift = Trajectory(
+            scenario_id="drift",
+            policy_step=0,
+            messages=[],
+            actions=[
+                ActionUnit(
+                    kind="chunk",
+                    payload=("alpha",),
+                    token_count=1,
+                    old_logprob=-2.0,
+                    new_logprob=1.0,
+                )
+            ],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "drift|chunk(chunk_size=1)"},
+        )
+        unaccounted = Trajectory(
+            scenario_id="drift",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "drift|token"},
+        )
+
+        low_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="drift", trajectories=(low_drift,))],
+            policy_step=0,
+        )
+        high_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="drift", trajectories=(high_drift,))],
+            policy_step=0,
+        )
+        high_metrics = scheduler.metrics()
+        unaccounted_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="drift", trajectories=(unaccounted,))],
+            policy_step=0,
+        )
+        unaccounted_metrics = scheduler.metrics()
+
+        self.assertGreater(low_score, high_score)
+        self.assertAlmostEqual(
+            high_metrics["scheduler/last_train_batch_old_new_logprob_coverage"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            high_metrics["scheduler/last_train_batch_off_policy_drift"],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            high_metrics["scheduler/last_train_batch_off_policy_penalty"],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            high_metrics[
+                "scheduler/last_train_batch_priority_before_off_policy"
+            ],
+            1.0,
+        )
+        self.assertAlmostEqual(high_score, 0.25)
+        self.assertAlmostEqual(unaccounted_score, 1.0)
+        self.assertEqual(
+            unaccounted_metrics[
+                "scheduler/last_train_batch_off_policy_penalty"
+            ],
+            0.0,
+        )
+
+    def test_off_policy_action_drift_tightens_policy_lag(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+            off_policy_priority_weight=1.0,
+            off_policy_cadence_tightening_threshold=0.5,
+            off_policy_lag_tightening_threshold=0.5,
+            staleness_priority_weight=0.0,
+        )
+        low_drift = Trajectory(
+            scenario_id="lag",
+            policy_step=0,
+            messages=[],
+            actions=[
+                ActionUnit(
+                    kind="chunk",
+                    payload=("alpha",),
+                    token_count=1,
+                    old_logprob=-1.0,
+                    new_logprob=-0.75,
+                )
+            ],
+            reward=1.0,
+        )
+        high_drift = Trajectory(
+            scenario_id="lag",
+            policy_step=0,
+            messages=[],
+            actions=[
+                ActionUnit(
+                    kind="chunk",
+                    payload=("alpha",),
+                    token_count=1,
+                    old_logprob=-2.0,
+                    new_logprob=0.0,
+                )
+            ],
+            reward=1.0,
+        )
+
+        scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="lag", trajectories=(low_drift,))],
+            policy_step=0,
+        )
+        loose_cadence = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        loose_lag = scheduler.max_policy_lag(
+            configured=3,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="lag", trajectories=(high_drift,))],
+            policy_step=1,
+        )
+        tight_cadence = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        tight_lag = scheduler.max_policy_lag(
+            configured=3,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(loose_cadence, 3)
+        self.assertEqual(loose_lag, 3)
+        self.assertEqual(tight_cadence, 1)
+        self.assertEqual(tight_lag, 0)
+        self.assertEqual(
+            metrics["scheduler/cadence/last_off_policy_penalty"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/cadence/off_policy_tightened"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/cadence/off_policy_tightening_threshold"],
+            0.5,
+        )
+        self.assertEqual(
+            metrics["scheduler/policy_lag/last_off_policy_penalty"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/policy_lag/off_policy_tightened"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/policy_lag/off_policy_tightening_threshold"],
+            0.5,
+        )
+
     def test_unsafe_high_reward_action_granularity_is_penalized(self):
         scenarios = [Scenario(id="task")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
@@ -2925,6 +3123,9 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             exploration_bonus=0.0,
             reward_efficiency_weight=0.25,
             staleness_priority_weight=0.5,
+            off_policy_priority_weight=0.75,
+            off_policy_cadence_tightening_threshold=0.2,
+            off_policy_lag_tightening_threshold=0.2,
             confidence_penalty_weight=0.25,
             control_exploration_bonus=0.15,
             max_control_candidate_values=5,
@@ -2939,7 +3140,15 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             scenario_id="cheap",
             policy_step=0,
             messages=[],
-            actions=[],
+            actions=[
+                ActionUnit(
+                    kind="token",
+                    payload="cheap",
+                    token_count=1,
+                    old_logprob=-2.0,
+                    new_logprob=-1.5,
+                )
+            ],
             reward=2.0,
             metadata={
                 "actor_id": 7,
@@ -2962,6 +3171,17 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         scheduler.observe_rollout(cheap, accepted=True, dollar_seconds=1.0)
         scheduler.observe_rollout(expensive, accepted=True, dollar_seconds=5.0)
         scheduler.score_train_groups([group], policy_step=1)
+        scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
+        scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.0,
+            policy_step=1,
+        )
         scheduler.observe_train(
             groups=[group],
             result=TrainResult(metrics={"train/reward": 3.0}),
@@ -2988,6 +3208,9 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(decision.arm_id, "cheap|token")
         self.assertEqual(restored.reward_efficiency_weight, 0.25)
         self.assertEqual(restored.staleness_priority_weight, 0.5)
+        self.assertEqual(restored.off_policy_priority_weight, 0.75)
+        self.assertEqual(restored.off_policy_cadence_tightening_threshold, 0.2)
+        self.assertEqual(restored.off_policy_lag_tightening_threshold, 0.2)
         self.assertEqual(restored.confidence_penalty_weight, 0.25)
         self.assertEqual(restored.control_exploration_bonus, 0.15)
         self.assertEqual(restored.max_control_candidate_values, 5)
@@ -3039,6 +3262,16 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_train_batch_lag_limit",
             "scheduler/last_train_batch_staleness_urgency",
             "scheduler/last_train_batch_staleness_bonus",
+            "scheduler/last_train_batch_old_new_logprob_coverage",
+            "scheduler/last_train_batch_off_policy_drift",
+            "scheduler/last_train_batch_off_policy_penalty",
+            "scheduler/last_train_batch_priority_before_off_policy",
+            "scheduler/cadence/last_off_policy_penalty",
+            "scheduler/cadence/off_policy_tightened",
+            "scheduler/cadence/off_policy_tightening_threshold",
+            "scheduler/policy_lag/last_off_policy_penalty",
+            "scheduler/policy_lag/off_policy_tightened",
+            "scheduler/policy_lag/off_policy_tightening_threshold",
             "scheduler/last_train_batch_reward_improving_experience",
             "scheduler/last_train_batch_sample_dollar_seconds",
             "scheduler/last_train_batch_cost_normalized_priority",
@@ -3046,6 +3279,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",
             "scheduler/weights/control_exploration",
+            "scheduler/weights/off_policy_priority",
             "scheduler/coverage/min_fraction",
             "scheduler/coverage/max_cost_fraction",
             "scheduler/coverage/forced_decisions",

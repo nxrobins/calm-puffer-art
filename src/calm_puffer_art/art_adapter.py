@@ -1021,6 +1021,11 @@ class AsyncArtBackend:
                     dollar_seconds=rollout_cost,
                     queue_wait_dollar_seconds=queue_wait_cost,
                 )
+        if self.action_space is not None:
+            self.action_space.update_from_metrics(
+                self.scheduler.metrics(),
+                allow_demotions=False,
+            )
 
     def _batch_priority_scorer(self):
         if self.scheduler is None:

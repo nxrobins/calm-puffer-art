@@ -882,6 +882,72 @@ class ArtAdapterTests(unittest.TestCase):
             1.0,
         )
 
+    def test_async_art_backend_promotes_action_space_from_submitted_rollouts(self):
+        async def run():
+            backend = FakeArtBackend()
+            backend.block_event = asyncio.Event()
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=999,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                action_space=action_space,
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(
+                                FakeMessage(
+                                    role="assistant",
+                                    content="alpha beta gamma delta",
+                                )
+                            )
+                        ],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={
+                            "scenario_id": "adapt",
+                            "scheduler/arm_id": "adapt|chunk(chunk_size=2)",
+                        },
+                    )
+                ],
+                metadata={"scenario_id": "adapt"},
+            )
+
+            await async_backend.register("art-model")
+            future = await async_backend.submit_train("art-model", [art_group])
+            first = async_backend.select_rollout(
+                scenarios=[Scenario(id="adapt")],
+                actor_id=0,
+            )
+            second = async_backend.select_rollout(
+                scenarios=[Scenario(id="adapt")],
+                actor_id=1,
+            )
+            backend.block_event.set()
+            await future
+            stats = async_backend.stats()
+            await async_backend.close()
+            return first, second, stats
+
+        first, second, stats = asyncio.run(run())
+
+        selected_codec_keys = {
+            action_codec_key(first.action_codec),
+            action_codec_key(second.action_codec),
+        }
+        self.assertIn("chunk(chunk_size=4)", selected_codec_keys)
+        self.assertEqual(
+            stats["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+
     def test_async_art_backend_synchronous_fallback_calls_backend_directly(self):
         async def run():
             backend = FakeArtBackend()

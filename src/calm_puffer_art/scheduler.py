@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Protocol, Sequence
 
-from .actions import ActionCodec, action_logprob_stats
+from .actions import ActionCodec, ActionLogprobStats, action_logprob_stats
 from .types import Scenario, TrainResult, Trajectory, TrajectoryGroup, mean
 
 
@@ -201,6 +201,7 @@ class ArmStats:
     new_logprob_sum: float = 0.0
     reference_logprob_sum: float = 0.0
     old_new_logprob_delta_sum: float = 0.0
+    old_new_logprob_abs_delta_sum: float = 0.0
     old_reference_logprob_delta_sum: float = 0.0
     importance_ratio_sum: float = 0.0
     stale_experience: float = 0.0
@@ -274,6 +275,9 @@ class ObjectiveScheduler:
         reward_efficiency_weight: float = 0.0,
         stale_penalty_weight: float = 1.0,
         staleness_priority_weight: float = 1.0,
+        off_policy_priority_weight: float = 1.0,
+        off_policy_cadence_tightening_threshold: float = 0.0,
+        off_policy_lag_tightening_threshold: float = 0.0,
         confidence_penalty_weight: float = 0.0,
         control_exploration_bonus: float = 0.1,
         max_control_candidate_values: int = 8,
@@ -315,6 +319,16 @@ class ObjectiveScheduler:
             raise ValueError("stale_penalty_weight must be non-negative")
         if staleness_priority_weight < 0:
             raise ValueError("staleness_priority_weight must be non-negative")
+        if off_policy_priority_weight < 0:
+            raise ValueError("off_policy_priority_weight must be non-negative")
+        if off_policy_cadence_tightening_threshold < 0:
+            raise ValueError(
+                "off_policy_cadence_tightening_threshold must be non-negative"
+            )
+        if off_policy_lag_tightening_threshold < 0:
+            raise ValueError(
+                "off_policy_lag_tightening_threshold must be non-negative"
+            )
         if confidence_penalty_weight < 0:
             raise ValueError("confidence_penalty_weight must be non-negative")
         if control_exploration_bonus < 0:
@@ -380,6 +394,13 @@ class ObjectiveScheduler:
         self.reward_efficiency_weight = reward_efficiency_weight
         self.stale_penalty_weight = stale_penalty_weight
         self.staleness_priority_weight = staleness_priority_weight
+        self.off_policy_priority_weight = off_policy_priority_weight
+        self.off_policy_cadence_tightening_threshold = (
+            off_policy_cadence_tightening_threshold
+        )
+        self.off_policy_lag_tightening_threshold = (
+            off_policy_lag_tightening_threshold
+        )
         self.confidence_penalty_weight = confidence_penalty_weight
         self.control_exploration_bonus = control_exploration_bonus
         self.max_control_candidate_values = max_control_candidate_values
@@ -441,6 +462,14 @@ class ObjectiveScheduler:
         self._last_train_batch_lag_limit = -1
         self._last_train_batch_staleness_urgency = 0.0
         self._last_train_batch_staleness_bonus = 0.0
+        self._last_train_batch_old_new_logprob_coverage = 0.0
+        self._last_train_batch_off_policy_drift = 0.0
+        self._last_train_batch_off_policy_penalty = 0.0
+        self._last_train_batch_priority_before_off_policy = 0.0
+        self._last_cadence_off_policy_penalty = 0.0
+        self._last_cadence_off_policy_tightened = False
+        self._last_policy_lag_off_policy_penalty = 0.0
+        self._last_policy_lag_off_policy_tightened = False
         self._last_train_batch_reward_improving_experience = 0.0
         self._last_train_batch_sample_dollar_seconds = 0.0
         self._last_train_batch_cost_normalized_priority = 0.0
@@ -580,8 +609,14 @@ class ObjectiveScheduler:
             configured=configured,
             upper=upper,
         )
+        off_policy_penalty = self._last_train_batch_off_policy_penalty
+        self._last_cadence_off_policy_penalty = off_policy_penalty
+        self._last_cadence_off_policy_tightened = False
         if self._has_positive_objective_signal():
             preferred = self.min_train_batch_groups
+        elif off_policy_penalty > self.off_policy_cadence_tightening_threshold:
+            preferred = self.min_train_batch_groups
+            self._last_cadence_off_policy_tightened = True
         elif train_queue_pressure >= 0.75 or pending_groups >= upper:
             preferred = upper
         else:
@@ -617,10 +652,16 @@ class ObjectiveScheduler:
             configured=configured,
             upper=upper,
         )
+        off_policy_penalty = self._last_train_batch_off_policy_penalty
+        self._last_policy_lag_off_policy_penalty = off_policy_penalty
+        self._last_policy_lag_off_policy_tightened = False
         if self._has_unaccepted_known_arm():
             return self._record_control_decision(self._lag_controls, configured)
         if train_queue_pressure >= 0.75:
             preferred = self.min_policy_lag
+        elif off_policy_penalty > self.off_policy_lag_tightening_threshold:
+            preferred = self.min_policy_lag
+            self._last_policy_lag_off_policy_tightened = True
         elif self._has_positive_objective_signal():
             preferred = self.min_policy_lag
         else:
@@ -779,6 +820,9 @@ class ObjectiveScheduler:
         stats.reference_logprob_sum += logprob_stats.reference_logprob_sum
         stats.old_new_logprob_delta_sum += (
             logprob_stats.old_new_logprob_delta_sum
+        )
+        stats.old_new_logprob_abs_delta_sum += (
+            logprob_stats.old_new_logprob_abs_delta_sum
         )
         stats.old_reference_logprob_delta_sum += (
             logprob_stats.old_reference_logprob_delta_sum
@@ -1113,7 +1157,23 @@ class ObjectiveScheduler:
             * self.staleness_priority_weight
             * staleness_urgency
         )
-        priority = base_priority + staleness_bonus
+        priority_before_off_policy = base_priority + staleness_bonus
+        logprob_stats = _groups_action_logprob_stats(groups)
+        old_new_logprob_coverage = (
+            logprob_stats.old_new_pairs / logprob_stats.action_units
+            if logprob_stats.action_units
+            else 0.0
+        )
+        off_policy_drift = logprob_stats.old_new_logprob_abs_delta_mean
+        off_policy_penalty = (
+            self.off_policy_priority_weight
+            * old_new_logprob_coverage
+            * off_policy_drift
+        )
+        if priority_before_off_policy >= 0.0:
+            priority = priority_before_off_policy / (1.0 + off_policy_penalty)
+        else:
+            priority = priority_before_off_policy * (1.0 + off_policy_penalty)
         self._last_train_batch_priority = priority
         self._last_train_batch_policy_lag = policy_lag
         self._last_train_batch_lag_limit = (
@@ -1121,6 +1181,14 @@ class ObjectiveScheduler:
         )
         self._last_train_batch_staleness_urgency = staleness_urgency
         self._last_train_batch_staleness_bonus = staleness_bonus
+        self._last_train_batch_old_new_logprob_coverage = (
+            old_new_logprob_coverage
+        )
+        self._last_train_batch_off_policy_drift = off_policy_drift
+        self._last_train_batch_off_policy_penalty = off_policy_penalty
+        self._last_train_batch_priority_before_off_policy = (
+            priority_before_off_policy
+        )
         self._last_train_batch_reward_improving_experience = (
             batch_reward_improving_experience
         )
@@ -1174,6 +1242,13 @@ class ObjectiveScheduler:
                 "reward_efficiency_weight": self.reward_efficiency_weight,
                 "stale_penalty_weight": self.stale_penalty_weight,
                 "staleness_priority_weight": self.staleness_priority_weight,
+                "off_policy_priority_weight": self.off_policy_priority_weight,
+                "off_policy_cadence_tightening_threshold": (
+                    self.off_policy_cadence_tightening_threshold
+                ),
+                "off_policy_lag_tightening_threshold": (
+                    self.off_policy_lag_tightening_threshold
+                ),
                 "confidence_penalty_weight": self.confidence_penalty_weight,
                 "control_exploration_bonus": self.control_exploration_bonus,
                 "max_control_candidate_values": (
@@ -1263,6 +1338,30 @@ class ObjectiveScheduler:
                 ),
                 "last_train_batch_staleness_bonus": (
                     self._last_train_batch_staleness_bonus
+                ),
+                "last_train_batch_old_new_logprob_coverage": (
+                    self._last_train_batch_old_new_logprob_coverage
+                ),
+                "last_train_batch_off_policy_drift": (
+                    self._last_train_batch_off_policy_drift
+                ),
+                "last_train_batch_off_policy_penalty": (
+                    self._last_train_batch_off_policy_penalty
+                ),
+                "last_train_batch_priority_before_off_policy": (
+                    self._last_train_batch_priority_before_off_policy
+                ),
+                "last_cadence_off_policy_penalty": (
+                    self._last_cadence_off_policy_penalty
+                ),
+                "last_cadence_off_policy_tightened": (
+                    self._last_cadence_off_policy_tightened
+                ),
+                "last_policy_lag_off_policy_penalty": (
+                    self._last_policy_lag_off_policy_penalty
+                ),
+                "last_policy_lag_off_policy_tightened": (
+                    self._last_policy_lag_off_policy_tightened
                 ),
                 "last_train_batch_reward_improving_experience": (
                     self._last_train_batch_reward_improving_experience
@@ -1419,6 +1518,27 @@ class ObjectiveScheduler:
             _state_float(
                 config.get("staleness_priority_weight"),
                 self.staleness_priority_weight,
+            ),
+        )
+        self.off_policy_priority_weight = max(
+            0.0,
+            _state_float(
+                config.get("off_policy_priority_weight"),
+                self.off_policy_priority_weight,
+            ),
+        )
+        self.off_policy_cadence_tightening_threshold = max(
+            0.0,
+            _state_float(
+                config.get("off_policy_cadence_tightening_threshold"),
+                self.off_policy_cadence_tightening_threshold,
+            ),
+        )
+        self.off_policy_lag_tightening_threshold = max(
+            0.0,
+            _state_float(
+                config.get("off_policy_lag_tightening_threshold"),
+                self.off_policy_lag_tightening_threshold,
             ),
         )
         self.confidence_penalty_weight = max(
@@ -1684,6 +1804,38 @@ class ObjectiveScheduler:
             learning_state.get("last_train_batch_staleness_bonus"),
             self._last_train_batch_staleness_bonus,
         )
+        self._last_train_batch_old_new_logprob_coverage = _state_float(
+            learning_state.get("last_train_batch_old_new_logprob_coverage"),
+            self._last_train_batch_old_new_logprob_coverage,
+        )
+        self._last_train_batch_off_policy_drift = _state_float(
+            learning_state.get("last_train_batch_off_policy_drift"),
+            self._last_train_batch_off_policy_drift,
+        )
+        self._last_train_batch_off_policy_penalty = _state_float(
+            learning_state.get("last_train_batch_off_policy_penalty"),
+            self._last_train_batch_off_policy_penalty,
+        )
+        self._last_train_batch_priority_before_off_policy = _state_float(
+            learning_state.get("last_train_batch_priority_before_off_policy"),
+            self._last_train_batch_priority_before_off_policy,
+        )
+        self._last_cadence_off_policy_penalty = _state_float(
+            learning_state.get("last_cadence_off_policy_penalty"),
+            self._last_cadence_off_policy_penalty,
+        )
+        self._last_cadence_off_policy_tightened = _state_bool(
+            learning_state.get("last_cadence_off_policy_tightened"),
+            self._last_cadence_off_policy_tightened,
+        )
+        self._last_policy_lag_off_policy_penalty = _state_float(
+            learning_state.get("last_policy_lag_off_policy_penalty"),
+            self._last_policy_lag_off_policy_penalty,
+        )
+        self._last_policy_lag_off_policy_tightened = _state_bool(
+            learning_state.get("last_policy_lag_off_policy_tightened"),
+            self._last_policy_lag_off_policy_tightened,
+        )
         self._last_train_batch_reward_improving_experience = _state_float(
             learning_state.get("last_train_batch_reward_improving_experience"),
             self._last_train_batch_reward_improving_experience,
@@ -1919,6 +2071,36 @@ class ObjectiveScheduler:
             "scheduler/last_train_batch_staleness_bonus": (
                 self._last_train_batch_staleness_bonus
             ),
+            "scheduler/last_train_batch_old_new_logprob_coverage": (
+                self._last_train_batch_old_new_logprob_coverage
+            ),
+            "scheduler/last_train_batch_off_policy_drift": (
+                self._last_train_batch_off_policy_drift
+            ),
+            "scheduler/last_train_batch_off_policy_penalty": (
+                self._last_train_batch_off_policy_penalty
+            ),
+            "scheduler/last_train_batch_priority_before_off_policy": (
+                self._last_train_batch_priority_before_off_policy
+            ),
+            "scheduler/cadence/last_off_policy_penalty": (
+                self._last_cadence_off_policy_penalty
+            ),
+            "scheduler/cadence/off_policy_tightened": (
+                1.0 if self._last_cadence_off_policy_tightened else 0.0
+            ),
+            "scheduler/cadence/off_policy_tightening_threshold": (
+                self.off_policy_cadence_tightening_threshold
+            ),
+            "scheduler/policy_lag/last_off_policy_penalty": (
+                self._last_policy_lag_off_policy_penalty
+            ),
+            "scheduler/policy_lag/off_policy_tightened": (
+                1.0 if self._last_policy_lag_off_policy_tightened else 0.0
+            ),
+            "scheduler/policy_lag/off_policy_tightening_threshold": (
+                self.off_policy_lag_tightening_threshold
+            ),
             "scheduler/last_train_batch_reward_improving_experience": (
                 self._last_train_batch_reward_improving_experience
             ),
@@ -1936,6 +2118,9 @@ class ObjectiveScheduler:
             "scheduler/weights/stale_penalty": self.stale_penalty_weight,
             "scheduler/weights/staleness_priority": (
                 self.staleness_priority_weight
+            ),
+            "scheduler/weights/off_policy_priority": (
+                self.off_policy_priority_weight
             ),
             "scheduler/weights/confidence_penalty": (
                 self.confidence_penalty_weight
@@ -2179,6 +2364,12 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/old_new_logprob_delta_mean"] = (
                 stats.old_new_logprob_delta_sum / stats.old_new_logprob_pairs
+                if stats.old_new_logprob_pairs
+                else 0.0
+            )
+            metrics[f"{prefix}/old_new_logprob_abs_delta_mean"] = (
+                stats.old_new_logprob_abs_delta_sum
+                / stats.old_new_logprob_pairs
                 if stats.old_new_logprob_pairs
                 else 0.0
             )
@@ -3720,6 +3911,10 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("old_new_logprob_delta_sum"),
             default.old_new_logprob_delta_sum,
         ),
+        old_new_logprob_abs_delta_sum=_state_float(
+            state.get("old_new_logprob_abs_delta_sum"),
+            default.old_new_logprob_abs_delta_sum,
+        ),
         old_reference_logprob_delta_sum=_state_float(
             state.get("old_reference_logprob_delta_sum"),
             default.old_reference_logprob_delta_sum,
@@ -3980,6 +4175,59 @@ def _useful_experience_count(groups: Sequence[TrajectoryGroup]) -> float:
         action_quality(trajectory)
         for group in groups
         for trajectory in group.trajectories
+    )
+
+
+def _groups_action_logprob_stats(
+    groups: Sequence[TrajectoryGroup],
+) -> ActionLogprobStats:
+    action_units = 0
+    old_logprob_units = 0
+    new_logprob_units = 0
+    reference_logprob_units = 0
+    old_logprob_sum = 0.0
+    new_logprob_sum = 0.0
+    reference_logprob_sum = 0.0
+    old_new_pairs = 0
+    old_reference_pairs = 0
+    old_new_logprob_delta_sum = 0.0
+    old_new_logprob_abs_delta_sum = 0.0
+    old_reference_logprob_delta_sum = 0.0
+    importance_ratio_sum = 0.0
+    for group in groups:
+        for trajectory in group.trajectories:
+            stats = action_logprob_stats(trajectory.actions)
+            action_units += stats.action_units
+            old_logprob_units += stats.old_logprob_units
+            new_logprob_units += stats.new_logprob_units
+            reference_logprob_units += stats.reference_logprob_units
+            old_logprob_sum += stats.old_logprob_sum
+            new_logprob_sum += stats.new_logprob_sum
+            reference_logprob_sum += stats.reference_logprob_sum
+            old_new_pairs += stats.old_new_pairs
+            old_reference_pairs += stats.old_reference_pairs
+            old_new_logprob_delta_sum += stats.old_new_logprob_delta_sum
+            old_new_logprob_abs_delta_sum += (
+                stats.old_new_logprob_abs_delta_sum
+            )
+            old_reference_logprob_delta_sum += (
+                stats.old_reference_logprob_delta_sum
+            )
+            importance_ratio_sum += stats.importance_ratio_sum
+    return ActionLogprobStats(
+        action_units=action_units,
+        old_logprob_units=old_logprob_units,
+        new_logprob_units=new_logprob_units,
+        reference_logprob_units=reference_logprob_units,
+        old_logprob_sum=old_logprob_sum,
+        new_logprob_sum=new_logprob_sum,
+        reference_logprob_sum=reference_logprob_sum,
+        old_new_pairs=old_new_pairs,
+        old_reference_pairs=old_reference_pairs,
+        old_new_logprob_delta_sum=old_new_logprob_delta_sum,
+        old_new_logprob_abs_delta_sum=old_new_logprob_abs_delta_sum,
+        old_reference_logprob_delta_sum=old_reference_logprob_delta_sum,
+        importance_ratio_sum=importance_ratio_sum,
     )
 
 

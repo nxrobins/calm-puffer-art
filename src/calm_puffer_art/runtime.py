@@ -781,6 +781,7 @@ class RuntimeTelemetry:
         self.old_new_logprob_pairs = 0
         self.old_reference_logprob_pairs = 0
         self.old_new_logprob_delta_sum = 0.0
+        self.old_new_logprob_abs_delta_sum = 0.0
         self.old_reference_logprob_delta_sum = 0.0
         self.importance_ratio_sum = 0.0
         self.rollout_s = 0.0
@@ -851,6 +852,9 @@ class RuntimeTelemetry:
             )
             self.old_new_logprob_delta_sum += (
                 logprob_stats.old_new_logprob_delta_sum
+            )
+            self.old_new_logprob_abs_delta_sum += (
+                logprob_stats.old_new_logprob_abs_delta_sum
             )
             self.old_reference_logprob_delta_sum += (
                 logprob_stats.old_reference_logprob_delta_sum
@@ -1003,6 +1007,11 @@ class RuntimeTelemetry:
             else 0.0,
             "actions/old_new_logprob_delta_mean": (
                 self.old_new_logprob_delta_sum / self.old_new_logprob_pairs
+                if self.old_new_logprob_pairs
+                else 0.0
+            ),
+            "actions/old_new_logprob_abs_delta_mean": (
+                self.old_new_logprob_abs_delta_sum / self.old_new_logprob_pairs
                 if self.old_new_logprob_pairs
                 else 0.0
             ),
@@ -1162,6 +1171,7 @@ class ControlPlane:
                 train_ring=train_ring,
                 telemetry=telemetry,
                 ready_groups=ready_groups,
+                action_space=action_space,
                 scheduler=scheduler,
             )
         )
@@ -1341,6 +1351,7 @@ class ControlPlane:
         train_ring: TrajectoryRingBuffer,
         telemetry: RuntimeTelemetry,
         ready_groups: deque[TrajectoryGroup],
+        action_space: AdaptiveActionSpace | None,
         scheduler: AdaptiveScheduler | None,
     ) -> None:
         while not stop.is_set():
@@ -1372,6 +1383,11 @@ class ControlPlane:
                     dollar_seconds=rollout_dollar_seconds,
                     queue_wait_dollar_seconds=queue_wait_dollar_seconds,
                 )
+                if action_space is not None:
+                    action_space.update_from_metrics(
+                        scheduler.metrics(),
+                        allow_demotions=False,
+                    )
             ready_groups.extend(result.groups)
 
             target_batch_groups = self._target_train_batch_groups(
