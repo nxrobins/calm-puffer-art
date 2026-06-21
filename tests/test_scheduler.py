@@ -1794,6 +1794,56 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0,
         )
 
+    def test_stale_penalty_uses_estimated_lost_objective_when_available(self):
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="valuable",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=4.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "valuable|token",
+                "scheduler/active_target_train_batch_groups": 2,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="valuable",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_stale_batch(
+            groups=[group],
+            policy_step=3,
+            reason="lagged",
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/stale_experience"], 1.0)
+        self.assertEqual(metrics["scheduler/stale_sample_dollar_seconds"], 2.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/stale_last_lost_reward_improving_experience"],
+            8.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/stale_last_penalty_objective"],
+            -4.0,
+        )
+        self.assertLess(
+            metrics["scheduler/control/policy_lag_1/objective_ema"],
+            metrics["scheduler/arm/valuable_token/marginal_objective_ema"],
+        )
+
     def test_train_objective_scales_by_useful_experience_count(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         useful = tuple(
@@ -3023,7 +3073,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/stale_experience",
             "scheduler/stale_last_penalty_objective",
             "scheduler/stale_last_experience_count",
+            "scheduler/stale_last_lost_reward_improving_experience",
+            "scheduler/stale_last_sample_dollar_seconds",
             "scheduler/stale_last_policy_step",
+            "scheduler/stale_lost_reward_improving_experience",
+            "scheduler/stale_sample_dollar_seconds",
             "scheduler/arm/stale_token/stale_updates",
             "scheduler/arm/stale_token/stale_experience",
             "scheduler/control/cadence_2/stale_updates",

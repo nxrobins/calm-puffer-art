@@ -46,11 +46,12 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It gates the static actor pool with a learned active actor cap, so actor count becomes a runtime control without changing the user-facing rollout API.
 - It can delay actor admission before rollout under downstream queue saturation, then explore and reuse millisecond delay values based on rollout, train, and stale objective feedback.
 - It scores candidate train batches so ready samples with higher estimated objective value train first, cost-normalizing queued batches by explicit sample/API/tool dollar-seconds when present, while applying current trajectory quality so unsafe batches from historically good arms lose priority before training.
-- It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale useful-experience waste before it happens.
+- It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale reward-improving experience waste before it happens.
 - It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
 - It can enable `reward_scale_normalization="arm_range"` for heterogeneous workflows, preserving raw reward telemetry while scale-adjusting rollout and train positive-improvement credit by each arm's observed reward range before control decisions are scored.
 - It credits reward improvement back to active actor-count, cadence, policy-lag, and actor-admission delay values, reports their objective/exploration scores under `scheduler/control/*`, and reuses the higher-value runtime controls.
+- It estimates lost reward-improving experience for stale train-ring drops from arm objective value and sample dollar-seconds, falling back to useful-experience count before value evidence exists.
 - It attributes rollout, train, stale, queue-wait, admission cost, semantic bandwidth, and objective back to individual actor slots under `scheduler/actor/*`, so actor-count control can be audited by marginal actor-slot contribution.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
 - It records verifier failures, user-defined verifier failure modes, reconstruction safety failures, reconstruction drift failure modes, and numeric reconstruction drift summaries as checkpointed scheduler evidence.
@@ -86,7 +87,7 @@ The runtime applies two filters:
 - `TrajectoryGrouper` drops individual trajectories if `latest_step - trajectory.policy_step > max_policy_lag`.
 - `TrajectoryRingBuffer` drops whole `VersionedTrajectoryBatch` objects if their oldest trajectory exceeds `max_policy_lag` by the time the trainer consumes them.
 
-Dropped train batches also call a synchronous discard hook. Schedulers that implement `observe_stale_batch()` receive the discarded groups, policy step, and reason, so stale useful experience becomes negative control feedback instead of only a counter.
+Dropped train batches also call a synchronous discard hook. Schedulers that implement `observe_stale_batch()` receive the discarded groups, policy step, and reason, so stale reward-improving experience becomes negative control feedback instead of only a counter.
 
 Before that drop path fires, the train ring can ask the scheduler to rescore queued non-stale batches at the current policy step. `ObjectiveScheduler` uses the active lag limit stamped onto each batch to add stale-risk priority only to batches with positive estimated objective value, so near-stale useful experience can train ahead of lower-risk work without rewarding low-value stale churn.
 
@@ -142,7 +143,7 @@ Phase 1: Runtime bridge
 - Consume high-priority train batches before lower-value ready batches while preserving bounded staleness.
 - Use verifier/reconstruction feedback to penalize unsafe action granularities before they affect rollout selection or train-batch priority.
 - Assign train-step policy-improvement credit back to the rollout/action arms that generated the consumed trajectories.
-- Feed stale train-batch drops back into scheduler arm, cadence, and policy-lag objective memory as negative experience.
+- Feed stale train-batch drops back into scheduler arm, cadence, and policy-lag objective memory as lost reward-improving experience.
 - Gate checkpoint publication on programmable promotion decisions and feed the promotion-effective score into scheduler train credit.
 - Make cadence pressure-aware so saturated trainers receive larger batches unless the objective signal justifies tighter updates.
 - Promote larger chunk codecs online when smaller chunks have live pull evidence, positive objective signal, observed semantic bandwidth, and acceptable quality.

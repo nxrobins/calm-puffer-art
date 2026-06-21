@@ -413,6 +413,8 @@ class ObjectiveScheduler:
         self._previous_accounted_dollar_seconds = 0.0
         self._last_stale_penalty_objective = 0.0
         self._last_stale_experience_count = 0.0
+        self._last_stale_lost_reward_improving_experience = 0.0
+        self._last_stale_sample_dollar_seconds = 0.0
         self._last_stale_policy_step = -1
         self._last_stale_reason = ""
         self._last_decision: SchedulerDecision | None = None
@@ -445,6 +447,8 @@ class ObjectiveScheduler:
         self._stale_batches = 0
         self._stale_trajectories = 0
         self._stale_experience = 0.0
+        self._stale_lost_reward_improving_experience = 0.0
+        self._stale_sample_dollar_seconds = 0.0
         self._cadence_controls: dict[int, ControlStats] = {}
         self._lag_controls: dict[int, ControlStats] = {}
         self._admission_controls: dict[int, ControlStats] = {}
@@ -973,17 +977,33 @@ class ObjectiveScheduler:
         stale_cost = _groups_sample_dollar_seconds(groups)
         if stale_cost <= 0.0:
             stale_cost = max(stale_experience, 1.0)
+        lost_reward_improving_experience = (
+            self._estimate_stale_lost_reward_improving_experience(
+                groups,
+                stale_cost=stale_cost,
+                stale_experience=stale_experience,
+            )
+        )
+        penalty_experience = (
+            lost_reward_improving_experience
+            if lost_reward_improving_experience > 0.0
+            else stale_experience
+        )
         penalty_objective = -(
             self.stale_penalty_weight
-            * stale_experience
+            * penalty_experience
             / max(stale_cost, 1e-12)
         )
 
         self._stale_batches += 1
         self._stale_trajectories += stale_trajectories
         self._stale_experience += stale_experience
+        self._stale_lost_reward_improving_experience += penalty_experience
+        self._stale_sample_dollar_seconds += stale_cost
         self._last_stale_penalty_objective = penalty_objective
         self._last_stale_experience_count = stale_experience
+        self._last_stale_lost_reward_improving_experience = penalty_experience
+        self._last_stale_sample_dollar_seconds = stale_cost
         self._last_stale_policy_step = policy_step
         self._last_stale_reason = str(reason)
 
@@ -1198,6 +1218,12 @@ class ObjectiveScheduler:
                     self._last_stale_penalty_objective
                 ),
                 "last_stale_experience_count": self._last_stale_experience_count,
+                "last_stale_lost_reward_improving_experience": (
+                    self._last_stale_lost_reward_improving_experience
+                ),
+                "last_stale_sample_dollar_seconds": (
+                    self._last_stale_sample_dollar_seconds
+                ),
                 "last_stale_policy_step": self._last_stale_policy_step,
                 "last_stale_reason": self._last_stale_reason,
                 "last_train_batch_priority": self._last_train_batch_priority,
@@ -1256,6 +1282,12 @@ class ObjectiveScheduler:
                 "stale_batches": self._stale_batches,
                 "stale_trajectories": self._stale_trajectories,
                 "stale_experience": self._stale_experience,
+                "stale_lost_reward_improving_experience": (
+                    self._stale_lost_reward_improving_experience
+                ),
+                "stale_sample_dollar_seconds": (
+                    self._stale_sample_dollar_seconds
+                ),
             },
             "arms": {
                 arm_id: _arm_stats_state(stats)
@@ -1588,6 +1620,16 @@ class ObjectiveScheduler:
             learning_state.get("last_stale_experience_count"),
             self._last_stale_experience_count,
         )
+        self._last_stale_lost_reward_improving_experience = _state_float(
+            learning_state.get(
+                "last_stale_lost_reward_improving_experience"
+            ),
+            self._last_stale_lost_reward_improving_experience,
+        )
+        self._last_stale_sample_dollar_seconds = _state_float(
+            learning_state.get("last_stale_sample_dollar_seconds"),
+            self._last_stale_sample_dollar_seconds,
+        )
         self._last_stale_policy_step = _state_int(
             learning_state.get("last_stale_policy_step"),
             self._last_stale_policy_step,
@@ -1707,6 +1749,14 @@ class ObjectiveScheduler:
             learning_state.get("stale_experience"),
             self._stale_experience,
         )
+        self._stale_lost_reward_improving_experience = _state_float(
+            learning_state.get("stale_lost_reward_improving_experience"),
+            self._stale_lost_reward_improving_experience,
+        )
+        self._stale_sample_dollar_seconds = _state_float(
+            learning_state.get("stale_sample_dollar_seconds"),
+            self._stale_sample_dollar_seconds,
+        )
         self._last_decision = None
         self._last_decision_snapshot = _decision_state_from_mapping(
             state.get("last_decision")
@@ -1810,11 +1860,23 @@ class ObjectiveScheduler:
             "scheduler/stale_batches": float(self._stale_batches),
             "scheduler/stale_trajectories": float(self._stale_trajectories),
             "scheduler/stale_experience": self._stale_experience,
+            "scheduler/stale_lost_reward_improving_experience": (
+                self._stale_lost_reward_improving_experience
+            ),
+            "scheduler/stale_sample_dollar_seconds": (
+                self._stale_sample_dollar_seconds
+            ),
             "scheduler/stale_last_penalty_objective": (
                 self._last_stale_penalty_objective
             ),
             "scheduler/stale_last_experience_count": (
                 self._last_stale_experience_count
+            ),
+            "scheduler/stale_last_lost_reward_improving_experience": (
+                self._last_stale_lost_reward_improving_experience
+            ),
+            "scheduler/stale_last_sample_dollar_seconds": (
+                self._last_stale_sample_dollar_seconds
             ),
             "scheduler/stale_last_policy_step": float(self._last_stale_policy_step),
             "scheduler/last_train_batch_priority": self._last_train_batch_priority,
@@ -2482,6 +2544,37 @@ class ObjectiveScheduler:
             return
         stats.min_train_reward = min(stats.min_train_reward, reward)
         stats.max_train_reward = max(stats.max_train_reward, reward)
+
+    def _estimate_stale_lost_reward_improving_experience(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        stale_cost: float,
+        stale_experience: float,
+    ) -> float:
+        lost_experience = 0.0
+        explicit_cost = _groups_sample_dollar_seconds(groups)
+        for group in groups:
+            for trajectory in group.trajectories:
+                quality = action_quality(trajectory)
+                if quality <= 0.0:
+                    continue
+                arm_id = str(
+                    trajectory.metadata.get("scheduler/arm_id", "unassigned")
+                )
+                stats = self._arms.get(arm_id)
+                if stats is None:
+                    continue
+                objective = max(0.0, self._arm_value(stats))
+                if objective <= 0.0:
+                    continue
+                trajectory_cost = _trajectory_sample_dollar_seconds(trajectory)
+                if trajectory_cost <= 0.0:
+                    if explicit_cost > 0.0 or stale_experience <= 0.0:
+                        continue
+                    trajectory_cost = stale_cost * quality / stale_experience
+                lost_experience += objective * trajectory_cost
+        return lost_experience
 
     def _credit_objective_to_arms(
         self,
