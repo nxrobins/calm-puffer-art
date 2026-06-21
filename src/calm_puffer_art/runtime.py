@@ -1528,6 +1528,32 @@ class ControlPlane:
             try:
                 trajectory = await workflow(snapshot.policy, decision.scenario, context)
                 trajectory.duration_s = time.perf_counter() - started
+            except asyncio.CancelledError as exc:
+                trajectory = Trajectory(
+                    scenario_id=decision.scenario.id,
+                    policy_step=snapshot.step,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                    duration_s=time.perf_counter() - started,
+                    exception=f"{type(exc).__name__}: rollout cancelled before submission",
+                    metadata={"actor_id": actor_id},
+                )
+                self._tag_rollout_control_metadata(
+                    trajectory,
+                    actor_id=actor_id,
+                    decision=decision,
+                    active_actor_count=active_actor_count,
+                    admission_delay_s=admission_delay_s,
+                )
+                self._stamp_reserved_rollout_dollar_seconds(trajectory)
+                self._observe_abandoned_rollout(
+                    trajectory,
+                    telemetry=telemetry,
+                    scheduler=scheduler,
+                    action_space=action_space,
+                )
+                raise
             except Exception as exc:
                 trajectory = Trajectory(
                     scenario_id=decision.scenario.id,
@@ -1539,55 +1565,13 @@ class ControlPlane:
                     exception=f"{type(exc).__name__}: {exc}",
                     metadata={"actor_id": actor_id},
                 )
-            trajectory.metadata.setdefault("actor_id", actor_id)
-            trajectory.metadata.setdefault("scheduler/arm_id", decision.arm_id)
-            trajectory.metadata.setdefault("scheduler/scenario_id", decision.scenario.id)
-            trajectory.metadata.setdefault(
-                "scheduler/action_codec",
-                getattr(decision.action_codec, "name", decision.action_codec.__class__.__name__),
+            self._tag_rollout_control_metadata(
+                trajectory,
+                actor_id=actor_id,
+                decision=decision,
+                active_actor_count=active_actor_count,
+                admission_delay_s=admission_delay_s,
             )
-            trajectory.metadata.setdefault(
-                "scheduler/target_train_batch_groups",
-                decision.target_train_batch_groups,
-            )
-            trajectory.metadata.setdefault(
-                "scheduler/max_policy_lag",
-                decision.max_policy_lag,
-            )
-            trajectory.metadata.setdefault(
-                "scheduler/active_actor_count",
-                active_actor_count,
-            )
-            for key in (
-                "expected_rollout_dollar_seconds",
-                "estimated_rollout_dollar_seconds",
-                "reserved_rollout_dollar_seconds",
-                "unobserved_rollout_cost_penalty",
-            ):
-                value = decision.metadata.get(key)
-                if isinstance(value, bool):
-                    continue
-                if isinstance(value, (int, float)) and isfinite(float(value)):
-                    trajectory.metadata.setdefault(
-                        f"scheduler/decision/{key}",
-                        float(value),
-                    )
-            admission_delay_ms = max(0, int(round(admission_delay_s * 1000.0)))
-            trajectory.metadata.setdefault(
-                "scheduler/active_rollout_admission_delay_ms",
-                admission_delay_ms,
-            )
-            trajectory.metadata.setdefault(
-                "scheduler/active_rollout_admission_delay_s",
-                admission_delay_s,
-            )
-            admission_dollar_seconds = (
-                admission_delay_s * self.config.cost_per_second_usd
-            )
-            if admission_dollar_seconds > 0.0:
-                trajectory.metrics["cost/actor_admission_dollar_seconds"] = (
-                    admission_dollar_seconds
-                )
             self._stamp_rollout_dollar_seconds(trajectory)
 
             queue_started = time.perf_counter()
@@ -1600,6 +1584,96 @@ class ControlPlane:
             # Let batcher feedback update scheduler controls before this actor
             # admits more rollout spend.
             await asyncio.sleep(0)
+
+    def _tag_rollout_control_metadata(
+        self,
+        trajectory: Trajectory,
+        *,
+        actor_id: int,
+        decision: SchedulerDecision,
+        active_actor_count: int,
+        admission_delay_s: float,
+    ) -> None:
+        trajectory.metadata.setdefault("actor_id", actor_id)
+        trajectory.metadata.setdefault("scheduler/arm_id", decision.arm_id)
+        trajectory.metadata.setdefault("scheduler/scenario_id", decision.scenario.id)
+        trajectory.metadata.setdefault(
+            "scheduler/action_codec",
+            action_codec_key(decision.action_codec),
+        )
+        trajectory.metadata.setdefault(
+            "scheduler/target_train_batch_groups",
+            decision.target_train_batch_groups,
+        )
+        trajectory.metadata.setdefault(
+            "scheduler/max_policy_lag",
+            decision.max_policy_lag,
+        )
+        trajectory.metadata.setdefault(
+            "scheduler/active_actor_count",
+            active_actor_count,
+        )
+        for key in (
+            "expected_rollout_dollar_seconds",
+            "estimated_rollout_dollar_seconds",
+            "reserved_rollout_dollar_seconds",
+            "unobserved_rollout_cost_penalty",
+        ):
+            value = decision.metadata.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and isfinite(float(value)):
+                trajectory.metadata.setdefault(
+                    f"scheduler/decision/{key}",
+                    float(value),
+                )
+        admission_delay_ms = max(0, int(round(admission_delay_s * 1000.0)))
+        trajectory.metadata.setdefault(
+            "scheduler/active_rollout_admission_delay_ms",
+            admission_delay_ms,
+        )
+        trajectory.metadata.setdefault(
+            "scheduler/active_rollout_admission_delay_s",
+            admission_delay_s,
+        )
+        admission_dollar_seconds = (
+            admission_delay_s * self.config.cost_per_second_usd
+        )
+        if admission_dollar_seconds > 0.0:
+            trajectory.metrics["cost/actor_admission_dollar_seconds"] = (
+                admission_dollar_seconds
+            )
+
+    def _observe_abandoned_rollout(
+        self,
+        trajectory: Trajectory,
+        *,
+        telemetry: RuntimeTelemetry,
+        scheduler: AdaptiveScheduler | None,
+        action_space: AdaptiveActionSpace | None,
+    ) -> None:
+        rollout_dollar_seconds = self._trajectory_dollar_seconds(trajectory)
+        telemetry.record_trajectory(
+            trajectory,
+            accepted=False,
+            dollar_seconds=rollout_dollar_seconds,
+        )
+        if scheduler is None:
+            return
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=False,
+            dollar_seconds=rollout_dollar_seconds,
+            queue_wait_dollar_seconds=self._trajectory_queue_wait_dollar_seconds(
+                trajectory
+            ),
+        )
+        if action_space is not None:
+            action_space.update_from_metrics(
+                scheduler.metrics(),
+                allow_promotions=False,
+                allow_demotions=True,
+            )
 
     async def _get_train_batch_or_stop(
         self,
@@ -1935,6 +2009,31 @@ class ControlPlane:
         trajectory.metrics["rollout/dollar_seconds"] = (
             max(0.0, trajectory.duration_s) * self.config.cost_per_second_usd
         )
+
+    def _stamp_reserved_rollout_dollar_seconds(self, trajectory: Trajectory) -> None:
+        explicit_cost = _first_nonnegative_float(
+            trajectory.metrics,
+            ("cost/dollar_seconds", "rollout/dollar_seconds"),
+        )
+        if explicit_cost is None:
+            explicit_cost = _first_nonnegative_float(
+                trajectory.metadata,
+                ("cost/dollar_seconds", "rollout/dollar_seconds"),
+            )
+        if explicit_cost is not None:
+            return
+        reserved_cost = _first_nonnegative_float(
+            trajectory.metadata,
+            (
+                "scheduler/decision/reserved_rollout_dollar_seconds",
+                "scheduler/decision/estimated_rollout_dollar_seconds",
+                "scheduler/decision/expected_rollout_dollar_seconds",
+            ),
+        )
+        if reserved_cost is not None:
+            trajectory.metrics["rollout/dollar_seconds"] = reserved_cost
+            return
+        self._stamp_rollout_dollar_seconds(trajectory)
 
     def _trajectory_queue_wait_dollar_seconds(self, trajectory: Trajectory) -> float:
         explicit_cost = _first_nonnegative_float(

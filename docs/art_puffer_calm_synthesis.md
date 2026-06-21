@@ -42,6 +42,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It estimates marginal reward improvement per dollar-second for each arm.
 - It explores untried arms, then prefers arms with better objective estimates.
 - It reserves in-flight rollout decisions so concurrent actors explore distinct untried arms before feedback arrives.
+- It records local actor cancellation after rollout reservation as zero-reward failed experience, releases the reservation, and accounts reserved or explicit rollout spend instead of leaving projected budget stuck.
 - It orders untried arms by estimated rollout dollar-seconds when related scenario, codec, or global sample-cost evidence exists, so first-time exploration is still guaranteed but early spend is not blind to cost.
 - It can enforce an opt-in `min_rollout_coverage_fraction` after the initial sweep, temporarily selecting the most under-covered arm so diagnostic workflows and action granularities keep receiving bounded live evidence, while `max_rollout_coverage_cost_fraction` prevents that override from overspending on an already expensive arm.
 - It gates the static actor pool with a learned active actor cap, so actor count becomes a runtime control without changing the user-facing rollout API; saturation and low-ROI backoff are initial preferences that actor-count feedback can override after the cap has been scored.

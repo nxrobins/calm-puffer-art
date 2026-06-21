@@ -1453,6 +1453,88 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(summary.metrics["scheduler/budget/accounted_exhausted"], 1.0)
         self.assertEqual(summary.pending_trajectories, 2)
 
+    def test_control_plane_accounts_cancelled_inflight_rollouts_on_shutdown(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=10.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="cancelled-rollout",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "cancelled-rollout|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=2,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            slow_started = asyncio.Event()
+            never_finish = asyncio.Event()
+            fast_calls = 0
+
+            async def rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal fast_calls
+                if context.actor_id == 1:
+                    slow_started.set()
+                    await never_finish.wait()
+                fast_calls += 1
+                if fast_calls > 1:
+                    await never_finish.wait()
+                await asyncio.wait_for(slow_started.wait(), timeout=0.5)
+                trajectory = await flat_rollout(policy, scenario, context)
+                trajectory.metrics["rollout/dollar_seconds"] = 1.0
+                return trajectory
+
+            return await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="cancelled-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertGreaterEqual(summary.metrics["data/trajectories_failed"], 1.0)
+        self.assertGreaterEqual(summary.metrics["scheduler/failure_rollouts"], 1.0)
+        self.assertEqual(summary.metrics["scheduler/total_inflight_rollouts"], 0.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            3.0,
+        )
+
     def test_control_plane_uses_explicit_train_dollar_seconds(self):
         async def run():
             scheduler = ObjectiveScheduler(
