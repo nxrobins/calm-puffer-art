@@ -320,6 +320,7 @@ class AsyncArtBackend:
         self._actor_admission_delay_s = 0.0
         self._actor_admission_dollar_seconds = 0.0
         self._sample_dollar_seconds = 0.0
+        self._failed_rollouts = 0
         self._published_policy_updates = 0
         self._published_policy_improvement = 0.0
         self._published_policy_reward_improving_experience = 0.0
@@ -585,6 +586,83 @@ class AsyncArtBackend:
             decision=decision,
             metadata=metadata,
         )
+
+    def record_rollout_failure(
+        self,
+        assignment: ArtRolloutAssignment,
+        *,
+        exception: BaseException | str | None = None,
+        dollar_seconds: float | None = None,
+        queue_wait_dollar_seconds: float = 0.0,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Trajectory:
+        """Observe an admitted external rollout that failed before submission.
+
+        External producer pools should call this when an assignment returned by
+        :meth:`admit_and_select_rollout` is abandoned or crashes before a real
+        ART trajectory can be submitted. The scheduler treats it as failed
+        experience, releases the in-flight reservation, and accounts the spend.
+        """
+
+        if not assignment.admitted or assignment.decision is None:
+            raise ValueError("assignment must be admitted and carry a decision")
+        decision = assignment.decision
+        failure_metadata = dict(assignment.metadata)
+        if metadata is not None:
+            failure_metadata.update(metadata)
+        failure_metadata.setdefault("scenario_id", decision.scenario.id)
+        failure_metadata.setdefault("scheduler/scenario_id", decision.scenario.id)
+        failure_metadata.setdefault("scheduler/arm_id", decision.arm_id)
+        failure_metadata.setdefault(
+            "scheduler/action_codec",
+            action_codec_key(decision.action_codec),
+        )
+        failure_metadata["scheduler/rollout_failed_before_submit"] = True
+        failure_metadata.setdefault("failure/mode", "rollout_failed_before_submit")
+
+        rollout_cost = _failure_rollout_dollar_seconds(
+            failure_metadata,
+            dollar_seconds=dollar_seconds,
+        )
+        queue_wait_cost = _validated_nonnegative_float(
+            queue_wait_dollar_seconds,
+            name="queue_wait_dollar_seconds",
+        )
+        metrics = {"rollout/dollar_seconds": rollout_cost}
+        if queue_wait_cost > 0.0:
+            metrics["cost/actor_queue_wait_dollar_seconds"] = queue_wait_cost
+
+        policy_step = _optional_int(failure_metadata.get("scheduler/policy_step"))
+        if policy_step is None:
+            policy_step = self._current_step
+        failure = Trajectory(
+            scenario_id=decision.scenario.id,
+            policy_step=policy_step,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            metrics=metrics,
+            metadata=failure_metadata,
+            duration_s=0.0,
+            exception=_failure_exception_text(exception),
+        )
+
+        self._failed_rollouts += 1
+        self._sample_dollar_seconds += _trajectory_sample_dollar_seconds(failure)
+        if self.scheduler is not None:
+            self.scheduler.observe_rollout(
+                failure,
+                accepted=False,
+                dollar_seconds=rollout_cost,
+                queue_wait_dollar_seconds=queue_wait_cost,
+            )
+            if self.action_space is not None:
+                self.action_space.update_from_metrics(
+                    self.scheduler.metrics(),
+                    allow_promotions=False,
+                    allow_demotions=True,
+                )
+        return failure
 
     def active_actor_count(
         self,
@@ -948,6 +1026,7 @@ class AsyncArtBackend:
             self._actor_admission_dollar_seconds
         )
         stats["art_backend/sample_dollar_seconds"] = self._sample_dollar_seconds
+        stats["art_backend/failed_rollouts"] = float(self._failed_rollouts)
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
         stats["art_backend/submitted_batches_per_s"] = (
             self._submitted_batches / wall_s
@@ -1763,6 +1842,45 @@ def _trajectory_admission_seconds(
     if cost_per_second_usd > 0.0:
         return admission_cost / cost_per_second_usd
     return 0.0
+
+
+def _failure_rollout_dollar_seconds(
+    metadata: Mapping[str, Any],
+    *,
+    dollar_seconds: float | None,
+) -> float:
+    if dollar_seconds is not None:
+        return _validated_nonnegative_float(
+            dollar_seconds,
+            name="dollar_seconds",
+        )
+    reserved = _first_nonnegative_mapping_float(
+        metadata,
+        (
+            "scheduler/decision/reserved_rollout_dollar_seconds",
+            "scheduler/decision/estimated_rollout_dollar_seconds",
+            "scheduler/decision/expected_rollout_dollar_seconds",
+        ),
+    )
+    return reserved or 0.0
+
+
+def _validated_nonnegative_float(value: float, *, name: str) -> float:
+    candidate = float(value)
+    if not isfinite(candidate) or candidate < 0.0:
+        raise ValueError(f"{name} must be a finite non-negative value")
+    return candidate
+
+
+def _failure_exception_text(exception: BaseException | str | None) -> str:
+    if exception is None:
+        return "rollout_failed_before_submit"
+    if isinstance(exception, BaseException):
+        text = str(exception)
+        if text:
+            return f"{type(exception).__name__}: {text}"
+        return type(exception).__name__
+    return str(exception) or "rollout_failed_before_submit"
 
 
 def _first_nonnegative_mapping_float(
