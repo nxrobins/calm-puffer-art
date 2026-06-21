@@ -252,7 +252,7 @@ The scheduler uses the same numerator shape for train feedback. It reports `sche
 The runtime also reports attributed cost telemetry:
 
 - `costs/wall_clock_dollar_seconds`: elapsed runtime multiplied by configured infrastructure cost.
-- `costs/rollout_dollar_seconds`: summed explicit rollout costs from `cost/dollar_seconds` or `rollout/dollar_seconds`, falling back to rollout duration multiplied by configured cost.
+- `costs/rollout_dollar_seconds`: summed rollout-only costs from `rollout/dollar_seconds`, from total `cost/dollar_seconds` after subtracting separately stamped queue-wait and admission-delay cost, or from rollout duration multiplied by configured cost.
 - `costs/trainer_dollar_seconds`: summed explicit train costs from `cost/dollar_seconds`, `train/dollar_seconds`, or `trainer/dollar_seconds`, falling back to trainer duration multiplied by configured cost.
 - `costs/trainer_wait_dollar_seconds`: trainer-side time spent waiting for a ready train batch.
 - `costs/promotion_eval_dollar_seconds`: promotion-gate evaluation spend, including held-out workflow rollouts or custom evaluator cost.
@@ -284,7 +284,7 @@ Implemented now:
 - Online action-space promotion and retirement across chunk codecs.
 - Action-space `state_dict()` / `load_state_dict()` snapshot and restore for resumable semantic-bandwidth control.
 - Train-step policy-improvement credit assignment back to rollout/action arms.
-- Explicit rollout dollar-second overrides for API/token/tool/GPU cost accounting.
+- Explicit total sample and rollout-only dollar-second overrides for API/token/tool/GPU cost accounting.
 - Explicit train dollar-second overrides for trainer/API/GPU cost accounting.
 - Pressure-aware train cadence that widens low-ROI batches under trainer saturation.
 - Rollout, trainer, queue-wait, wall-clock, and accounted cost telemetry.

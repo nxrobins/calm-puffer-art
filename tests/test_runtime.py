@@ -1923,6 +1923,56 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("rollout/dollar_seconds", explicit.metrics)
         self.assertEqual(runtime._trajectory_dollar_seconds(explicit), 9.0)
 
+    def test_runtime_dedupes_total_sample_cost_from_wait_costs(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=100.0))
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=9.0,
+            metrics={
+                "cost/dollar_seconds": 10.0,
+                "cost/actor_queue_wait_dollar_seconds": 3.0,
+                "cost/actor_admission_dollar_seconds": 2.0,
+            },
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+
+        rollout_cost = runtime._trajectory_dollar_seconds(trajectory)
+        queue_cost = runtime._trajectory_queue_wait_dollar_seconds(trajectory)
+        admission_cost = runtime._trajectory_admission_dollar_seconds(trajectory)
+
+        self.assertEqual(rollout_cost, 5.0)
+        self.assertEqual(queue_cost, 3.0)
+        self.assertEqual(admission_cost, 2.0)
+
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        scheduler.observe_rollout_admission_delay(
+            seconds=0.02,
+            dollar_seconds=admission_cost,
+        )
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=rollout_cost,
+            queue_wait_dollar_seconds=queue_cost,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/costs/rollout_dollar_seconds"], 5.0)
+        self.assertEqual(metrics["scheduler/costs/queue_wait_dollar_seconds"], 3.0)
+        self.assertEqual(
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(metrics["scheduler/budget/accounted_dollar_seconds"], 10.0)
+        self.assertEqual(
+            metrics["scheduler/arm/costed_token/mean_sample_dollar_seconds"],
+            10.0,
+        )
+
     def test_runtime_applies_scheduler_rollout_admission_delay_before_work(self):
         async def run():
             runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))

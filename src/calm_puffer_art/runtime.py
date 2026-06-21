@@ -1991,17 +1991,34 @@ class ControlPlane:
         )
 
     def _trajectory_dollar_seconds(self, trajectory: Trajectory) -> float:
-        explicit_cost = _first_nonnegative_float(
+        explicit_total = _first_nonnegative_float(
             trajectory.metrics,
-            ("cost/dollar_seconds", "rollout/dollar_seconds"),
+            ("cost/dollar_seconds",),
         )
-        if explicit_cost is None:
-            explicit_cost = _first_nonnegative_float(
+        if explicit_total is None:
+            explicit_total = _first_nonnegative_float(
                 trajectory.metadata,
-                ("cost/dollar_seconds", "rollout/dollar_seconds"),
+                ("cost/dollar_seconds",),
             )
-        if explicit_cost is not None:
-            return explicit_cost
+        if explicit_total is not None:
+            return max(
+                0.0,
+                explicit_total
+                - self._trajectory_queue_wait_dollar_seconds(trajectory)
+                - self._trajectory_admission_dollar_seconds(trajectory),
+            )
+
+        explicit_rollout_cost = _first_nonnegative_float(
+            trajectory.metrics,
+            ("rollout/dollar_seconds",),
+        )
+        if explicit_rollout_cost is None:
+            explicit_rollout_cost = _first_nonnegative_float(
+                trajectory.metadata,
+                ("rollout/dollar_seconds",),
+            )
+        if explicit_rollout_cost is not None:
+            return explicit_rollout_cost
         return max(0.0, trajectory.duration_s) * self.config.cost_per_second_usd
 
     def _stamp_rollout_dollar_seconds(self, trajectory: Trajectory) -> None:
@@ -2056,6 +2073,21 @@ class ControlPlane:
                 (
                     "cost/actor_queue_wait_dollar_seconds",
                     "queue_wait/dollar_seconds",
+                ),
+            )
+        return explicit_cost or 0.0
+
+    def _trajectory_admission_dollar_seconds(self, trajectory: Trajectory) -> float:
+        explicit_cost = _first_nonnegative_float(
+            trajectory.metrics,
+            ("cost/actor_admission_dollar_seconds", "admission/dollar_seconds"),
+        )
+        if explicit_cost is None:
+            explicit_cost = _first_nonnegative_float(
+                trajectory.metadata,
+                (
+                    "cost/actor_admission_dollar_seconds",
+                    "admission/dollar_seconds",
                 ),
             )
         return explicit_cost or 0.0

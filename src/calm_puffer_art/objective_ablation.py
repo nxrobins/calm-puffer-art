@@ -81,7 +81,7 @@ async def ablation_rollout(
         messages=messages,
         actions=actions,
         reward=reward,
-        metrics={"cost/dollar_seconds": rollout_cost},
+        metrics={"rollout/dollar_seconds": rollout_cost},
     )
 
 
@@ -106,7 +106,7 @@ async def action_space_ablation_rollout(
         messages=messages,
         actions=actions,
         reward=reward,
-        metrics={"cost/dollar_seconds": rollout_cost},
+        metrics={"rollout/dollar_seconds": rollout_cost},
     )
 
 
