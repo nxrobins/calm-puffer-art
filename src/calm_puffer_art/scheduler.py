@@ -641,6 +641,10 @@ class ObjectiveScheduler:
         if (
             preferred == upper
             and not self._has_positive_objective_signal()
+            and not self._control_family_has_feedback(
+                self._cadence_controls,
+                candidates,
+            )
         ):
             return self._record_control_decision(self._cadence_controls, upper)
         return self._record_control_decision(
@@ -3486,6 +3490,17 @@ class ObjectiveScheduler:
                 fraction = index / (self.max_control_candidate_values - 1)
                 values.add(round(min_value + (upper - min_value) * fraction))
         return tuple(sorted(value for value in values if min_value <= value <= upper))
+
+    @staticmethod
+    def _control_family_has_feedback(
+        controls: Mapping[int, ControlStats],
+        candidates: Sequence[int],
+    ) -> bool:
+        return any(
+            _control_feedback_updates(controls[value]) > 0
+            for value in candidates
+            if value in controls
+        )
 
     def _select_control_value(
         self,

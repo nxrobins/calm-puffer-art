@@ -1191,6 +1191,52 @@ class ObjectiveSchedulerTests(unittest.TestCase):
 
         self.assertEqual(target, 4)
 
+    def test_train_pressure_uses_cadence_feedback_after_stale_waste(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            exploration_bonus=0.0,
+        )
+        stale = Trajectory(
+            scenario_id="pressure",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={
+                "scheduler/arm_id": "pressure|token",
+                "scheduler/active_target_train_batch_groups": 4,
+            },
+        )
+
+        scheduler.observe_stale_batch(
+            groups=[
+                TrajectoryGroup(
+                    scenario_id="pressure",
+                    trajectories=(stale,),
+                )
+            ],
+            policy_step=1,
+            reason="pressure_cadence_waste",
+        )
+        target = scheduler.target_train_batch_groups(
+            configured=2,
+            pending_groups=0,
+            train_queue_pressure=0.9,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertNotEqual(target, 4)
+        self.assertLess(
+            metrics["scheduler/control/cadence_4/objective_ema"],
+            0.0,
+        )
+        self.assertEqual(
+            metrics[f"scheduler/control/cadence_{target}/decisions"],
+            1.0,
+        )
+
     def test_control_selection_explores_untried_runtime_values(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,

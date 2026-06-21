@@ -57,7 +57,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
 - It records verifier failures, user-defined verifier failure modes, reconstruction safety failures, reconstruction drift failure modes, and numeric reconstruction drift summaries as checkpointed scheduler evidence.
 - It explores train-batch cadence candidates after the configured default, then tightens or widens cadence according to reward-improving experience per dollar-second.
-- It widens train-batch cadence under trainer saturation when there is no positive objective signal, reducing low-ROI tiny-batch churn.
+- It widens train-batch cadence under trainer saturation before cadence feedback exists, then lets train and stale objective feedback override pressured widening when a wider batch wastes reward-improving experience.
 - It explores policy-lag candidates after the configured default, while preserving the configured allowance until known arms have accepted samples, then reuses lag values with stronger objective credit.
 - It keeps the configured lag while known arms still lack accepted samples, so exploration is not starved by stale-sample filtering.
 - It can stop training early when `roi_patience` is configured and either train-step objective or accounted interval objective stays below threshold, or when `max_accounted_dollar_seconds` exhausts the configured rollout/train/promotion spend envelope.
