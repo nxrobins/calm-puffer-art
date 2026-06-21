@@ -159,6 +159,10 @@ class ArmStats:
     stale_trajectories: int = 0
     reward_ema: float = 0.0
     effective_reward_ema: float = 0.0
+    min_effective_reward: float = 0.0
+    max_effective_reward: float = 0.0
+    last_reward_scale: float = 1.0
+    last_normalized_positive_improvement: float = 0.0
     action_quality_ema: float = 1.0
     reward_efficiency_ema: float = 0.0
     marginal_objective_ema: float = 0.0
@@ -167,12 +171,19 @@ class ArmStats:
     objective_mean: float = 0.0
     objective_m2: float = 0.0
     dollar_seconds_ema: float = 0.0
+    train_reward_observations: int = 0
+    min_train_reward: float = 0.0
+    max_train_reward: float = 0.0
     last_train_reward: float = 0.0
+    last_train_reward_scale: float = 1.0
     last_train_reward_improvement: float = 0.0
+    last_normalized_train_reward_improvement: float = 0.0
     total_reward: float = 0.0
     total_effective_reward: float = 0.0
     total_positive_improvement: float = 0.0
+    total_normalized_positive_improvement: float = 0.0
     total_reward_improving_experience: float = 0.0
+    total_normalized_reward_improving_experience: float = 0.0
     total_policy_improvement_objective: float = 0.0
     total_stale_penalty_objective: float = 0.0
     total_dollar_seconds: float = 0.0
@@ -267,6 +278,7 @@ class ObjectiveScheduler:
         rollout_admission_pressure_threshold: float = 0.75,
         rollout_admission_positive_signal_scale: float = 0.25,
         reconstruction_drift_threshold: float = 0.95,
+        reward_scale_normalization: str = "none",
     ) -> None:
         if min_train_batch_groups <= 0:
             raise ValueError("min_train_batch_groups must be positive")
@@ -338,6 +350,10 @@ class ObjectiveScheduler:
             )
         if not 0 <= reconstruction_drift_threshold <= 1:
             raise ValueError("reconstruction_drift_threshold must be in [0, 1]")
+        if reward_scale_normalization not in {"none", "arm_range"}:
+            raise ValueError(
+                "reward_scale_normalization must be 'none' or 'arm_range'"
+            )
         self.min_train_batch_groups = min_train_batch_groups
         self.max_train_batch_groups = max_train_batch_groups
         self.min_policy_lag = min_policy_lag
@@ -374,6 +390,7 @@ class ObjectiveScheduler:
             rollout_admission_positive_signal_scale
         )
         self.reconstruction_drift_threshold = reconstruction_drift_threshold
+        self.reward_scale_normalization = reward_scale_normalization
         self._arms: dict[str, ArmStats] = {}
         self._total_decisions = 0
         self._total_pulls = 0
@@ -386,9 +403,11 @@ class ObjectiveScheduler:
         self._last_train_reward_improvement = 0.0
         self._last_train_experience_count = 0.0
         self._last_train_reward_improving_experience = 0.0
+        self._last_train_control_reward_improving_experience = 0.0
         self._accounted_objective_ema = 0.0
         self._last_accounted_objective = 0.0
         self._last_accounted_reward_improving_experience = 0.0
+        self._last_accounted_control_reward_improving_experience = 0.0
         self._last_accounted_dollar_seconds = 0.0
         self._last_continuation_objective = 0.0
         self._previous_accounted_dollar_seconds = 0.0
@@ -677,10 +696,20 @@ class ObjectiveScheduler:
         effective_reward = reward * quality
         previous_reward = stats.effective_reward_ema if stats.pulls else 0.0
         positive_improvement = max(0.0, effective_reward - previous_reward)
-        marginal_objective = positive_improvement / cost
+        reward_scale = self._arm_effective_reward_scale(stats, effective_reward)
+        normalized_positive_improvement = self._normalized_reward_improvement(
+            positive_improvement,
+            reward_scale,
+        )
+        marginal_objective = normalized_positive_improvement / cost
         reward_efficiency = max(0.0, effective_reward) / cost
 
         stats.pulls += 1
+        self._observe_arm_effective_reward(stats, effective_reward)
+        stats.last_reward_scale = reward_scale
+        stats.last_normalized_positive_improvement = (
+            normalized_positive_improvement
+        )
         self._total_pulls += 1
         if accepted:
             stats.accepted += 1
@@ -715,6 +744,9 @@ class ObjectiveScheduler:
         stats.total_reward += reward
         stats.total_effective_reward += effective_reward
         stats.total_positive_improvement += positive_improvement
+        stats.total_normalized_positive_improvement += (
+            normalized_positive_improvement
+        )
         stats.total_dollar_seconds += cost
         stats.rollout_dollar_seconds += rollout_cost
         stats.queue_wait_dollar_seconds += queue_wait_cost
@@ -865,6 +897,7 @@ class ObjectiveScheduler:
             reward_improving_experience,
             arm_objectives,
             arm_weights,
+            control_reward_improving_experience,
         ) = self._credit_train_objective_to_arms(
             groups,
             reward=reward,
@@ -880,8 +913,12 @@ class ObjectiveScheduler:
         self._last_train_reward_improvement = improvement
         self._last_train_experience_count = experience_count
         self._last_train_reward_improving_experience = reward_improving_experience
+        self._last_train_control_reward_improving_experience = (
+            control_reward_improving_experience
+        )
         accounted_objective = self._observe_accounted_train_objective(
-            reward_improving_experience
+            control_reward_improving_experience,
+            raw_reward_improving_experience=reward_improving_experience,
         )
         continuation_objective = (
             accounted_objective
@@ -1121,6 +1158,7 @@ class ObjectiveScheduler:
                 "reconstruction_drift_threshold": (
                     self.reconstruction_drift_threshold
                 ),
+                "reward_scale_normalization": self.reward_scale_normalization,
             },
             "learning_state": {
                 "total_decisions": self._total_decisions,
@@ -1138,10 +1176,16 @@ class ObjectiveScheduler:
                 "last_train_reward_improving_experience": (
                     self._last_train_reward_improving_experience
                 ),
+                "last_train_control_reward_improving_experience": (
+                    self._last_train_control_reward_improving_experience
+                ),
                 "accounted_objective_ema": self._accounted_objective_ema,
                 "last_accounted_objective": self._last_accounted_objective,
                 "last_accounted_reward_improving_experience": (
                     self._last_accounted_reward_improving_experience
+                ),
+                "last_accounted_control_reward_improving_experience": (
+                    self._last_accounted_control_reward_improving_experience
                 ),
                 "last_accounted_dollar_seconds": (
                     self._last_accounted_dollar_seconds
@@ -1422,6 +1466,14 @@ class ObjectiveScheduler:
                 ),
             ),
         )
+        reward_scale_normalization = str(
+            config.get(
+                "reward_scale_normalization",
+                self.reward_scale_normalization,
+            )
+        )
+        if reward_scale_normalization in {"none", "arm_range"}:
+            self.reward_scale_normalization = reward_scale_normalization
 
         arms = _mapping_state(state.get("arms"))
         self._arms = {
@@ -1492,6 +1544,12 @@ class ObjectiveScheduler:
             learning_state.get("last_train_reward_improving_experience"),
             self._last_train_reward_improving_experience,
         )
+        self._last_train_control_reward_improving_experience = _state_float(
+            learning_state.get(
+                "last_train_control_reward_improving_experience"
+            ),
+            self._last_train_control_reward_improving_experience,
+        )
         self._accounted_objective_ema = _state_float(
             learning_state.get("accounted_objective_ema"),
             self._accounted_objective_ema,
@@ -1503,6 +1561,12 @@ class ObjectiveScheduler:
         self._last_accounted_reward_improving_experience = _state_float(
             learning_state.get("last_accounted_reward_improving_experience"),
             self._last_accounted_reward_improving_experience,
+        )
+        self._last_accounted_control_reward_improving_experience = _state_float(
+            learning_state.get(
+                "last_accounted_control_reward_improving_experience"
+            ),
+            self._last_accounted_control_reward_improving_experience,
         )
         self._last_accounted_dollar_seconds = _state_float(
             learning_state.get("last_accounted_dollar_seconds"),
@@ -1711,10 +1775,16 @@ class ObjectiveScheduler:
             "scheduler/train_last_reward_improving_experience": (
                 self._last_train_reward_improving_experience
             ),
+            "scheduler/train_last_control_reward_improving_experience": (
+                self._last_train_control_reward_improving_experience
+            ),
             "scheduler/accounted_objective_ema": self._accounted_objective_ema,
             "scheduler/accounted_last_objective": self._last_accounted_objective,
             "scheduler/accounted_last_reward_improving_experience": (
                 self._last_accounted_reward_improving_experience
+            ),
+            "scheduler/accounted_last_control_reward_improving_experience": (
+                self._last_accounted_control_reward_improving_experience
             ),
             "scheduler/accounted_last_dollar_seconds": (
                 self._last_accounted_dollar_seconds
@@ -1783,6 +1853,11 @@ class ObjectiveScheduler:
             ),
             "scheduler/weights/control_exploration": (
                 self.control_exploration_bonus
+            ),
+            "scheduler/reward_scale_normalization/arm_range": (
+                1.0
+                if self.reward_scale_normalization == "arm_range"
+                else 0.0
             ),
             "scheduler/coverage/min_fraction": (
                 self.min_rollout_coverage_fraction
@@ -1906,6 +1981,16 @@ class ObjectiveScheduler:
             )
             metrics[f"{prefix}/reward_ema"] = stats.reward_ema
             metrics[f"{prefix}/effective_reward_ema"] = stats.effective_reward_ema
+            metrics[f"{prefix}/effective_reward_min"] = (
+                stats.min_effective_reward if stats.pulls else 0.0
+            )
+            metrics[f"{prefix}/effective_reward_max"] = (
+                stats.max_effective_reward if stats.pulls else 0.0
+            )
+            metrics[f"{prefix}/last_reward_scale"] = stats.last_reward_scale
+            metrics[f"{prefix}/last_normalized_positive_improvement"] = (
+                stats.last_normalized_positive_improvement
+            )
             metrics[f"{prefix}/action_quality_ema"] = stats.action_quality_ema
             metrics[f"{prefix}/marginal_objective_ema"] = (
                 stats.marginal_objective_ema
@@ -1914,8 +1999,20 @@ class ObjectiveScheduler:
                 stats.policy_improvement_objective_ema
             )
             metrics[f"{prefix}/last_train_reward"] = stats.last_train_reward
+            metrics[f"{prefix}/train_reward_min"] = (
+                stats.min_train_reward if stats.train_reward_observations else 0.0
+            )
+            metrics[f"{prefix}/train_reward_max"] = (
+                stats.max_train_reward if stats.train_reward_observations else 0.0
+            )
+            metrics[f"{prefix}/last_train_reward_scale"] = (
+                stats.last_train_reward_scale
+            )
             metrics[f"{prefix}/last_train_reward_improvement"] = (
                 stats.last_train_reward_improvement
+            )
+            metrics[f"{prefix}/last_normalized_train_reward_improvement"] = (
+                stats.last_normalized_train_reward_improvement
             )
             metrics[f"{prefix}/reward_efficiency_ema"] = stats.reward_efficiency_ema
             metrics[f"{prefix}/objective_score"] = self._arm_value(stats)
@@ -1989,8 +2086,14 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/total_positive_improvement"] = (
                 stats.total_positive_improvement
             )
+            metrics[f"{prefix}/total_normalized_positive_improvement"] = (
+                stats.total_normalized_positive_improvement
+            )
             metrics[f"{prefix}/total_reward_improving_experience"] = (
                 stats.total_reward_improving_experience
+            )
+            metrics[f"{prefix}/total_normalized_reward_improving_experience"] = (
+                stats.total_normalized_reward_improving_experience
             )
             metrics[f"{prefix}/total_improvement_per_dollar_second"] = (
                 stats.total_positive_improvement / stats.total_dollar_seconds
@@ -2336,6 +2439,50 @@ class ObjectiveScheduler:
         delta2 = value - stats.objective_mean
         stats.objective_m2 += delta * delta2
 
+    def _normalized_reward_improvement(
+        self,
+        improvement: float,
+        reward_scale: float,
+    ) -> float:
+        if self.reward_scale_normalization == "none":
+            return improvement
+        return improvement / max(reward_scale, 1e-12)
+
+    @staticmethod
+    def _arm_effective_reward_scale(stats: ArmStats, reward: float) -> float:
+        if stats.pulls <= 0:
+            return max(1.0, abs(reward))
+        low = min(stats.min_effective_reward, reward)
+        high = max(stats.max_effective_reward, reward)
+        return max(1.0, high - low)
+
+    @staticmethod
+    def _observe_arm_effective_reward(stats: ArmStats, reward: float) -> None:
+        if stats.pulls <= 1:
+            stats.min_effective_reward = min(0.0, reward)
+            stats.max_effective_reward = max(0.0, reward)
+            return
+        stats.min_effective_reward = min(stats.min_effective_reward, reward)
+        stats.max_effective_reward = max(stats.max_effective_reward, reward)
+
+    @staticmethod
+    def _arm_train_reward_scale(stats: ArmStats, reward: float) -> float:
+        if stats.train_reward_observations <= 0:
+            return max(1.0, abs(reward))
+        low = min(stats.min_train_reward, reward)
+        high = max(stats.max_train_reward, reward)
+        return max(1.0, high - low)
+
+    @staticmethod
+    def _observe_arm_train_reward(stats: ArmStats, reward: float) -> None:
+        stats.train_reward_observations += 1
+        if stats.train_reward_observations == 1:
+            stats.min_train_reward = min(0.0, reward)
+            stats.max_train_reward = max(0.0, reward)
+            return
+        stats.min_train_reward = min(stats.min_train_reward, reward)
+        stats.max_train_reward = max(stats.max_train_reward, reward)
+
     def _credit_objective_to_arms(
         self,
         groups: Sequence[TrajectoryGroup],
@@ -2388,11 +2535,12 @@ class ObjectiveScheduler:
         *,
         reward: float,
         cost: float,
-    ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
+    ) -> tuple[float, float, float, dict[str, float], dict[str, float], float]:
         arm_weights = _arm_credit_weights(groups)
         arm_experience = _arm_useful_experience(groups)
         total_experience = sum(arm_experience.values())
         total_reward_improving_experience = 0.0
+        total_control_reward_improving_experience = 0.0
         arm_objectives: dict[str, float] = {}
 
         for arm_id in arm_weights:
@@ -2403,15 +2551,35 @@ class ObjectiveScheduler:
                 if experience > 0.0
                 else 0.0
             )
+            reward_scale = (
+                self._arm_train_reward_scale(stats, reward)
+                if experience > 0.0
+                else 1.0
+            )
+            normalized_improvement = self._normalized_reward_improvement(
+                improvement,
+                reward_scale,
+            )
             reward_improving_experience = improvement * experience
-            credit = reward_improving_experience / cost
+            control_reward_improving_experience = (
+                normalized_improvement * experience
+            )
+            credit = control_reward_improving_experience / cost
 
             stats.train_updates += 1
             if experience > 0.0:
+                self._observe_arm_train_reward(stats, reward)
                 stats.last_train_reward = reward
+                stats.last_train_reward_scale = reward_scale
             stats.last_train_reward_improvement = improvement
+            stats.last_normalized_train_reward_improvement = (
+                normalized_improvement
+            )
             stats.total_reward_improving_experience += (
                 reward_improving_experience
+            )
+            stats.total_normalized_reward_improving_experience += (
+                control_reward_improving_experience
             )
             stats.total_policy_improvement_objective += credit
             stats.policy_improvement_objective_ema = self._ema(
@@ -2422,14 +2590,18 @@ class ObjectiveScheduler:
             self._observe_objective_sample(stats, credit)
             arm_objectives[arm_id] = credit
             total_reward_improving_experience += reward_improving_experience
+            total_control_reward_improving_experience += (
+                control_reward_improving_experience
+            )
 
-        objective = total_reward_improving_experience / cost
+        objective = total_control_reward_improving_experience / cost
         return (
             objective,
             total_experience,
             total_reward_improving_experience,
             arm_objectives,
             arm_weights,
+            total_control_reward_improving_experience,
         )
 
     def _credit_train_objective_to_controls(
@@ -2916,6 +3088,8 @@ class ObjectiveScheduler:
     def _observe_accounted_train_objective(
         self,
         reward_improving_experience: float,
+        *,
+        raw_reward_improving_experience: float | None = None,
     ) -> float:
         accounted_dollar_seconds = self._accounted_dollar_seconds()
         interval_cost = max(
@@ -2930,6 +3104,11 @@ class ObjectiveScheduler:
         )
         self._last_accounted_objective = objective
         self._last_accounted_reward_improving_experience = (
+            reward_improving_experience
+            if raw_reward_improving_experience is None
+            else raw_reward_improving_experience
+        )
+        self._last_accounted_control_reward_improving_experience = (
             reward_improving_experience
         )
         self._last_accounted_dollar_seconds = interval_cost
@@ -3215,6 +3394,22 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("effective_reward_ema"),
             default.effective_reward_ema,
         ),
+        min_effective_reward=_state_float(
+            state.get("min_effective_reward"),
+            default.min_effective_reward,
+        ),
+        max_effective_reward=_state_float(
+            state.get("max_effective_reward"),
+            default.max_effective_reward,
+        ),
+        last_reward_scale=_state_float(
+            state.get("last_reward_scale"),
+            default.last_reward_scale,
+        ),
+        last_normalized_positive_improvement=_state_float(
+            state.get("last_normalized_positive_improvement"),
+            default.last_normalized_positive_improvement,
+        ),
         action_quality_ema=_state_float(
             state.get("action_quality_ema"),
             default.action_quality_ema,
@@ -3247,13 +3442,33 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("dollar_seconds_ema"),
             default.dollar_seconds_ema,
         ),
+        train_reward_observations=_state_int(
+            state.get("train_reward_observations"),
+            default.train_reward_observations,
+        ),
+        min_train_reward=_state_float(
+            state.get("min_train_reward"),
+            default.min_train_reward,
+        ),
+        max_train_reward=_state_float(
+            state.get("max_train_reward"),
+            default.max_train_reward,
+        ),
         last_train_reward=_state_float(
             state.get("last_train_reward"),
             default.last_train_reward,
         ),
+        last_train_reward_scale=_state_float(
+            state.get("last_train_reward_scale"),
+            default.last_train_reward_scale,
+        ),
         last_train_reward_improvement=_state_float(
             state.get("last_train_reward_improvement"),
             default.last_train_reward_improvement,
+        ),
+        last_normalized_train_reward_improvement=_state_float(
+            state.get("last_normalized_train_reward_improvement"),
+            default.last_normalized_train_reward_improvement,
         ),
         total_reward=_state_float(state.get("total_reward"), default.total_reward),
         total_effective_reward=_state_float(
@@ -3264,9 +3479,17 @@ def _arm_stats_from_state(value: Any) -> ArmStats:
             state.get("total_positive_improvement"),
             default.total_positive_improvement,
         ),
+        total_normalized_positive_improvement=_state_float(
+            state.get("total_normalized_positive_improvement"),
+            default.total_normalized_positive_improvement,
+        ),
         total_reward_improving_experience=_state_float(
             state.get("total_reward_improving_experience"),
             default.total_reward_improving_experience,
+        ),
+        total_normalized_reward_improving_experience=_state_float(
+            state.get("total_normalized_reward_improving_experience"),
+            default.total_normalized_reward_improving_experience,
         ),
         total_policy_improvement_objective=_state_float(
             state.get("total_policy_improvement_objective"),

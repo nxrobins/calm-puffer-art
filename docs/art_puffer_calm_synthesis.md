@@ -49,6 +49,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale useful-experience waste before it happens.
 - It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
 - It credits train-step reward-improving useful experience back to the scenario/action-codec arms that produced the consumed batch, using each arm's own previous train score as the baseline.
+- It can enable `reward_scale_normalization="arm_range"` for heterogeneous workflows, preserving raw reward telemetry while scale-adjusting rollout and train positive-improvement credit by each arm's observed reward range before control decisions are scored.
 - It credits reward improvement back to active actor-count, cadence, policy-lag, and actor-admission delay values, reports their objective/exploration scores under `scheduler/control/*`, and reuses the higher-value runtime controls.
 - It attributes rollout, train, stale, queue-wait, admission cost, semantic bandwidth, and objective back to individual actor slots under `scheduler/actor/*`, so actor-count control can be audited by marginal actor-slot contribution.
 - It converts verifier and reconstruction metadata into effective reward, so unsafe high-bandwidth actions are demoted.
@@ -74,7 +75,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can use `continuation_objective="accounted"` so ROI patience divides reward-improving useful experience by rollout, queue, admission, trainer, trainer-wait, and promotion cost accumulated for the train interval.
 - It defaults runtime-control train credit to `control_train_objective="accounted"`, so cadence, policy-lag, actor-count, and admission-delay choices are trained against the same accounted interval denominator rather than trainer spend alone.
 
-This is still a local bandit controller, not the final supremum. The next version should add stronger policy-level safeguards around tasks whose rewards are not directly comparable.
+This is still a local bandit controller, not the final supremum. It now has an opt-in reward-scale safeguard for heterogeneous workflows, but broader policy-level comparability still depends on users exposing meaningful reward scales, promotion gates, or evaluators for their domains.
 
 ## Bounded Staleness
 

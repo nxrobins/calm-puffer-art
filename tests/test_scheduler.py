@@ -76,6 +76,198 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(next_decision.arm_id, "easy|chunk(chunk_size=2)")
 
+    def test_reward_scale_normalization_changes_cross_scale_rollout_choice(self):
+        scenarios = [Scenario(id="large"), Scenario(id="small")]
+        codecs = [TokenActionCodec()]
+
+        def observe(
+            scheduler: ObjectiveScheduler,
+            scenario_id: str,
+            reward: float,
+        ) -> None:
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=scenario_id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=reward,
+                    metadata={"scheduler/arm_id": f"{scenario_id}|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+
+        raw = ObjectiveScheduler(exploration_bonus=0.0, ema_alpha=1.0)
+        normalized = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            ema_alpha=1.0,
+            reward_scale_normalization="arm_range",
+        )
+        for scheduler in (raw, normalized):
+            observe(scheduler, "large", 1000.0)
+            observe(scheduler, "large", 1010.0)
+            observe(scheduler, "small", 0.5)
+
+        raw_decision = raw.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        normalized_decision = normalized.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        metrics = normalized.metrics()
+
+        self.assertEqual(raw_decision.arm_id, "large|token")
+        self.assertEqual(normalized_decision.arm_id, "small|token")
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/large_token/last_reward_scale"],
+            1010.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/arm/large_token/"
+                "last_normalized_positive_improvement"
+            ],
+            10.0 / 1010.0,
+        )
+
+    def test_reward_scale_normalization_changes_cross_scale_train_credit(self):
+        scenarios = [Scenario(id="large"), Scenario(id="small")]
+        codecs = [TokenActionCodec()]
+
+        def rollout_group(
+            scheduler: ObjectiveScheduler,
+            scenario_id: str,
+        ) -> TrajectoryGroup:
+            trajectory = Trajectory(
+                scenario_id=scenario_id,
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={"scheduler/arm_id": f"{scenario_id}|token"},
+            )
+            scheduler.observe_rollout(
+                trajectory,
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            return TrajectoryGroup(
+                scenario_id=scenario_id,
+                trajectories=(trajectory,),
+            )
+
+        def observe_train(
+            scheduler: ObjectiveScheduler,
+            group: TrajectoryGroup,
+            reward: float,
+            policy_step: int,
+        ) -> None:
+            scheduler.observe_train(
+                groups=[group],
+                result=TrainResult(metrics={"train/reward": reward}),
+                duration_s=1.0,
+                dollar_seconds=1.0,
+                policy_step=policy_step,
+            )
+
+        raw = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            ema_alpha=1.0,
+            rollout_objective_weight=0.0,
+        )
+        normalized = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            ema_alpha=1.0,
+            rollout_objective_weight=0.0,
+            reward_scale_normalization="arm_range",
+        )
+        raw_large = rollout_group(raw, "large")
+        raw_small = rollout_group(raw, "small")
+        normalized_large = rollout_group(normalized, "large")
+        normalized_small = rollout_group(normalized, "small")
+
+        observe_train(raw, raw_large, 1000.0, 0)
+        observe_train(raw, raw_large, 1010.0, 1)
+        observe_train(raw, raw_small, 0.5, 2)
+        observe_train(normalized, normalized_large, 1000.0, 0)
+        observe_train(normalized, normalized_large, 1010.0, 1)
+        observe_train(normalized, normalized_small, 0.5, 2)
+
+        raw_decision = raw.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=3,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        normalized_decision = normalized.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=3,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        metrics = normalized.metrics()
+
+        self.assertEqual(raw_decision.arm_id, "large|token")
+        self.assertEqual(normalized_decision.arm_id, "small|token")
+        self.assertAlmostEqual(
+            metrics["scheduler/arm/large_token/last_train_reward_scale"],
+            1010.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/arm/large_token/"
+                "last_normalized_train_reward_improvement"
+            ],
+            10.0 / 1010.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/train_last_reward_improving_experience"],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "scheduler/train_last_control_reward_improving_experience"
+            ],
+            0.5,
+        )
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(normalized.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(
+            restored.state_dict()["config"]["reward_scale_normalization"],
+            "arm_range",
+        )
+        self.assertAlmostEqual(
+            restored_metrics[
+                "scheduler/arm/large_token/last_train_reward_scale"
+            ],
+            1010.0,
+        )
+
     def test_scheduler_reserves_inflight_untried_arms_for_async_actors(self):
         scenarios = [Scenario(id="easy"), Scenario(id="hard")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
