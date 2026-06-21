@@ -9,6 +9,9 @@ from .types import Scenario, TrainResult, Trajectory, TrajectoryGroup, mean
 
 
 SCHEDULER_STATE_KEY = "scheduler/state"
+_UNOBSERVED_ARM_SCORE = 1_000_000_000.0
+_UNOBSERVED_ARM_INFLIGHT_PENALTY = 1_000_000.0
+_UNOBSERVED_ARM_COST_PENALTY_CAP = 999_999.0
 
 
 @dataclass(frozen=True)
@@ -518,7 +521,7 @@ class ObjectiveScheduler:
         if coverage_selection is None:
             arm_id, scenario, codec = max(
                 arms,
-                key=lambda arm: self._score_arm(arm[0]),
+                key=lambda arm: self._score_arm(arm[0], arm[1], arm[2]),
             )
             coverage_forced = False
             coverage_target = self._effective_coverage_target(len(arms))
@@ -539,7 +542,13 @@ class ObjectiveScheduler:
             self._coverage_forced_decisions += 1
         coverage_cost_limit = self.max_rollout_coverage_cost_fraction or 0.0
         selected_stats = self._arms[arm_id]
-        decision_score = self._score_arm(arm_id)
+        estimated_rollout_dollar_seconds = (
+            self._estimated_rollout_dollar_seconds(arm_id, scenario, codec)
+        )
+        unobserved_rollout_cost_penalty = (
+            self._unobserved_rollout_cost_penalty(arm_id, scenario, codec)
+        )
+        decision_score = self._score_arm(arm_id, scenario, codec)
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
         self._record_arm_decision(selected_stats)
@@ -583,9 +592,17 @@ class ObjectiveScheduler:
                 "coverage_cost_limit": coverage_cost_limit,
                 "coverage_cost_limited": coverage_cost_limited,
                 "expected_rollout_dollar_seconds": (
-                    selected_stats.dollar_seconds_ema
-                    if selected_stats.pulls
-                    else 0.0
+                    estimated_rollout_dollar_seconds
+                ),
+                "estimated_rollout_dollar_seconds": (
+                    estimated_rollout_dollar_seconds
+                ),
+                "unobserved_rollout_cost_penalty": (
+                    unobserved_rollout_cost_penalty
+                ),
+                "unobserved_rollout_cost_estimated": (
+                    selected_stats.pulls == 0
+                    and estimated_rollout_dollar_seconds > 0.0
                 ),
             },
         )
@@ -2186,6 +2203,9 @@ class ObjectiveScheduler:
         }
         if self._last_decision_snapshot is not None:
             last_arm_id = str(self._last_decision_snapshot.get("arm_id", ""))
+            last_metadata = _mapping_state(
+                self._last_decision_snapshot.get("metadata")
+            )
             metrics[
                 f"scheduler/last_arm/{_safe_metric_key(last_arm_id)}"
             ] = 1.0
@@ -2194,6 +2214,26 @@ class ObjectiveScheduler:
             )
             metrics["scheduler/last_max_policy_lag"] = float(
                 self._last_decision_snapshot.get("max_policy_lag", 0)
+            )
+            metrics["scheduler/last_rollout_estimated_dollar_seconds"] = (
+                _state_float(
+                    last_metadata.get("estimated_rollout_dollar_seconds"),
+                    0.0,
+                )
+            )
+            metrics["scheduler/last_rollout_unobserved_cost_penalty"] = (
+                _state_float(
+                    last_metadata.get("unobserved_rollout_cost_penalty"),
+                    0.0,
+                )
+            )
+            metrics["scheduler/last_rollout_unobserved_cost_estimated"] = (
+                1.0
+                if _state_bool(
+                    last_metadata.get("unobserved_rollout_cost_estimated"),
+                    False,
+                )
+                else 0.0
             )
         for mode, count in failure_modes.items():
             safe_mode = _safe_metric_key(mode)
@@ -2339,6 +2379,12 @@ class ObjectiveScheduler:
                 stats.admission_dollar_seconds / stats.pulls
                 if stats.pulls
                 else 0.0
+            )
+            metrics[f"{prefix}/estimated_rollout_dollar_seconds"] = (
+                self._estimated_rollout_dollar_seconds(arm_id)
+            )
+            metrics[f"{prefix}/unobserved_rollout_cost_penalty"] = (
+                self._unobserved_rollout_cost_penalty(arm_id)
             )
             metrics[f"{prefix}/action_units"] = float(stats.action_units)
             metrics[f"{prefix}/source_tokens"] = float(stats.source_tokens)
@@ -2642,7 +2688,12 @@ class ObjectiveScheduler:
                 continue
             if (
                 math.isclose(deficit, most_undercovered[5])
-                and self._score_arm(arm_id) > self._score_arm(most_undercovered[0])
+                and self._score_arm(arm_id, scenario, codec)
+                > self._score_arm(
+                    most_undercovered[0],
+                    most_undercovered[1],
+                    most_undercovered[2],
+                )
             ):
                 most_undercovered = candidate
         return most_undercovered, cost_limited
@@ -2682,14 +2733,106 @@ class ObjectiveScheduler:
             return False
         return cost_share >= self.max_rollout_coverage_cost_fraction
 
-    def _score_arm(self, arm_id: str) -> float:
+    def _score_arm(
+        self,
+        arm_id: str,
+        scenario: Scenario | None = None,
+        codec: ActionCodec | None = None,
+    ) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
         if stats.pulls == 0:
-            # Reserve unobserved arms before repeating in-flight work.
-            return 1_000_000_000.0 - stats.inflight
+            return (
+                _UNOBSERVED_ARM_SCORE
+                - stats.inflight * _UNOBSERVED_ARM_INFLIGHT_PENALTY
+                - self._unobserved_rollout_cost_penalty(
+                    arm_id,
+                    scenario,
+                    codec,
+                )
+            )
         exploitation = self._arm_value(stats)
         exploration = self._exploration_value(stats)
         return exploitation + exploration
+
+    def _estimated_rollout_dollar_seconds(
+        self,
+        arm_id: str,
+        scenario: Scenario | None = None,
+        codec: ActionCodec | None = None,
+    ) -> float:
+        stats = self._arms.get(arm_id)
+        if stats is not None and stats.pulls > 0:
+            if stats.dollar_seconds_ema > 0.0:
+                return stats.dollar_seconds_ema
+            return stats.total_dollar_seconds / stats.pulls
+
+        scenario_id = (
+            str(scenario.id) if scenario is not None else _arm_scenario_id(arm_id)
+        )
+        codec_key = (
+            _codec_key(codec) if codec is not None else _arm_codec_key(arm_id)
+        )
+        estimates: list[float] = []
+
+        scenario_cost = self._mean_observed_sample_cost(scenario_id=scenario_id)
+        if scenario_cost > 0.0:
+            estimates.append(scenario_cost)
+        codec_cost = self._mean_observed_sample_cost(codec_key=codec_key)
+        if codec_cost > 0.0:
+            estimates.append(codec_cost)
+        if not estimates:
+            global_cost = self._mean_observed_sample_cost()
+            if global_cost > 0.0:
+                estimates.append(global_cost)
+        if not estimates:
+            return 0.0
+        return sum(estimates) / len(estimates)
+
+    def _unobserved_rollout_cost_penalty(
+        self,
+        arm_id: str,
+        scenario: Scenario | None = None,
+        codec: ActionCodec | None = None,
+    ) -> float:
+        stats = self._arms.get(arm_id)
+        if stats is not None and stats.pulls > 0:
+            return 0.0
+        estimated_cost = self._estimated_rollout_dollar_seconds(
+            arm_id,
+            scenario,
+            codec,
+        )
+        if estimated_cost <= 0.0:
+            return 0.0
+        baseline_cost = self._mean_observed_sample_cost()
+        if baseline_cost <= 0.0:
+            baseline_cost = estimated_cost
+        return min(
+            _UNOBSERVED_ARM_COST_PENALTY_CAP,
+            estimated_cost / max(baseline_cost, 1e-12),
+        )
+
+    def _mean_observed_sample_cost(
+        self,
+        *,
+        scenario_id: str | None = None,
+        codec_key: str | None = None,
+    ) -> float:
+        total_cost = 0.0
+        total_pulls = 0
+        for arm_id, stats in self._arms.items():
+            if stats.pulls <= 0:
+                continue
+            arm_scenario_id, arm_codec_key = _split_arm_id(arm_id)
+            if scenario_id is not None and arm_scenario_id != scenario_id:
+                continue
+            if codec_key is not None and arm_codec_key != codec_key:
+                continue
+            total_cost += max(0.0, stats.total_dollar_seconds)
+            total_pulls += stats.pulls
+        if total_pulls <= 0:
+            return 0.0
+        return total_cost / total_pulls
 
     def _exploration_value(self, stats: ArmStats) -> float:
         if stats.pulls == 0:
@@ -3482,6 +3625,21 @@ class ObjectiveScheduler:
 
 def _arm_id(scenario: Scenario, codec: ActionCodec) -> str:
     return f"{scenario.id}|{_codec_key(codec)}"
+
+
+def _split_arm_id(arm_id: str) -> tuple[str, str]:
+    if "|" not in arm_id:
+        return "", arm_id
+    scenario_id, codec_key = arm_id.rsplit("|", 1)
+    return scenario_id, codec_key
+
+
+def _arm_scenario_id(arm_id: str) -> str:
+    return _split_arm_id(arm_id)[0]
+
+
+def _arm_codec_key(arm_id: str) -> str:
+    return _split_arm_id(arm_id)[1]
 
 
 def _codec_key(codec: ActionCodec) -> str:

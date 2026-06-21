@@ -385,6 +385,62 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/arm/easy_token/inflight"], 0.0)
         self.assertEqual(metrics["scheduler/arm/easy_token/pulls"], 1.0)
 
+    def test_unobserved_rollout_exploration_prefers_lower_estimated_cost(self):
+        scenarios = [Scenario(id="expensive"), Scenario(id="cheap")]
+        codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+
+        for scenario_id, cost in (("expensive", 10.0), ("cheap", 1.0)):
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id=scenario_id,
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.1,
+                    metadata={"scheduler/arm_id": f"{scenario_id}|token"},
+                ),
+                accepted=True,
+                dollar_seconds=cost,
+            )
+
+        decision = scheduler.select_rollout(
+            scenarios=scenarios,
+            action_codecs=codecs,
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(decision.arm_id, "cheap|chunk(chunk_size=2)")
+        self.assertAlmostEqual(
+            decision.metadata["estimated_rollout_dollar_seconds"],
+            1.0,
+        )
+        self.assertTrue(decision.metadata["unobserved_rollout_cost_estimated"])
+        self.assertLess(
+            metrics[
+                "scheduler/arm/cheap_chunk_chunk_size_2/"
+                "unobserved_rollout_cost_penalty"
+            ],
+            metrics[
+                "scheduler/arm/expensive_chunk_chunk_size_2/"
+                "unobserved_rollout_cost_penalty"
+            ],
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/last_rollout_estimated_dollar_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/last_rollout_unobserved_cost_estimated"],
+            1.0,
+        )
+
     def test_scheduler_defaults_to_marginal_objective_over_raw_reward_efficiency(self):
         scenarios = [Scenario(id="stale-high"), Scenario(id="fresh-improver")]
         codecs = [TokenActionCodec()]
@@ -3278,6 +3334,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/last_arm/cheap_token",
             "scheduler/last_target_train_batch_groups",
             "scheduler/last_max_policy_lag",
+            "scheduler/last_rollout_estimated_dollar_seconds",
+            "scheduler/last_rollout_unobserved_cost_penalty",
+            "scheduler/last_rollout_unobserved_cost_estimated",
+            "scheduler/arm/cheap_token/estimated_rollout_dollar_seconds",
+            "scheduler/arm/cheap_token/unobserved_rollout_cost_penalty",
             "scheduler/weights/control_exploration",
             "scheduler/weights/off_policy_priority",
             "scheduler/coverage/min_fraction",
