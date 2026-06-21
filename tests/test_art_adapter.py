@@ -643,6 +643,18 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(metadata["actor_id"], 7)
         self.assertEqual(metadata["scheduler/target_train_batch_groups"], 2)
         self.assertEqual(metadata["scheduler/max_policy_lag"], 3)
+        self.assertIn(
+            "scheduler/decision/estimated_rollout_dollar_seconds",
+            metadata,
+        )
+        self.assertIn(
+            "scheduler/decision/unobserved_rollout_cost_penalty",
+            metadata,
+        )
+        self.assertIn(
+            "scheduler/decision/unobserved_rollout_cost_estimated",
+            metadata,
+        )
         self.assertEqual(metrics[f"{metric_arm}/decisions"], 1.0)
         self.assertEqual(metrics[f"{metric_arm}/pulls"], 1.0)
         self.assertEqual(metrics[f"{metric_arm}/inflight"], 0.0)
@@ -1254,6 +1266,105 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(after["art_backend/pending_groups"], 0.0)
         self.assertEqual(after["art_backend/completed_batches"], 1.0)
         self.assertEqual(len(backend.calls[0][1]), 1)
+
+    def test_async_art_backend_drops_stale_pending_group_on_submit(self):
+        async def run():
+            backend = FakeArtBackend()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=2,
+                    train_queue_capacity=2,
+                    max_policy_lag=0,
+                ),
+            )
+            await async_backend.register("art-model")
+            async_backend._current_step = 2
+            old_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 3.0},
+                    )
+                ]
+            )
+
+            future = await async_backend.submit_group("art-model", old_group)
+            with self.assertRaises(StaleArtBatchError):
+                await future
+            stats = async_backend.stats()
+            await async_backend.close()
+            return stats
+
+        stats = asyncio.run(run())
+
+        self.assertEqual(stats["art_backend/submitted_groups"], 1.0)
+        self.assertEqual(stats["art_backend/submitted_batches"], 0.0)
+        self.assertEqual(stats["art_backend/pending_groups"], 0.0)
+        self.assertEqual(stats["art_backend/stale_pending_groups"], 1.0)
+        self.assertEqual(stats["art_backend/sample_dollar_seconds"], 3.0)
+
+    def test_async_art_backend_debits_pending_group_stale_after_policy_update(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = FixedCadenceScheduler(target=2, lag=0)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=2,
+                    train_queue_capacity=2,
+                    max_policy_lag=0,
+                ),
+                scheduler=scheduler,
+            )
+            pending = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metrics={"cost/dollar_seconds": 4.0},
+                    )
+                ]
+            )
+            trained = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        initial_policy_version=0,
+                    )
+                ]
+            )
+
+            await async_backend.register("art-model")
+            pending_future = await async_backend.submit_group("art-model", pending)
+            train_result = await async_backend.train("art-model", [trained])
+            with self.assertRaises(StaleArtBatchError):
+                await asyncio.wait_for(pending_future, timeout=1.0)
+            stats = async_backend.stats()
+            await async_backend.close()
+            return train_result, scheduler, stats
+
+        train_result, scheduler, stats = asyncio.run(run())
+
+        self.assertEqual(train_result.step, 1)
+        self.assertEqual(stats["art_backend/current_step"], 1.0)
+        self.assertEqual(stats["art_backend/pending_groups"], 0.0)
+        self.assertEqual(stats["art_backend/stale_pending_groups"], 1.0)
+        self.assertEqual(stats["art_backend/sample_dollar_seconds"], 4.0)
+        self.assertEqual(
+            scheduler.stale_batches,
+            [
+                {
+                    "groups": 1,
+                    "policy_step": 1,
+                    "reason": "art_pending_group_stale",
+                }
+            ],
+        )
 
     def test_async_art_backend_scheduler_controls_group_batch_cadence(self):
         async def run():

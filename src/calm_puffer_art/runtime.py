@@ -1225,6 +1225,7 @@ class ControlPlane:
                 if scheduler is not None:
                     self._observe_promotion_rollouts(
                         scheduler=scheduler,
+                        action_space=action_space,
                         promotion=promotion,
                     )
                 result = _with_promotion_metadata(result, promotion)
@@ -1288,6 +1289,7 @@ class ControlPlane:
         self,
         *,
         scheduler: AdaptiveScheduler,
+        action_space: AdaptiveActionSpace | None,
         promotion: PromotionDecision,
     ) -> None:
         for trajectory in promotion.trajectories:
@@ -1298,6 +1300,11 @@ class ControlPlane:
                     trajectory,
                     cost_per_second_usd=self.config.cost_per_second_usd,
                 ),
+            )
+        if action_space is not None and promotion.trajectories:
+            action_space.update_from_metrics(
+                scheduler.metrics(),
+                allow_demotions=False,
             )
 
     async def _evaluate_promotion(
@@ -1534,6 +1541,7 @@ class ControlPlane:
                 trajectory.metrics["cost/actor_admission_dollar_seconds"] = (
                     admission_dollar_seconds
                 )
+            self._stamp_rollout_dollar_seconds(trajectory)
 
             queue_started = time.perf_counter()
             queue_wait_s = await self._put_trajectory_with_queue_cost(
@@ -1778,6 +1786,22 @@ class ControlPlane:
         if explicit_cost is not None:
             return explicit_cost
         return max(0.0, trajectory.duration_s) * self.config.cost_per_second_usd
+
+    def _stamp_rollout_dollar_seconds(self, trajectory: Trajectory) -> None:
+        explicit_cost = _first_nonnegative_float(
+            trajectory.metrics,
+            ("cost/dollar_seconds", "rollout/dollar_seconds"),
+        )
+        if explicit_cost is None:
+            explicit_cost = _first_nonnegative_float(
+                trajectory.metadata,
+                ("cost/dollar_seconds", "rollout/dollar_seconds"),
+            )
+        if explicit_cost is not None:
+            return
+        trajectory.metrics["rollout/dollar_seconds"] = (
+            max(0.0, trajectory.duration_s) * self.config.cost_per_second_usd
+        )
 
     def _trajectory_queue_wait_dollar_seconds(self, trajectory: Trajectory) -> float:
         explicit_cost = _first_nonnegative_float(

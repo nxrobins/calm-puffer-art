@@ -644,6 +644,64 @@ class RuntimeTests(unittest.TestCase):
             1.0,
         )
 
+    def test_promotion_rollout_feedback_can_promote_action_space(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                promotion_min_pulls=1,
+                demotion_min_pulls=999,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+
+            summary = await runtime.run(
+                scenarios=[Scenario(id="train-flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=flat_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldout-adapt")],
+                    workflow=adaptive_chunk_size_rollout,
+                    action_codec=ChunkActionCodec(chunk_size=2),
+                    min_delta=0.0,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldout_adapt_chunk_chunk_size_2/pulls"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertEqual(summary.metrics["action_space/promotions"], 1.0)
+
     def test_control_plane_promotes_adaptive_action_space_codecs(self):
         async def run():
             scheduler = ObjectiveScheduler(
@@ -1468,6 +1526,34 @@ class RuntimeTests(unittest.TestCase):
             queued.metrics["cost/actor_queue_wait_dollar_seconds"],
             0.0,
         )
+
+    def test_runtime_stamps_rollout_cost_before_enqueue(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=0.25,
+        )
+        explicit = Trajectory(
+            scenario_id="explicit",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            duration_s=0.25,
+            metrics={"cost/dollar_seconds": 9.0},
+        )
+
+        runtime._stamp_rollout_dollar_seconds(trajectory)
+        runtime._stamp_rollout_dollar_seconds(explicit)
+
+        self.assertEqual(trajectory.metrics["rollout/dollar_seconds"], 2.5)
+        self.assertEqual(runtime._trajectory_dollar_seconds(trajectory), 2.5)
+        self.assertNotIn("rollout/dollar_seconds", explicit.metrics)
+        self.assertEqual(runtime._trajectory_dollar_seconds(explicit), 9.0)
 
     def test_runtime_applies_scheduler_rollout_admission_delay_before_work(self):
         async def run():

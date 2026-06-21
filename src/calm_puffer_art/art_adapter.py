@@ -299,6 +299,7 @@ class AsyncArtBackend:
         self._completed_batches = 0
         self._failed_batches = 0
         self._stale_batches = 0
+        self._stale_pending_groups = 0
         self._stopped_admissions = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
@@ -693,10 +694,17 @@ class AsyncArtBackend:
             future=future,
         )
         async with self._pending_lock:
+            self._discard_stale_pending_locked()
+            self._submitted_groups += 1
+            if self._pending_group_max_lag(pending) > self._max_policy_lag():
+                self._discard_pending_group(
+                    pending,
+                    reason="art_pending_group_stale_on_submit",
+                )
+                return future
             if self._pending_groups and not self._compatible_pending_group(pending):
                 await self._flush_pending_locked()
             self._pending_groups.append(pending)
-            self._submitted_groups += 1
             target = self._target_train_batch_groups()
             if len(self._pending_groups) >= target:
                 await self._flush_pending_locked()
@@ -764,6 +772,9 @@ class AsyncArtBackend:
         stats["art_backend/completed_batches"] = float(self._completed_batches)
         stats["art_backend/failed_batches"] = float(self._failed_batches)
         stats["art_backend/stale_batches"] = float(self._stale_batches)
+        stats["art_backend/stale_pending_groups"] = float(
+            self._stale_pending_groups
+        )
         stats["art_backend/stopped_admissions"] = float(self._stopped_admissions)
         stats["art_backend/trainer_wait_s"] = self._trainer_wait_s
         stats["art_backend/trainer_wait_dollar_seconds"] = (
@@ -880,6 +891,7 @@ class AsyncArtBackend:
                         self.action_space.update_from_metrics(
                             self.scheduler.metrics()
                         )
+                self._schedule_stale_pending_discard()
                 self._record_published_update(local_result, batch.groups)
                 checkpoint_metadata = dict(local_result.metadata)
                 checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
@@ -982,6 +994,7 @@ class AsyncArtBackend:
         self,
         groups: Sequence[TrajectoryGroup],
     ) -> None:
+        self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
         if self.scheduler is None:
             return
         observe_rollout = getattr(self.scheduler, "observe_rollout", None)
@@ -1066,10 +1079,10 @@ class AsyncArtBackend:
         )
         self._submitted_batches += 1
         self._submitted_train_groups += len(groups)
-        self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
         await self.ring.put(batch)
 
     async def _flush_pending_locked(self) -> int:
+        self._discard_stale_pending_locked()
         if not self._pending_groups:
             return 0
         pending = tuple(self._pending_groups)
@@ -1082,6 +1095,63 @@ class AsyncArtBackend:
             kwargs=first.kwargs,
         )
         return 1
+
+    async def _discard_stale_pending_groups(self) -> int:
+        async with self._pending_lock:
+            return self._discard_stale_pending_locked()
+
+    def _schedule_stale_pending_discard(self) -> None:
+        if not self._pending_groups:
+            return
+        task = asyncio.create_task(self._discard_stale_pending_groups())
+        task.add_done_callback(_consume_task_exception)
+
+    def _discard_stale_pending_locked(self) -> int:
+        if not self._pending_groups:
+            return 0
+        active_max_policy_lag = self._max_policy_lag()
+        kept: list[_PendingArtGroup] = []
+        discarded = 0
+        for pending in self._pending_groups:
+            if self._pending_group_max_lag(pending) > active_max_policy_lag:
+                self._discard_pending_group(
+                    pending,
+                    reason="art_pending_group_stale",
+                )
+                discarded += 1
+            else:
+                kept.append(pending)
+        self._pending_groups = kept
+        return discarded
+
+    def _discard_pending_group(
+        self,
+        pending: _PendingArtGroup,
+        *,
+        reason: str,
+    ) -> None:
+        self._stale_pending_groups += 1
+        observe_stale_batch_feedback(
+            self.scheduler,
+            groups=(pending.group,),
+            policy_step=self._current_step,
+            reason=reason,
+        )
+        if not pending.future.done():
+            pending.future.set_exception(
+                StaleArtBatchError(
+                    "ART pending group exceeded max_policy_lag before batching"
+                )
+            )
+
+    def _pending_group_max_lag(self, pending: _PendingArtGroup) -> int:
+        policy_steps = [
+            trajectory.policy_step
+            for trajectory in pending.group.trajectories
+        ]
+        if not policy_steps:
+            return 0
+        return max(0, self._current_step - min(policy_steps))
 
     def _compatible_pending_group(self, pending: _PendingArtGroup) -> bool:
         if not self._pending_groups:
@@ -1263,6 +1333,13 @@ def art_rollout_metadata(
         "coverage_target",
         "coverage_share",
         "coverage_deficit",
+        "coverage_cost_share",
+        "coverage_cost_limit",
+        "coverage_cost_limited",
+        "expected_rollout_dollar_seconds",
+        "estimated_rollout_dollar_seconds",
+        "unobserved_rollout_cost_penalty",
+        "unobserved_rollout_cost_estimated",
     ):
         value = decision.metadata.get(key)
         if isinstance(value, bool):
@@ -1317,6 +1394,13 @@ async def _maybe_await(value: Awaitable[Any] | Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    with contextlib.suppress(BaseException):
+        task.exception()
 
 
 def _checkpoint_id(
