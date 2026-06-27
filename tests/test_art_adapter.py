@@ -1945,6 +1945,77 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
         self.assertGreater(metrics[f"{prefix}/total_objective"], 0.0)
 
+    def test_async_art_backend_compatibility_flush_records_timing_response_payoff(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=3,
+                max_train_batch_groups=3,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=3,
+                    train_queue_capacity=3,
+                    max_policy_lag=2,
+                ),
+            )
+            first = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={"scenario_id": "compat-flush"},
+                    )
+                ],
+                metadata={"scenario_id": "compat-flush"},
+            )
+            second = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=0.5,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={"scenario_id": "compat-flush"},
+                    )
+                ],
+                metadata={"scenario_id": "compat-flush"},
+            )
+
+            first_future = await async_backend.submit_group(
+                "art-model",
+                first,
+                mode="first",
+            )
+            second_future = await async_backend.submit_group(
+                "art-model",
+                second,
+                mode="second",
+            )
+            first_result = await first_future
+            await async_backend.flush_pending_groups()
+            second_result = await second_future
+            metrics = scheduler.metrics()
+            await async_backend.close()
+            return first_result, second_result, metrics
+
+        first_result, second_result, metrics = asyncio.run(run())
+
+        prefix = (
+            "scheduler/timing_response/"
+            "control_batch_flush_value_1_preference_compatibility_flush_"
+            "pressure_low_pending_1"
+        )
+        self.assertFalse(first_result is None)
+        self.assertFalse(second_result is None)
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
+        self.assertGreater(metrics[f"{prefix}/total_objective"], 0.0)
+
     def test_async_art_backend_drops_stale_pending_group_on_submit(self):
         async def run():
             backend = FakeArtBackend()

@@ -1065,7 +1065,7 @@ class AsyncArtBackend:
                 )
                 return future
             if self._pending_groups and not self._compatible_pending_group(pending):
-                await self._flush_pending_locked()
+                await self._flush_pending_locked(reason="compatibility_flush")
             target = self._target_train_batch_groups(
                 pending_groups=len(self._pending_groups) + 1
             )
