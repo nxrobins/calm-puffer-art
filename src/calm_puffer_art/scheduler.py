@@ -525,6 +525,7 @@ class ObjectiveScheduler:
         self._last_stale_experience_count = 0.0
         self._last_stale_lost_reward_improving_experience = 0.0
         self._last_stale_sample_dollar_seconds = 0.0
+        self._last_stale_unobserved_sample_dollar_seconds = 0.0
         self._last_stale_policy_step = -1
         self._last_stale_reason = ""
         self._last_decision: SchedulerDecision | None = None
@@ -578,6 +579,7 @@ class ObjectiveScheduler:
         self._stale_experience = 0.0
         self._stale_lost_reward_improving_experience = 0.0
         self._stale_sample_dollar_seconds = 0.0
+        self._stale_unobserved_sample_dollar_seconds = 0.0
         self._stale_additional_dollar_seconds = 0.0
         self._last_stale_additional_dollar_seconds = 0.0
         self._cadence_controls: dict[int, ControlStats] = {}
@@ -1174,6 +1176,7 @@ class ObjectiveScheduler:
         queue_wait_cost = max(0.0, queue_wait_dollar_seconds)
         admission_cost = _trajectory_admission_dollar_seconds(trajectory)
         cost = max(rollout_cost + queue_wait_cost + admission_cost, 1e-12)
+        trajectory.metadata["scheduler/rollout_observed"] = True
         self._rollout_dollar_seconds += rollout_cost
         self._queue_wait_dollar_seconds += queue_wait_cost
         quality = action_quality(trajectory)
@@ -1522,6 +1525,9 @@ class ObjectiveScheduler:
         )
         stale_experience = _useful_experience_count(groups)
         stale_sample_cost = _groups_sample_dollar_seconds(groups)
+        stale_unobserved_sample_cost = _groups_unobserved_sample_dollar_seconds(
+            groups
+        )
         stale_overhead_cost = max(0.0, additional_dollar_seconds)
         stale_cost = stale_sample_cost + stale_overhead_cost
         if stale_cost <= 0.0:
@@ -1549,11 +1555,15 @@ class ObjectiveScheduler:
         self._stale_experience += stale_experience
         self._stale_lost_reward_improving_experience += penalty_experience
         self._stale_sample_dollar_seconds += stale_sample_cost
+        self._stale_unobserved_sample_dollar_seconds += stale_unobserved_sample_cost
         self._stale_additional_dollar_seconds += stale_overhead_cost
         self._last_stale_penalty_objective = penalty_objective
         self._last_stale_experience_count = stale_experience
         self._last_stale_lost_reward_improving_experience = penalty_experience
         self._last_stale_sample_dollar_seconds = stale_sample_cost
+        self._last_stale_unobserved_sample_dollar_seconds = (
+            stale_unobserved_sample_cost
+        )
         self._last_stale_additional_dollar_seconds = stale_overhead_cost
         self._last_stale_policy_step = policy_step
         self._last_stale_reason = str(reason)
@@ -1895,6 +1905,9 @@ class ObjectiveScheduler:
                 "last_stale_sample_dollar_seconds": (
                     self._last_stale_sample_dollar_seconds
                 ),
+                "last_stale_unobserved_sample_dollar_seconds": (
+                    self._last_stale_unobserved_sample_dollar_seconds
+                ),
                 "last_stale_additional_dollar_seconds": (
                     self._last_stale_additional_dollar_seconds
                 ),
@@ -2016,6 +2029,9 @@ class ObjectiveScheduler:
                 ),
                 "stale_sample_dollar_seconds": (
                     self._stale_sample_dollar_seconds
+                ),
+                "stale_unobserved_sample_dollar_seconds": (
+                    self._stale_unobserved_sample_dollar_seconds
                 ),
                 "stale_additional_dollar_seconds": (
                     self._stale_additional_dollar_seconds
@@ -2441,6 +2457,10 @@ class ObjectiveScheduler:
             learning_state.get("last_stale_sample_dollar_seconds"),
             self._last_stale_sample_dollar_seconds,
         )
+        self._last_stale_unobserved_sample_dollar_seconds = _state_float(
+            learning_state.get("last_stale_unobserved_sample_dollar_seconds"),
+            self._last_stale_unobserved_sample_dollar_seconds,
+        )
         self._last_stale_additional_dollar_seconds = _state_float(
             learning_state.get("last_stale_additional_dollar_seconds"),
             self._last_stale_additional_dollar_seconds,
@@ -2664,6 +2684,10 @@ class ObjectiveScheduler:
             learning_state.get("stale_sample_dollar_seconds"),
             self._stale_sample_dollar_seconds,
         )
+        self._stale_unobserved_sample_dollar_seconds = _state_float(
+            learning_state.get("stale_unobserved_sample_dollar_seconds"),
+            self._stale_unobserved_sample_dollar_seconds,
+        )
         self._stale_additional_dollar_seconds = _state_float(
             learning_state.get("stale_additional_dollar_seconds"),
             self._stale_additional_dollar_seconds,
@@ -2798,6 +2822,9 @@ class ObjectiveScheduler:
             "scheduler/stale_sample_dollar_seconds": (
                 self._stale_sample_dollar_seconds
             ),
+            "scheduler/stale_unobserved_sample_dollar_seconds": (
+                self._stale_unobserved_sample_dollar_seconds
+            ),
             "scheduler/stale_additional_dollar_seconds": (
                 self._stale_additional_dollar_seconds
             ),
@@ -2816,6 +2843,9 @@ class ObjectiveScheduler:
             ),
             "scheduler/stale_last_sample_dollar_seconds": (
                 self._last_stale_sample_dollar_seconds
+            ),
+            "scheduler/stale_last_unobserved_sample_dollar_seconds": (
+                self._last_stale_unobserved_sample_dollar_seconds
             ),
             "scheduler/stale_last_additional_dollar_seconds": (
                 self._last_stale_additional_dollar_seconds
@@ -2964,6 +2994,9 @@ class ObjectiveScheduler:
                 self._rollout_admission_dollar_seconds
             ),
             "scheduler/costs/train_dollar_seconds": self._train_dollar_seconds,
+            "scheduler/costs/stale_unobserved_sample_dollar_seconds": (
+                self._stale_unobserved_sample_dollar_seconds
+            ),
             "scheduler/costs/stale_additional_dollar_seconds": (
                 self._stale_additional_dollar_seconds
             ),
@@ -5612,6 +5645,7 @@ class ObjectiveScheduler:
             + self._queue_wait_dollar_seconds
             + self._rollout_admission_dollar_seconds
             + self._train_dollar_seconds
+            + self._stale_unobserved_sample_dollar_seconds
             + self._stale_additional_dollar_seconds
         )
 
@@ -6710,6 +6744,24 @@ def _groups_sample_dollar_seconds(groups: Sequence[TrajectoryGroup]) -> float:
         _trajectory_sample_dollar_seconds(trajectory)
         for group in groups
         for trajectory in group.trajectories
+    )
+
+
+def _groups_unobserved_sample_dollar_seconds(
+    groups: Sequence[TrajectoryGroup],
+) -> float:
+    return sum(
+        _trajectory_sample_dollar_seconds(trajectory)
+        for group in groups
+        for trajectory in group.trajectories
+        if not _trajectory_rollout_observed(trajectory)
+    )
+
+
+def _trajectory_rollout_observed(trajectory: Trajectory) -> bool:
+    return _state_bool(
+        trajectory.metadata.get("scheduler/rollout_observed"),
+        False,
     )
 
 

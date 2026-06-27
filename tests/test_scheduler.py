@@ -3125,8 +3125,16 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         restored_metrics = restored.metrics()
 
         self.assertEqual(metrics["scheduler/stale_sample_dollar_seconds"], 2.0)
+        self.assertEqual(
+            metrics["scheduler/stale_unobserved_sample_dollar_seconds"],
+            0.0,
+        )
         self.assertEqual(metrics["scheduler/stale_additional_dollar_seconds"], 3.0)
         self.assertEqual(metrics["scheduler/stale_total_dollar_seconds"], 5.0)
+        self.assertEqual(
+            metrics["scheduler/stale_last_unobserved_sample_dollar_seconds"],
+            0.0,
+        )
         self.assertEqual(
             metrics["scheduler/stale_last_additional_dollar_seconds"],
             3.0,
@@ -3152,6 +3160,10 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             3.0,
         )
         self.assertEqual(
+            metrics["scheduler/costs/stale_unobserved_sample_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
             metrics["scheduler/costs/stale_total_dollar_seconds"],
             5.0,
         )
@@ -3166,6 +3178,65 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(
             restored_metrics["scheduler/stale_total_dollar_seconds"],
             5.0,
+        )
+
+    def test_stale_penalty_accounts_unobserved_sample_cost(self):
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="direct-stale",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=2.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "direct-stale|token",
+                "scheduler/active_target_train_batch_groups": 1,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="direct-stale",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_stale_batch(
+            groups=[group],
+            policy_step=3,
+            reason="direct_stale_feedback",
+        )
+        metrics = scheduler.metrics()
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(metrics["scheduler/stale_sample_dollar_seconds"], 2.0)
+        self.assertEqual(
+            metrics["scheduler/stale_unobserved_sample_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/stale_last_unobserved_sample_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/costs/stale_unobserved_sample_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/stale_unobserved_sample_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/stale_last_unobserved_sample_dollar_seconds"],
+            2.0,
         )
 
     def test_train_objective_scales_by_useful_experience_count(self):
@@ -5303,10 +5374,12 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/stale_last_experience_count",
             "scheduler/stale_last_lost_reward_improving_experience",
             "scheduler/stale_last_sample_dollar_seconds",
+            "scheduler/stale_last_unobserved_sample_dollar_seconds",
             "scheduler/stale_last_total_dollar_seconds",
             "scheduler/stale_last_policy_step",
             "scheduler/stale_lost_reward_improving_experience",
             "scheduler/stale_sample_dollar_seconds",
+            "scheduler/stale_unobserved_sample_dollar_seconds",
             "scheduler/stale_total_dollar_seconds",
             "scheduler/arm/stale_token/stale_updates",
             "scheduler/arm/stale_token/stale_experience",
