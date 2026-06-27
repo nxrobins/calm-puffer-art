@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
@@ -15,6 +16,7 @@ from .actions import (
     action_codec_key,
     action_space_checkpoint_metadata,
     action_space_signature,
+    safe_metric_key,
 )
 from .runtime import (
     TrajectoryRingBuffer,
@@ -84,6 +86,16 @@ class AsyncArtBackendConfig:
             raise ValueError("max_train_steps must be positive when set")
         if self.cost_per_second_usd < 0:
             raise ValueError("cost_per_second_usd must be non-negative")
+
+
+@dataclass
+class PublicationDecisionStats:
+    decisions: int = 0
+    published: int = 0
+    total_candidate_improvement: float = 0.0
+    total_published_policy_improvement: float = 0.0
+    total_reward_improving_experience: float = 0.0
+    total_dollar_seconds: float = 0.0
 
 
 def art_trajectory_to_local(
@@ -330,6 +342,10 @@ class AsyncArtBackend:
         self._published_policy_reward_improving_experience = 0.0
         self._latest_published_policy_score = 0.0
         self._last_published_policy_score = 0.0
+        self._publication_decision_stats: defaultdict[
+            str,
+            PublicationDecisionStats,
+        ] = defaultdict(PublicationDecisionStats)
         self._pending_groups: list[_PendingArtGroup] = []
         self._pending_lock = asyncio.Lock()
 
@@ -401,6 +417,9 @@ class AsyncArtBackend:
             ),
             "latest_published_policy_score": self._latest_published_policy_score,
             "last_published_policy_score": self._last_published_policy_score,
+            "publication_decision_stats": _publication_decision_stats_state(
+                self._publication_decision_stats
+            ),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -434,6 +453,9 @@ class AsyncArtBackend:
         self._last_published_policy_score = _state_float(
             state.get("last_published_policy_score"),
             self._last_published_policy_score,
+        )
+        self._publication_decision_stats = _publication_decision_stats_from_state(
+            state.get("publication_decision_stats")
         )
 
     async def admit_rollout(
@@ -909,7 +931,12 @@ class AsyncArtBackend:
                             self.scheduler.metrics()
                         )
                 self._schedule_stale_pending_discard()
-                self._record_published_update(local_result, local_groups)
+                self._record_published_update(
+                    local_result,
+                    local_groups,
+                    dollar_seconds=train_dollar_seconds,
+                    reason="synchronous_fallback",
+                )
                 checkpoint_metadata = dict(local_result.metadata)
                 checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
                 checkpoint_metadata.update(
@@ -1099,6 +1126,35 @@ class AsyncArtBackend:
             )
         else:
             accounted_published_objective = 0.0
+        publication_decisions = sum(
+            decision.decisions
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_published = sum(
+            decision.published
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_candidate_improvement = sum(
+            decision.total_candidate_improvement
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_published_improvement = sum(
+            decision.total_published_policy_improvement
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_experience = sum(
+            decision.total_reward_improving_experience
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_dollar_seconds = sum(
+            decision.total_dollar_seconds
+            for decision in self._publication_decision_stats.values()
+        )
+        publication_positive_keys = sum(
+            1
+            for decision in self._publication_decision_stats.values()
+            if decision.total_reward_improving_experience > 0.0
+        )
         stats = self.ring.stats()
         stats["art_backend/wall_clock_s"] = wall_s
         stats["art_backend/wall_clock_dollar_seconds"] = wall_dollar_seconds
@@ -1171,6 +1227,79 @@ class AsyncArtBackend:
         stats[
             "art_backend/accounted_published_policy_reward_improving_experience_per_dollar_second"
         ] = accounted_published_objective
+        stats["art_backend/publication/decision/keys"] = float(
+            len(self._publication_decision_stats)
+        )
+        stats["art_backend/publication/decision/decisions"] = float(
+            publication_decisions
+        )
+        stats["art_backend/publication/decision/published"] = float(
+            publication_published
+        )
+        stats[
+            "art_backend/publication/decision/positive_reward_improving_keys"
+        ] = float(publication_positive_keys)
+        stats[
+            "art_backend/publication/decision/total_candidate_improvement"
+        ] = publication_candidate_improvement
+        stats[
+            "art_backend/publication/decision/total_published_policy_improvement"
+        ] = publication_published_improvement
+        stats[
+            "art_backend/publication/decision/realized_reward_improving_experience"
+        ] = publication_experience
+        stats[
+            "art_backend/publication/decision/total_dollar_seconds"
+        ] = publication_dollar_seconds
+        stats[
+            "art_backend/publication/decision/"
+            "mean_realized_reward_improving_experience_per_decision"
+        ] = (
+            publication_experience / publication_decisions
+            if publication_decisions
+            else 0.0
+        )
+        stats[
+            "art_backend/publication/decision/"
+            "realized_reward_improving_experience_per_dollar_second"
+        ] = (
+            publication_experience / publication_dollar_seconds
+            if publication_dollar_seconds
+            else 0.0
+        )
+        for key, decision in sorted(self._publication_decision_stats.items()):
+            prefix = f"art_backend/publication/decision/{safe_metric_key(key)}"
+            stats[f"{prefix}/decisions"] = float(decision.decisions)
+            stats[f"{prefix}/published"] = float(decision.published)
+            stats[f"{prefix}/total_candidate_improvement"] = (
+                decision.total_candidate_improvement
+            )
+            stats[f"{prefix}/total_published_policy_improvement"] = (
+                decision.total_published_policy_improvement
+            )
+            stats[f"{prefix}/realized_reward_improving_experience"] = (
+                decision.total_reward_improving_experience
+            )
+            stats[f"{prefix}/total_dollar_seconds"] = (
+                decision.total_dollar_seconds
+            )
+            stats[
+                f"{prefix}/"
+                "mean_realized_reward_improving_experience_per_decision"
+            ] = (
+                decision.total_reward_improving_experience / decision.decisions
+                if decision.decisions
+                else 0.0
+            )
+            stats[
+                f"{prefix}/"
+                "realized_reward_improving_experience_per_dollar_second"
+            ] = (
+                decision.total_reward_improving_experience
+                / decision.total_dollar_seconds
+                if decision.total_dollar_seconds
+                else 0.0
+            )
         if scheduler_stats:
             stats.update(scheduler_stats)
         if self.action_space is not None:
@@ -1245,7 +1374,14 @@ class AsyncArtBackend:
                             self.scheduler.metrics()
                         )
                 self._schedule_stale_pending_discard()
-                self._record_published_update(local_result, batch.groups)
+                self._record_published_update(
+                    local_result,
+                    batch.groups,
+                    dollar_seconds=(
+                        train_dollar_seconds + train_wait_dollar_seconds
+                    ),
+                    reason="async_train_result",
+                )
                 checkpoint_metadata = dict(local_result.metadata)
                 checkpoint_metadata.update(scheduler_checkpoint_metadata(self.scheduler))
                 checkpoint_metadata.update(
@@ -1277,15 +1413,29 @@ class AsyncArtBackend:
         self,
         result: TrainResult,
         groups: Sequence[TrajectoryGroup],
+        *,
+        dollar_seconds: float = 0.0,
+        reason: str = "backend_train_result",
     ) -> None:
         score = train_result_score(result, groups)
         improvement = max(0.0, score - self._last_published_policy_score)
         experience = useful_experience_count(groups)
+        reward_improving_experience = improvement * experience
         self._published_policy_updates += 1
         self._published_policy_improvement += improvement
         self._published_policy_reward_improving_experience += (
-            improvement * experience
+            reward_improving_experience
         )
+        decision_key = _publication_decision_key(reason)
+        decision_stats = self._publication_decision_stats[decision_key]
+        decision_stats.decisions += 1
+        decision_stats.published += 1
+        decision_stats.total_candidate_improvement += improvement
+        decision_stats.total_published_policy_improvement += improvement
+        decision_stats.total_reward_improving_experience += (
+            reward_improving_experience
+        )
+        decision_stats.total_dollar_seconds += max(0.0, dollar_seconds)
         self._last_published_policy_score = score
         self._latest_published_policy_score = score
 
@@ -2200,6 +2350,74 @@ def _first_int(*values: Any) -> int:
         if parsed is not None:
             return parsed
     return 0
+
+
+def _publication_decision_key(reason: str) -> str:
+    safe_reason = safe_metric_key(str(reason).strip()) or "backend_train_result"
+    return f"action=publish|reason={safe_reason}"
+
+
+def _publication_decision_stats_state(
+    stats: Mapping[str, PublicationDecisionStats],
+) -> dict[str, dict[str, float | int]]:
+    return {
+        key: {
+            "decisions": value.decisions,
+            "published": value.published,
+            "total_candidate_improvement": value.total_candidate_improvement,
+            "total_published_policy_improvement": (
+                value.total_published_policy_improvement
+            ),
+            "total_reward_improving_experience": (
+                value.total_reward_improving_experience
+            ),
+            "total_dollar_seconds": value.total_dollar_seconds,
+        }
+        for key, value in stats.items()
+    }
+
+
+def _publication_decision_stats_from_state(
+    state: Any,
+) -> defaultdict[str, PublicationDecisionStats]:
+    restored: defaultdict[str, PublicationDecisionStats] = defaultdict(
+        PublicationDecisionStats
+    )
+    if not isinstance(state, Mapping):
+        return restored
+    for raw_key, raw_stats in state.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_stats, Mapping):
+            continue
+        restored[raw_key] = PublicationDecisionStats(
+            decisions=max(0, _state_int(raw_stats.get("decisions"), 0)),
+            published=max(0, _state_int(raw_stats.get("published"), 0)),
+            total_candidate_improvement=max(
+                0.0,
+                _state_float(
+                    raw_stats.get("total_candidate_improvement"),
+                    0.0,
+                ),
+            ),
+            total_published_policy_improvement=max(
+                0.0,
+                _state_float(
+                    raw_stats.get("total_published_policy_improvement"),
+                    0.0,
+                ),
+            ),
+            total_reward_improving_experience=max(
+                0.0,
+                _state_float(
+                    raw_stats.get("total_reward_improving_experience"),
+                    0.0,
+                ),
+            ),
+            total_dollar_seconds=max(
+                0.0,
+                _state_float(raw_stats.get("total_dollar_seconds"), 0.0),
+            ),
+        )
+    return restored
 
 
 def _state_int(value: Any, default: int) -> int:

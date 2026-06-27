@@ -147,6 +147,68 @@ def assert_promotion_decision_payoff_metrics(
     )
 
 
+def assert_art_publication_decision_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertGreater(metrics["art_backend/publication/decision/keys"], 0.0)
+    test_case.assertGreater(
+        metrics["art_backend/publication/decision/decisions"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["art_backend/publication/decision/published"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics[
+            "art_backend/publication/decision/positive_reward_improving_keys"
+        ],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics[
+            "art_backend/publication/decision/"
+            "total_candidate_improvement"
+        ],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics[
+            "art_backend/publication/decision/"
+            "total_published_policy_improvement"
+        ],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics[
+            "art_backend/publication/decision/"
+            "realized_reward_improving_experience"
+        ],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["art_backend/publication/decision/total_dollar_seconds"],
+        0.0,
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "art_backend/publication/decision/"
+                "mean_realized_reward_improving_experience_per_decision"
+            ]
+        )
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "art_backend/publication/decision/"
+                "realized_reward_improving_experience_per_dollar_second"
+            ]
+        )
+    )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -446,6 +508,7 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertGreater(objective["art_backend/submitted_groups"], 0.0)
         self.assertGreater(objective["art_backend/completed_batches"], 0.0)
+        assert_art_publication_decision_payoff_metrics(self, objective)
 
 
 if __name__ == "__main__":

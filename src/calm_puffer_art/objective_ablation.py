@@ -721,6 +721,18 @@ def bridge_summary_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "art_backend/completed_batches",
         "art_backend/published_policy_updates",
         "art_backend/published_policy_reward_improving_experience",
+        "art_backend/publication/decision/keys",
+        "art_backend/publication/decision/decisions",
+        "art_backend/publication/decision/published",
+        "art_backend/publication/decision/positive_reward_improving_keys",
+        "art_backend/publication/decision/total_candidate_improvement",
+        "art_backend/publication/decision/total_published_policy_improvement",
+        "art_backend/publication/decision/realized_reward_improving_experience",
+        "art_backend/publication/decision/total_dollar_seconds",
+        "art_backend/publication/decision/"
+        "mean_realized_reward_improving_experience_per_decision",
+        "art_backend/publication/decision/"
+        "realized_reward_improving_experience_per_dollar_second",
         "actions/semantic_bandwidth_tokens_per_decision",
         "action_space/active_codecs",
         "action_space/promotions",

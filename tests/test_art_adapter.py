@@ -282,6 +282,15 @@ class ArtAdapterTests(unittest.TestCase):
             ],
             0.75,
         )
+        state_decisions = update.metadata[ART_BACKEND_STATE_KEY][
+            "publication_decision_stats"
+        ]
+        self.assertEqual(
+            state_decisions[
+                "action=publish|reason=async_train_result"
+            ]["decisions"],
+            1,
+        )
         self.assertEqual(update.metadata[SCHEDULER_STATE_KEY]["version"], 1)
         self.assertIn("art-task|art", update.metadata[SCHEDULER_STATE_KEY]["arms"])
         self.assertGreater(
@@ -300,6 +309,39 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(stats["art_backend/published_policy_improvement"], 0.75)
         self.assertEqual(
             stats["art_backend/published_policy_reward_improving_experience"],
+            0.75,
+        )
+        self.assertEqual(stats["art_backend/publication/decision/keys"], 1.0)
+        self.assertEqual(stats["art_backend/publication/decision/decisions"], 1.0)
+        self.assertEqual(stats["art_backend/publication/decision/published"], 1.0)
+        self.assertEqual(
+            stats[
+                "art_backend/publication/decision/"
+                "positive_reward_improving_keys"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            stats[
+                "art_backend/publication/decision/"
+                "total_published_policy_improvement"
+            ],
+            0.75,
+        )
+        self.assertEqual(
+            stats[
+                "art_backend/publication/decision/"
+                "realized_reward_improving_experience"
+            ],
+            0.75,
+        )
+        decision_prefix = (
+            "art_backend/publication/decision/"
+            "action_publish_reason_async_train_result"
+        )
+        self.assertEqual(stats[f"{decision_prefix}/decisions"], 1.0)
+        self.assertEqual(
+            stats[f"{decision_prefix}/realized_reward_improving_experience"],
             0.75,
         )
         self.assertEqual(stats["art_backend/latest_published_policy_score"], 0.75)
@@ -620,6 +662,15 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(stats["art_backend/published_policy_improvement"], 0.75)
         self.assertEqual(
             stats["art_backend/published_policy_reward_improving_experience"],
+            0.75,
+        )
+        self.assertEqual(stats["art_backend/publication/decision/decisions"], 2.0)
+        self.assertEqual(stats["art_backend/publication/decision/published"], 2.0)
+        self.assertEqual(
+            stats[
+                "art_backend/publication/decision/"
+                "realized_reward_improving_experience"
+            ],
             0.75,
         )
         self.assertEqual(stats["art_backend/latest_published_policy_score"], 0.75)
