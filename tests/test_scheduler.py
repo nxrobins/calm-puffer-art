@@ -4052,13 +4052,13 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             min_train_steps=1,
             roi_patience=1,
             min_train_objective=0.5,
+            continuation_objective="train",
         )
         accounted = ObjectiveScheduler(
             exploration_bonus=0.0,
             min_train_steps=1,
             roi_patience=1,
             min_train_objective=0.5,
-            continuation_objective="accounted",
         )
 
         for scheduler in (train_only, accounted):
@@ -4111,6 +4111,15 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/accounted_last_dollar_seconds"], 100.0)
         self.assertEqual(metrics["scheduler/continuation/objective_accounted"], 1.0)
         self.assertEqual(metrics["scheduler/stop_recommended"], 1.0)
+
+    def test_continuation_roi_defaults_to_accounted_objective(self):
+        scheduler = ObjectiveScheduler()
+
+        self.assertEqual(scheduler.continuation_objective, "accounted")
+        self.assertEqual(
+            scheduler.metrics()["scheduler/continuation/objective_accounted"],
+            1.0,
+        )
 
     def test_accounted_budget_stops_after_dollar_second_limit(self):
         scheduler = ObjectiveScheduler(

@@ -337,7 +337,7 @@ class ObjectiveScheduler:
         min_train_steps: int = 1,
         roi_patience: int | None = None,
         min_train_objective: float = 0.0,
-        continuation_objective: str = "train",
+        continuation_objective: str = "accounted",
         control_train_objective: str = "accounted",
         max_accounted_dollar_seconds: float | None = None,
         max_rollout_admission_delay_s: float = 0.0,
