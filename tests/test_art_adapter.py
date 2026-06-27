@@ -1473,6 +1473,9 @@ class ArtAdapterTests(unittest.TestCase):
             metrics["scheduler/control/cadence_1/train_updates"],
             1.0,
         )
+        self.assertEqual(metrics["scheduler/train_selection/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/train_selection/train_updates"], 1.0)
+        self.assertGreater(metrics["scheduler/train_selection/total_objective"], 0.0)
         self.assertEqual(update.step, 1)
         self.assertIn(SCHEDULER_STATE_KEY, update.metadata)
         self.assertIn(ART_BACKEND_STATE_KEY, update.metadata)

@@ -897,8 +897,9 @@ class AsyncArtBackend:
                 )
                 return future
             self._observe_submitted_rollouts(local_groups)
-            started = time.perf_counter()
             policy_step = self._current_step
+            self._record_train_group_selection(local_groups, policy_step=policy_step)
+            started = time.perf_counter()
             try:
                 result = await _maybe_await(
                     self.backend.train(model, art_groups, **kwargs)
@@ -1610,16 +1611,27 @@ class AsyncArtBackend:
         *,
         policy_step: int,
     ) -> None:
+        self._record_train_group_selection(
+            batch.groups,
+            policy_step=policy_step,
+        )
+
+    def _record_train_group_selection(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        policy_step: int,
+    ) -> None:
         if self.scheduler is None:
             return
         recorder = getattr(self.scheduler, "record_train_batch_selection", None)
         if recorder is None:
             return
         priority = self.scheduler.score_train_groups(
-            batch.groups,
+            groups,
             policy_step=policy_step,
         )
-        recorder(batch.groups, priority=priority, policy_step=policy_step)
+        recorder(groups, priority=priority, policy_step=policy_step)
 
     async def _submit_local_batch(
         self,
