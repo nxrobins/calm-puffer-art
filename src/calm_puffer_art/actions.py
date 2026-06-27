@@ -468,6 +468,7 @@ class AdaptiveActionSpace:
     demotion_min_reference_logprob_coverage: float = 0.0
     demotion_min_pulls: int = 2
     demotion_decision_payoff_threshold: float = 0.0
+    demotion_decision_source_token_throughput_payoff_threshold: float | None = None
     demotion_decision_min_observations: int = 2
     demote_on_stale_feedback: bool = False
     promote_latent_patches: bool = False
@@ -479,6 +480,7 @@ class AdaptiveActionSpace:
     _promotions: int = field(default=0, init=False)
     _demotions: int = field(default=0, init=False)
     _decision_payoff_demotions: int = field(default=0, init=False)
+    _source_token_throughput_payoff_demotions: int = field(default=0, init=False)
     _decision_stats: dict[str, "_ActionSpaceDecisionStats"] = field(
         default_factory=dict,
         init=False,
@@ -538,6 +540,21 @@ class AdaptiveActionSpace:
         if self.demotion_decision_min_observations <= 0:
             raise ValueError(
                 "demotion_decision_min_observations must be positive"
+            )
+        source_token_payoff_threshold = _finite_float(
+            self.demotion_decision_source_token_throughput_payoff_threshold
+        )
+        if (
+            self.demotion_decision_source_token_throughput_payoff_threshold
+            is not None
+        ):
+            if source_token_payoff_threshold is None:
+                raise ValueError(
+                    "demotion_decision_source_token_throughput_payoff_threshold "
+                    "must be finite or None"
+                )
+            self.demotion_decision_source_token_throughput_payoff_threshold = (
+                source_token_payoff_threshold
             )
         if self.latent_patch_latent_size <= 0:
             raise ValueError("latent_patch_latent_size must be positive")
@@ -696,10 +713,11 @@ class AdaptiveActionSpace:
             if signal.pulls < self.demotion_min_pulls:
                 continue
             heuristic_demotion = self._should_demote(codec, signal, metrics)
-            decision_payoff_demotion = self._should_demote_from_decision_payoff(
+            decision_payoff_causes = self._decision_payoff_demotion_causes(
                 codec,
                 metrics,
             )
+            decision_payoff_demotion = bool(decision_payoff_causes)
             if not (heuristic_demotion or decision_payoff_demotion):
                 continue
             for candidate in tuple(self._codecs):
@@ -719,6 +737,8 @@ class AdaptiveActionSpace:
                     self._demotions += 1
                     if decision_payoff_demotion and not heuristic_demotion:
                         self._decision_payoff_demotions += 1
+                        if "source_token_throughput" in decision_payoff_causes:
+                            self._source_token_throughput_payoff_demotions += 1
         return disabled
 
     def _should_demote(
@@ -748,11 +768,11 @@ class AdaptiveActionSpace:
             return True
         return signal.objective <= self.demotion_objective_threshold
 
-    def _should_demote_from_decision_payoff(
+    def _decision_payoff_demotion_causes(
         self,
         codec: ActionCodec,
         metrics: Mapping[str, float],
-    ) -> bool:
+    ) -> set[str]:
         parent = self._parent_codec(codec)
         decision_key = _action_space_decision_key(
             kind="promotion",
@@ -761,16 +781,38 @@ class AdaptiveActionSpace:
         )
         stats = self._decision_stats.get(decision_key)
         if stats is None or stats.kind != "promotion":
-            return False
+            return set()
         self._update_decision_payoff(stats, metrics)
         if (
             stats.post_decision_observations
             < self.demotion_decision_min_observations
         ):
-            return False
-        return (
+            return set()
+        causes: set[str] = set()
+        if (
             stats.realized_objective_payoff
             <= self.demotion_decision_payoff_threshold
+        ):
+            causes.add("objective")
+        source_token_threshold = (
+            self.demotion_decision_source_token_throughput_payoff_threshold
+        )
+        if (
+            source_token_threshold is not None
+            and self._has_source_token_throughput_payoff_evidence(stats)
+            and stats.realized_source_token_throughput_payoff
+            <= source_token_threshold
+        ):
+            causes.add("source_token_throughput")
+        return causes
+
+    @staticmethod
+    def _has_source_token_throughput_payoff_evidence(
+        stats: "_ActionSpaceDecisionStats",
+    ) -> bool:
+        return (
+            stats.target_source_tokens_per_dollar_second > 0.0
+            or stats.parent_source_tokens_per_dollar_second > 0.0
         )
 
     def _parent_outperforms(
@@ -1028,6 +1070,9 @@ class AdaptiveActionSpace:
                 "demotion_decision_payoff_threshold": (
                     self.demotion_decision_payoff_threshold
                 ),
+                "demotion_decision_source_token_throughput_payoff_threshold": (
+                    self.demotion_decision_source_token_throughput_payoff_threshold
+                ),
                 "demotion_decision_min_observations": (
                     self.demotion_decision_min_observations
                 ),
@@ -1042,6 +1087,9 @@ class AdaptiveActionSpace:
                 "promotions": self._promotions,
                 "demotions": self._demotions,
                 "decision_payoff_demotions": self._decision_payoff_demotions,
+                "source_token_throughput_payoff_demotions": (
+                    self._source_token_throughput_payoff_demotions
+                ),
             },
             "decision_stats": {
                 key: _action_space_decision_stats_state(stats)
@@ -1154,6 +1202,14 @@ class AdaptiveActionSpace:
             config.get("demotion_decision_payoff_threshold"),
             self.demotion_decision_payoff_threshold,
         )
+        self.demotion_decision_source_token_throughput_payoff_threshold = (
+            _state_optional_float(
+                config.get(
+                    "demotion_decision_source_token_throughput_payoff_threshold"
+                ),
+                self.demotion_decision_source_token_throughput_payoff_threshold,
+            )
+        )
         self.demotion_decision_min_observations = _state_int(
             config.get("demotion_decision_min_observations"),
             self.demotion_decision_min_observations,
@@ -1265,6 +1321,10 @@ class AdaptiveActionSpace:
             learning_state.get("decision_payoff_demotions"),
             self._decision_payoff_demotions,
         )
+        self._source_token_throughput_payoff_demotions = _state_int(
+            learning_state.get("source_token_throughput_payoff_demotions"),
+            self._source_token_throughput_payoff_demotions,
+        )
         self._decision_stats = _action_space_decision_stats_from_state(
             state.get("decision_stats")
         )
@@ -1289,6 +1349,9 @@ class AdaptiveActionSpace:
             "action_space/demotions": float(self._demotions),
             "action_space/decision_payoff_demotions": float(
                 self._decision_payoff_demotions
+            ),
+            "action_space/source_token_throughput_payoff_demotions": float(
+                self._source_token_throughput_payoff_demotions
             ),
             "action_space/disabled_codecs": float(len(self._disabled_codec_keys)),
             "action_space/max_chunk_size": float(self._active_max_chunk_size()),
@@ -1318,6 +1381,18 @@ class AdaptiveActionSpace:
             ),
             "action_space/demotion_decision_payoff_threshold": (
                 self.demotion_decision_payoff_threshold
+            ),
+            "action_space/demotion_decision_source_token_throughput_payoff_enabled": (
+                1.0
+                if self.demotion_decision_source_token_throughput_payoff_threshold
+                is not None
+                else 0.0
+            ),
+            "action_space/demotion_decision_source_token_throughput_payoff_threshold": (
+                self.demotion_decision_source_token_throughput_payoff_threshold
+                if self.demotion_decision_source_token_throughput_payoff_threshold
+                is not None
+                else 0.0
             ),
             "action_space/demotion_decision_min_observations": float(
                 self.demotion_decision_min_observations
@@ -1851,6 +1926,13 @@ def _state_int(value: Any, default: int) -> int:
 
 
 def _state_float(value: Any, default: float) -> float:
+    parsed = _finite_float(value)
+    return default if parsed is None else parsed
+
+
+def _state_optional_float(value: Any, default: float | None) -> float | None:
+    if value is None:
+        return default
     parsed = _finite_float(value)
     return default if parsed is None else parsed
 
