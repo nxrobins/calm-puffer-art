@@ -162,6 +162,14 @@ class ObjectiveAblationTests(unittest.TestCase):
             objective["scheduler/joint_action/positive_objective_tuples"],
             0.0,
         )
+        self.assertGreater(
+            objective["scheduler/joint_action/mean_objective_per_decision"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/joint_action/mean_objective_per_feedback_update"],
+            0.0,
+        )
         self.assertTrue(
             isfinite(objective["scheduler/last_train_batch_joint_action_score"])
         )
@@ -218,6 +226,14 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertGreater(
             objective["scheduler/joint_action/positive_objective_tuples"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/joint_action/mean_objective_per_decision"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/joint_action/mean_objective_per_feedback_update"],
             0.0,
         )
         self.assertGreater(objective["art_backend/submitted_groups"], 0.0)

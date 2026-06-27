@@ -634,6 +634,8 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "scheduler/joint_action/feedback_tuples",
         "scheduler/joint_action/positive_objective_tuples",
         "scheduler/joint_action/total_objective",
+        "scheduler/joint_action/mean_objective_per_decision",
+        "scheduler/joint_action/mean_objective_per_feedback_update",
         "scheduler/last_train_batch_joint_action_score",
     ]
     return {
@@ -676,6 +678,8 @@ def bridge_summary_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "scheduler/joint_action/feedback_updates",
         "scheduler/joint_action/positive_objective_tuples",
         "scheduler/joint_action/total_objective",
+        "scheduler/joint_action/mean_objective_per_decision",
+        "scheduler/joint_action/mean_objective_per_feedback_update",
         "scheduler/last_train_batch_joint_action_score",
     ]
     return {key: float(metrics[key]) for key in keys if key in metrics}

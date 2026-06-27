@@ -3005,26 +3005,37 @@ class ObjectiveScheduler:
             key: _control_feedback_updates(stats)
             for key, stats in self._joint_action_controls.items()
         }
+        joint_decisions = sum(
+            stats.decisions for stats in self._joint_action_controls.values()
+        )
+        joint_rollout_updates = sum(
+            stats.rollout_updates for stats in self._joint_action_controls.values()
+        )
+        joint_train_updates = sum(
+            stats.train_updates for stats in self._joint_action_controls.values()
+        )
+        joint_stale_updates = sum(
+            stats.stale_updates for stats in self._joint_action_controls.values()
+        )
+        joint_total_feedback_updates = sum(joint_feedback_updates.values())
+        joint_total_objective = sum(
+            stats.total_objective for stats in self._joint_action_controls.values()
+        )
+        joint_total_stale_penalty_objective = sum(
+            stats.total_stale_penalty_objective
+            for stats in self._joint_action_controls.values()
+        )
         metrics["scheduler/joint_action/tuples"] = float(
             len(self._joint_action_controls)
         )
-        metrics["scheduler/joint_action/decisions"] = float(
-            sum(stats.decisions for stats in self._joint_action_controls.values())
-        )
+        metrics["scheduler/joint_action/decisions"] = float(joint_decisions)
         metrics["scheduler/joint_action/rollout_updates"] = float(
-            sum(
-                stats.rollout_updates
-                for stats in self._joint_action_controls.values()
-            )
+            joint_rollout_updates
         )
-        metrics["scheduler/joint_action/train_updates"] = float(
-            sum(stats.train_updates for stats in self._joint_action_controls.values())
-        )
-        metrics["scheduler/joint_action/stale_updates"] = float(
-            sum(stats.stale_updates for stats in self._joint_action_controls.values())
-        )
+        metrics["scheduler/joint_action/train_updates"] = float(joint_train_updates)
+        metrics["scheduler/joint_action/stale_updates"] = float(joint_stale_updates)
         metrics["scheduler/joint_action/feedback_updates"] = float(
-            sum(joint_feedback_updates.values())
+            joint_total_feedback_updates
         )
         metrics["scheduler/joint_action/feedback_tuples"] = float(
             sum(1 for updates in joint_feedback_updates.values() if updates > 0)
@@ -3036,21 +3047,35 @@ class ObjectiveScheduler:
                 if stats.total_objective > 0.0
             )
         )
-        metrics["scheduler/joint_action/total_objective"] = sum(
-            stats.total_objective for stats in self._joint_action_controls.values()
+        metrics["scheduler/joint_action/total_objective"] = joint_total_objective
+        metrics["scheduler/joint_action/mean_objective_per_decision"] = (
+            joint_total_objective / joint_decisions if joint_decisions else 0.0
         )
-        metrics["scheduler/joint_action/total_stale_penalty_objective"] = sum(
-            stats.total_stale_penalty_objective
-            for stats in self._joint_action_controls.values()
+        metrics["scheduler/joint_action/mean_objective_per_feedback_update"] = (
+            joint_total_objective / joint_total_feedback_updates
+            if joint_total_feedback_updates
+            else 0.0
+        )
+        metrics["scheduler/joint_action/total_stale_penalty_objective"] = (
+            joint_total_stale_penalty_objective
         )
         for key, stats in sorted(self._joint_action_controls.items()):
             prefix = f"scheduler/joint_action/{_safe_metric_key(key)}"
+            feedback_updates = _control_feedback_updates(stats)
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
             metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
-            metrics[f"{prefix}/feedback_updates"] = float(
-                _control_feedback_updates(stats)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
             metrics[f"{prefix}/score"] = self._score_control_value(

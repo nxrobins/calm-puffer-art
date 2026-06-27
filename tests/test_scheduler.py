@@ -77,6 +77,14 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/joint_action/stale_updates"], 1.0)
         self.assertEqual(metrics["scheduler/joint_action/feedback_updates"], 3.0)
         self.assertEqual(metrics["scheduler/joint_action/feedback_tuples"], 1.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/joint_action/mean_objective_per_decision"],
+            metrics["scheduler/joint_action/total_objective"],
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/joint_action/mean_objective_per_feedback_update"],
+            metrics["scheduler/joint_action/total_objective"] / 3.0,
+        )
         self.assertLess(
             metrics["scheduler/joint_action/total_stale_penalty_objective"],
             0.0,
@@ -86,6 +94,14 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
         self.assertEqual(metrics[f"{prefix}/stale_updates"], 1.0)
         self.assertEqual(metrics[f"{prefix}/feedback_updates"], 3.0)
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/mean_objective_per_decision"],
+            metrics[f"{prefix}/total_objective"],
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/mean_objective_per_feedback_update"],
+            metrics[f"{prefix}/total_objective"] / 3.0,
+        )
         self.assertLess(metrics[f"{prefix}/total_stale_penalty_objective"], 0.0)
 
         restored = ObjectiveScheduler()
