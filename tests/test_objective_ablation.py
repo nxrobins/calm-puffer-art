@@ -49,6 +49,34 @@ def assert_action_space_payoff_means(
     )
 
 
+def assert_train_selection_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertGreater(metrics["scheduler/train_selection/keys"], 0.0)
+    test_case.assertGreater(metrics["scheduler/train_selection/decisions"], 0.0)
+    test_case.assertGreater(
+        metrics["scheduler/train_selection/feedback_updates"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["scheduler/train_selection/positive_objective_keys"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["scheduler/train_selection/total_objective"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["scheduler/train_selection/mean_objective_per_decision"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["scheduler/train_selection/mean_objective_per_feedback_update"],
+        0.0,
+    )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -124,6 +152,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/actor_count_2",
             ),
         )
+        assert_train_selection_payoff_metrics(self, objective)
 
     def test_adaptive_action_space_ablation_beats_fixed_bandwidth(self):
         result = asyncio.run(run_action_space_ablation())
@@ -228,6 +257,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/actor_count_2",
             ),
         )
+        assert_train_selection_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
             objective["scheduler/joint_action/feedback_updates"],
@@ -320,6 +350,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/actor_count_2",
             ),
         )
+        assert_train_selection_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
             objective["scheduler/joint_action/feedback_updates"],

@@ -1316,6 +1316,11 @@ class ControlPlane:
                 telemetry.record_train_wait(train_wait_s)
                 if batch is None:
                     break
+                self._record_train_batch_selection(
+                    scheduler=scheduler,
+                    batch=batch,
+                    policy_step=current.step,
+                )
                 self._tag_batch_control_metadata(
                     batch.groups,
                     max_policy_lag=train_ring.max_policy_lag,
@@ -2120,6 +2125,25 @@ class ControlPlane:
         if scheduler is None:
             return 0.0
         return scheduler.score_train_groups(groups, policy_step=policy_step)
+
+    def _record_train_batch_selection(
+        self,
+        *,
+        scheduler: AdaptiveScheduler | None,
+        batch: VersionedTrajectoryBatch,
+        policy_step: int,
+    ) -> None:
+        if scheduler is None:
+            return
+        recorder = getattr(scheduler, "record_train_batch_selection", None)
+        if recorder is None:
+            return
+        priority = self._score_train_groups(
+            scheduler=scheduler,
+            groups=batch.groups,
+            policy_step=policy_step,
+        )
+        recorder(batch.groups, priority=priority, policy_step=policy_step)
 
     @staticmethod
     def _batch_priority_scorer(

@@ -172,6 +172,15 @@ class AdaptiveScheduler(Protocol):
     ) -> float:
         ...
 
+    def record_train_batch_selection(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        priority: float,
+        policy_step: int,
+    ) -> None:
+        ...
+
     def should_continue_training(
         self,
         *,
@@ -556,6 +565,7 @@ class ObjectiveScheduler:
         self._admission_controls: dict[int, ControlStats] = {}
         self._actor_count_controls: dict[int, ControlStats] = {}
         self._joint_action_controls: dict[str, ControlStats] = {}
+        self._train_selection_controls: dict[str, ControlStats] = {}
         self._actors: dict[int, ActorStats] = {}
 
     def select_rollout(
@@ -1344,6 +1354,11 @@ class ObjectiveScheduler:
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
+        self._credit_train_objective_to_train_selection(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
         if continuation_objective <= self.min_train_objective:
             self._low_roi_train_steps += 1
         else:
@@ -1531,6 +1546,33 @@ class ObjectiveScheduler:
         self._last_train_batch_cost_normalized_priority = base_priority
         self._last_train_batch_joint_action_score = joint_action_component
         return priority
+
+    def record_train_batch_selection(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        priority: float,
+        policy_step: int,
+    ) -> None:
+        """Record the batch the trainer selected from the ready queue."""
+
+        if not groups:
+            return
+        key = _train_selection_key(groups)
+        stats = self._train_selection_controls.setdefault(key, ControlStats())
+        stats.decisions += 1
+        selected_priority = priority if math.isfinite(priority) else 0.0
+        for group in groups:
+            for trajectory in group.trajectories:
+                trajectory.metadata.setdefault("scheduler/train_selection_key", key)
+                trajectory.metadata.setdefault(
+                    "scheduler/train_selection_priority",
+                    selected_priority,
+                )
+                trajectory.metadata.setdefault(
+                    "scheduler/train_selection_policy_step",
+                    policy_step,
+                )
 
     def should_continue_training(
         self,
@@ -1784,6 +1826,10 @@ class ObjectiveScheduler:
                 key: _dataclass_state(stats)
                 for key, stats in self._joint_action_controls.items()
             },
+            "train_selection_controls": {
+                key: _dataclass_state(stats)
+                for key, stats in self._train_selection_controls.items()
+            },
             "actors": {
                 str(actor_id): _actor_stats_state(stats)
                 for actor_id, stats in self._actors.items()
@@ -2035,6 +2081,9 @@ class ObjectiveScheduler:
         )
         self._joint_action_controls = _string_control_family_from_state(
             state.get("joint_action_controls")
+        )
+        self._train_selection_controls = _string_control_family_from_state(
+            state.get("train_selection_controls")
         )
         self._actors = _actor_family_from_state(state.get("actors"))
 
@@ -3037,6 +3086,85 @@ class ObjectiveScheduler:
                 stats.total_stale_penalty_objective
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        train_selection_feedback_updates = {
+            key: _control_feedback_updates(stats)
+            for key, stats in self._train_selection_controls.items()
+        }
+        train_selection_decisions = sum(
+            stats.decisions for stats in self._train_selection_controls.values()
+        )
+        train_selection_train_updates = sum(
+            stats.train_updates for stats in self._train_selection_controls.values()
+        )
+        train_selection_total_feedback_updates = sum(
+            train_selection_feedback_updates.values()
+        )
+        train_selection_total_objective = sum(
+            stats.total_objective
+            for stats in self._train_selection_controls.values()
+        )
+        metrics["scheduler/train_selection/keys"] = float(
+            len(self._train_selection_controls)
+        )
+        metrics["scheduler/train_selection/decisions"] = float(
+            train_selection_decisions
+        )
+        metrics["scheduler/train_selection/train_updates"] = float(
+            train_selection_train_updates
+        )
+        metrics["scheduler/train_selection/feedback_updates"] = float(
+            train_selection_total_feedback_updates
+        )
+        metrics["scheduler/train_selection/positive_objective_keys"] = float(
+            sum(
+                1
+                for stats in self._train_selection_controls.values()
+                if stats.total_objective > 0.0
+            )
+        )
+        metrics["scheduler/train_selection/total_objective"] = (
+            train_selection_total_objective
+        )
+        metrics["scheduler/train_selection/mean_objective_per_decision"] = (
+            train_selection_total_objective / train_selection_decisions
+            if train_selection_decisions
+            else 0.0
+        )
+        metrics[
+            "scheduler/train_selection/mean_objective_per_feedback_update"
+        ] = (
+            train_selection_total_objective / train_selection_total_feedback_updates
+            if train_selection_total_feedback_updates
+            else 0.0
+        )
+        for key, stats in sorted(self._train_selection_controls.items()):
+            prefix = f"scheduler/train_selection/{_safe_metric_key(key)}"
+            feedback_updates = _control_feedback_updates(stats)
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._train_selection_controls,
+                key,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._train_selection_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
         joint_feedback_updates = {
             key: _control_feedback_updates(stats)
             for key, stats in self._joint_action_controls.items()
@@ -3891,6 +4019,43 @@ class ObjectiveScheduler:
                 _control_feedback_updates(stats),
             )
 
+    def _credit_train_objective_to_train_selection(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        key_credit: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                key = _train_selection_key_from_metadata(trajectory.metadata)
+                if key is None:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                key_credit[key] = key_credit.get(key, 0.0) + credit
+
+        for key, credit in key_credit.items():
+            stats = self._train_selection_controls.setdefault(key, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
     def _credit_train_objective_to_actors(
         self,
         groups: Sequence[TrajectoryGroup],
@@ -4532,6 +4697,44 @@ def _safe_metric_key(value: str) -> str:
 
 def _actor_metric_key(actor_id: int) -> str:
     return _safe_metric_key(f"actor_{actor_id}")
+
+
+def _train_selection_key(groups: Sequence[TrajectoryGroup]) -> str:
+    trajectories = [
+        trajectory
+        for group in groups
+        for trajectory in group.trajectories
+    ]
+    arm_ids = sorted(
+        str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+        for trajectory in trajectories
+    )
+    joint_keys = sorted(
+        key
+        for key in (
+            _joint_action_key_from_metadata(trajectory.metadata)
+            for trajectory in trajectories
+        )
+        if key is not None
+    )
+    arm_component = "+".join(arm_ids) if arm_ids else "none"
+    joint_component = "+".join(joint_keys) if joint_keys else "none"
+    return (
+        f"arms={arm_component}"
+        f"|joints={joint_component}"
+        f"|groups={len(groups)}"
+        f"|trajectories={len(trajectories)}"
+    )
+
+
+def _train_selection_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    raw_key = metadata.get("scheduler/train_selection_key")
+    if raw_key is None:
+        raw_key = metadata.get("train_selection_key")
+    if raw_key is None or isinstance(raw_key, bool):
+        return None
+    key = str(raw_key)
+    return key if key else None
 
 
 def _arm_feedback_updates(stats: ArmStats) -> int:

@@ -2564,6 +2564,74 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0.0,
         )
 
+    def test_train_batch_selection_receives_train_objective_payoff(self):
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="selected",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "selected|token"},
+        )
+        group = TrajectoryGroup(
+            scenario_id="selected",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_rollout(trajectory, accepted=True, dollar_seconds=1.0)
+        priority = scheduler.score_train_groups([group], policy_step=0)
+        scheduler.record_train_batch_selection(
+            [group],
+            priority=priority,
+            policy_step=0,
+        )
+        selection_key = trajectory.metadata["scheduler/train_selection_key"]
+        scheduler.observe_train(
+            groups=[group],
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+
+        metrics = scheduler.metrics()
+        prefix = f"scheduler/train_selection/{_test_metric_key(selection_key)}"
+
+        self.assertEqual(metrics["scheduler/train_selection/keys"], 1.0)
+        self.assertEqual(metrics["scheduler/train_selection/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/train_selection/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/train_selection/feedback_updates"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/train_selection/positive_objective_keys"],
+            1.0,
+        )
+        self.assertGreater(metrics["scheduler/train_selection/total_objective"], 0.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/train_selection/mean_objective_per_decision"],
+            metrics["scheduler/train_selection/total_objective"],
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/train_selection/mean_objective_per_feedback_update"],
+            metrics["scheduler/train_selection/total_objective"],
+        )
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/mean_objective_per_decision"],
+            metrics[f"{prefix}/total_objective"],
+        )
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(restored_metrics[f"{prefix}/train_updates"], 1.0)
+
     def test_control_train_credit_uses_accounted_interval_objective_by_default(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,

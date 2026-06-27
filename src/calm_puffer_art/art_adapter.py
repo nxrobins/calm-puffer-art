@@ -1198,6 +1198,7 @@ class AsyncArtBackend:
             futures = self._batch_futures(batch)
             if not futures:
                 continue
+            self._record_train_batch_selection(batch, policy_step=self._current_step)
             self._tag_batch_control_metadata(
                 batch.groups,
                 max_policy_lag=self.ring.max_policy_lag,
@@ -1452,6 +1453,23 @@ class AsyncArtBackend:
             )
 
         return score_batch
+
+    def _record_train_batch_selection(
+        self,
+        batch: VersionedTrajectoryBatch,
+        *,
+        policy_step: int,
+    ) -> None:
+        if self.scheduler is None:
+            return
+        recorder = getattr(self.scheduler, "record_train_batch_selection", None)
+        if recorder is None:
+            return
+        priority = self.scheduler.score_train_groups(
+            batch.groups,
+            policy_step=policy_step,
+        )
+        recorder(batch.groups, priority=priority, policy_step=policy_step)
 
     async def _submit_local_batch(
         self,
