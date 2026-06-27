@@ -13,6 +13,7 @@ from .actions import (
     action_codec_key,
     action_logprob_stats,
     action_space_checkpoint_metadata,
+    action_space_signature,
     semantic_bandwidth,
 )
 from .art_adapter import (
@@ -146,6 +147,7 @@ __all__ = [
     "action_codec_key",
     "action_logprob_stats",
     "action_space_checkpoint_metadata",
+    "action_space_signature",
     "art_rollout_metadata",
     "art_group_to_local",
     "art_groups_to_local",

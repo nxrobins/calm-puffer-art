@@ -22,6 +22,7 @@ from calm_puffer_art import (
     TrajectoryGroup,
     WeightBroadcastChannel,
     action_codec_key,
+    action_space_signature,
     art_rollout_metadata,
     art_group_to_local,
     local_group_to_art,
@@ -592,14 +593,17 @@ class ArtAdapterTests(unittest.TestCase):
         async def run():
             backend = FakeArtBackend()
             scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=2)
             async_backend = AsyncArtBackend(
                 backend=backend,
                 scheduler=scheduler,
+                action_space=action_space,
                 config=AsyncArtBackendConfig(
                     train_batch_groups=2,
                     max_policy_lag=3,
                 ),
             )
+            expected_signature = action_space_signature(action_space)
             decision = async_backend.select_rollout(
                 scenarios=[Scenario(id="external-select")],
                 action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
@@ -633,9 +637,9 @@ class ArtAdapterTests(unittest.TestCase):
             await async_backend.train("art-model", [art_group])
             metrics = scheduler.metrics()
             await async_backend.close()
-            return decision, metadata, metrics
+            return decision, metadata, metrics, expected_signature
 
-        decision, metadata, metrics = asyncio.run(run())
+        decision, metadata, metrics, expected_signature = asyncio.run(run())
 
         metric_arm = "scheduler/arm/external_select_token"
         self.assertEqual(decision.arm_id, "external-select|token")
@@ -645,6 +649,7 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(metadata["actor_id"], 7)
         self.assertEqual(metadata["scheduler/target_train_batch_groups"], 2)
         self.assertEqual(metadata["scheduler/max_policy_lag"], 3)
+        self.assertEqual(metadata["scheduler/action_space_key"], expected_signature)
         self.assertIn(
             "scheduler/decision/estimated_rollout_dollar_seconds",
             metadata,
@@ -663,6 +668,37 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(
             metrics[f"{metric_arm}/mean_rollout_dollar_seconds"],
             3.0,
+        )
+
+    def test_art_rollout_metadata_preserves_action_space_joint_key(self):
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="external-select")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=7,
+            policy_step=0,
+            trajectory_queue_pressure=0.25,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=2,
+            configured_max_policy_lag=3,
+            active_actor_count=4,
+            rollout_admission_delay_ms=25,
+            action_space_key="bridge-space",
+        )
+
+        metadata = art_rollout_metadata(decision)
+
+        self.assertEqual(metadata["scheduler/action_space_key"], "bridge_space")
+        self.assertEqual(
+            metadata["scheduler/joint_action_key"],
+            scheduling_action_key(
+                arm_id=decision.arm_id,
+                target_train_batch_groups=decision.target_train_batch_groups,
+                max_policy_lag=decision.max_policy_lag,
+                active_actor_count=4,
+                admission_delay_ms=25,
+                action_space_key="bridge-space",
+            ),
         )
 
     def test_async_art_backend_applies_external_actor_admission_control(self):
@@ -1153,19 +1189,24 @@ class ArtAdapterTests(unittest.TestCase):
 
             await async_backend.register("art-model")
             await async_backend.train("art-model", [art_group])
+            expected_signature = action_space_signature(action_space)
             first = async_backend.select_rollout(
                 scenarios=[Scenario(id="adapt")],
                 actor_id=0,
+                active_actor_count=1,
+                rollout_admission_delay_ms=0,
             )
             second = async_backend.select_rollout(
                 scenarios=[Scenario(id="adapt")],
                 actor_id=1,
+                active_actor_count=1,
+                rollout_admission_delay_ms=0,
             )
             metrics = scheduler.metrics()
             await async_backend.close()
-            return first, second, metrics, async_backend.stats()
+            return first, second, metrics, async_backend.stats(), expected_signature
 
-        first, second, metrics, stats = asyncio.run(run())
+        first, second, metrics, stats, expected_signature = asyncio.run(run())
 
         selected_codec_keys = {
             action_codec_key(first.action_codec),
@@ -1179,6 +1220,11 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(
             metrics["scheduler/arm/adapt_chunk_chunk_size_4/decisions"],
             1.0,
+        )
+        self.assertEqual(first.metadata["action_space_key"], expected_signature)
+        self.assertIn(
+            f"|action_space={expected_signature}",
+            first.metadata["joint_action_key"],
         )
 
     def test_async_art_backend_promotes_action_space_from_submitted_rollouts(self):

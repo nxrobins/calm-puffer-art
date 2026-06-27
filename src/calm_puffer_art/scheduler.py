@@ -4,7 +4,12 @@ import math
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping, Protocol, Sequence
 
-from .actions import ActionCodec, ActionLogprobStats, action_logprob_stats
+from .actions import (
+    ActionCodec,
+    ActionLogprobStats,
+    action_logprob_stats,
+    safe_metric_key,
+)
 from .types import Scenario, TrainResult, Trajectory, TrajectoryGroup, mean
 
 
@@ -33,16 +38,21 @@ def scheduling_action_key(
     max_policy_lag: int,
     active_actor_count: int,
     admission_delay_ms: int,
+    action_space_key: str | None = None,
 ) -> str:
     """Stable key for the full rollout/runtime/action scheduling tuple."""
 
-    return (
+    key = (
         f"arm={arm_id}"
         f"|cadence={max(1, int(target_train_batch_groups))}"
         f"|lag={max(0, int(max_policy_lag))}"
         f"|actors={max(0, int(active_actor_count))}"
         f"|admission_ms={max(0, int(admission_delay_ms))}"
     )
+    normalized_action_space_key = _normalize_key_component(action_space_key)
+    if normalized_action_space_key is not None:
+        key = f"{key}|action_space={normalized_action_space_key}"
+    return key
 
 
 class AdaptiveScheduler(Protocol):
@@ -61,6 +71,7 @@ class AdaptiveScheduler(Protocol):
         configured_max_policy_lag: int,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> SchedulerDecision:
         ...
 
@@ -560,11 +571,13 @@ class ObjectiveScheduler:
         configured_max_policy_lag: int,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> SchedulerDecision:
         if not scenarios:
             raise ValueError("at least one scenario is required")
         if not action_codecs:
             raise ValueError("at least one action codec is required")
+        action_space_key = _normalize_key_component(action_space_key)
 
         target_train_batch_groups = self.target_train_batch_groups(
             configured=configured_train_batch_groups,
@@ -589,6 +602,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         arm_ids = [candidate[0] for candidate in arms]
         if coverage_selection is None:
@@ -602,6 +616,7 @@ class ObjectiveScheduler:
                     max_policy_lag=max_policy_lag,
                     active_actor_count=active_actor_count,
                     rollout_admission_delay_ms=rollout_admission_delay_ms,
+                    action_space_key=action_space_key,
                 ),
             )
             coverage_forced = False
@@ -637,6 +652,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
@@ -646,6 +662,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         joint_action_key = self._candidate_joint_action_key(
             arm_id=arm_id,
@@ -653,6 +670,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         reserved_rollout_dollar_seconds = max(0.0, estimated_rollout_dollar_seconds)
         self._record_arm_decision(
@@ -709,6 +727,14 @@ class ObjectiveScheduler:
                 ),
             },
         )
+        if action_space_key is not None:
+            decision = replace(
+                decision,
+                metadata={
+                    **decision.metadata,
+                    "action_space_key": action_space_key,
+                },
+            )
         if joint_action_key is not None:
             decision = replace(
                 decision,
@@ -3021,6 +3047,7 @@ class ObjectiveScheduler:
         max_policy_lag: int,
         active_actor_count: int | None,
         rollout_admission_delay_ms: int | None,
+        action_space_key: str | None = None,
     ) -> tuple[
         tuple[str, Scenario, ActionCodec, float, float, float, float] | None,
         bool,
@@ -3077,6 +3104,7 @@ class ObjectiveScheduler:
                     max_policy_lag=max_policy_lag,
                     active_actor_count=active_actor_count,
                     rollout_admission_delay_ms=rollout_admission_delay_ms,
+                    action_space_key=action_space_key,
                 )
                 > self._score_arm(
                     most_undercovered[0],
@@ -3086,6 +3114,7 @@ class ObjectiveScheduler:
                     max_policy_lag=max_policy_lag,
                     active_actor_count=active_actor_count,
                     rollout_admission_delay_ms=rollout_admission_delay_ms,
+                    action_space_key=action_space_key,
                 )
             ):
                 most_undercovered = candidate
@@ -3136,6 +3165,7 @@ class ObjectiveScheduler:
         max_policy_lag: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
         if stats.pulls == 0:
@@ -3156,6 +3186,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
 
     def _joint_action_score(
@@ -3166,6 +3197,7 @@ class ObjectiveScheduler:
         max_policy_lag: int | None,
         active_actor_count: int | None,
         rollout_admission_delay_ms: int | None,
+        action_space_key: str | None = None,
     ) -> float:
         if self.joint_action_objective_weight <= 0.0:
             return 0.0
@@ -3175,6 +3207,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         if key is None:
             return 0.0
@@ -3208,6 +3241,7 @@ class ObjectiveScheduler:
         max_policy_lag: int | None,
         active_actor_count: int | None,
         rollout_admission_delay_ms: int | None,
+        action_space_key: str | None = None,
     ) -> str | None:
         if (
             target_train_batch_groups is None
@@ -3222,6 +3256,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
 
     def _joint_action_scores_for_control_values(
@@ -4513,6 +4548,14 @@ def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
             "scheduler/rollout_admission_delay_ms",
         ),
     )
+    action_space_key = _first_text_metadata(
+        metadata,
+        (
+            "scheduler/action_space_key",
+            "scheduler/action_space_signature",
+            "action_space_key",
+        ),
+    )
     if (
         cadence is None
         or max_policy_lag is None
@@ -4526,20 +4569,21 @@ def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         max_policy_lag=max_policy_lag,
         active_actor_count=active_actor_count,
         admission_delay_ms=admission_delay_ms,
+        action_space_key=action_space_key,
     )
 
 
 def _joint_action_control_fields(key: str) -> dict[str, int] | None:
-    parts = str(key).rsplit("|cadence=", 1)
-    if len(parts) != 2:
-        return None
-    suffix = parts[1].split("|")
-    if len(suffix) != 4:
-        return None
-    cadence = _state_optional_int(suffix[0], None)
-    lag = _prefixed_int(suffix[1], "lag=")
-    actors = _prefixed_int(suffix[2], "actors=")
-    admission_ms = _prefixed_int(suffix[3], "admission_ms=")
+    values: dict[str, str] = {}
+    for part in str(key).split("|"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        values[name] = value
+    cadence = _state_optional_int(values.get("cadence"), None)
+    lag = _state_optional_int(values.get("lag"), None)
+    actors = _state_optional_int(values.get("actors"), None)
+    admission_ms = _state_optional_int(values.get("admission_ms"), None)
     if cadence is None or lag is None or actors is None or admission_ms is None:
         return None
     return {
@@ -4550,10 +4594,23 @@ def _joint_action_control_fields(key: str) -> dict[str, int] | None:
     }
 
 
-def _prefixed_int(value: str, prefix: str) -> int | None:
-    if not value.startswith(prefix):
+def _first_text_metadata(
+    metadata: Mapping[str, Any],
+    keys: Sequence[str],
+) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        normalized = _normalize_key_component(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _normalize_key_component(value: Any | None) -> str | None:
+    if value is None or isinstance(value, bool):
         return None
-    return _state_optional_int(value[len(prefix) :], None)
+    key = safe_metric_key(str(value))
+    return key or None
 
 
 def _batch_staleness_state(

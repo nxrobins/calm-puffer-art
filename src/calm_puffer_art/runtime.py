@@ -18,6 +18,7 @@ from .actions import (
     action_codec_key,
     action_logprob_stats,
     action_space_checkpoint_metadata,
+    action_space_signature,
     semantic_bandwidth,
 )
 from .scheduler import (
@@ -1648,6 +1649,7 @@ class ControlPlane:
                 train_ring=train_ring,
                 active_actor_count=active_actor_count,
                 admission_delay_s=admission_delay_s,
+                action_space_key=action_space_signature(action_space),
             )
             if self._selected_rollout_exceeds_accounted_budget(scheduler):
                 self._should_continue_training(
@@ -1790,16 +1792,35 @@ class ControlPlane:
             "scheduler/active_rollout_admission_delay_s",
             admission_delay_s,
         )
-        trajectory.metadata.setdefault(
-            "scheduler/joint_action_key",
-            scheduling_action_key(
-                arm_id=decision.arm_id,
-                target_train_batch_groups=decision.target_train_batch_groups,
-                max_policy_lag=decision.max_policy_lag,
-                active_actor_count=active_actor_count,
-                admission_delay_ms=admission_delay_ms,
-            ),
-        )
+        action_space_key = decision.metadata.get("action_space_key")
+        if action_space_key is not None and not isinstance(action_space_key, bool):
+            trajectory.metadata.setdefault(
+                "scheduler/action_space_key",
+                str(action_space_key),
+            )
+        selected_joint_key = decision.metadata.get("joint_action_key")
+        if selected_joint_key is not None and not isinstance(selected_joint_key, bool):
+            trajectory.metadata.setdefault(
+                "scheduler/joint_action_key",
+                str(selected_joint_key),
+            )
+        else:
+            trajectory.metadata.setdefault(
+                "scheduler/joint_action_key",
+                scheduling_action_key(
+                    arm_id=decision.arm_id,
+                    target_train_batch_groups=decision.target_train_batch_groups,
+                    max_policy_lag=decision.max_policy_lag,
+                    active_actor_count=active_actor_count,
+                    admission_delay_ms=admission_delay_ms,
+                    action_space_key=(
+                        str(action_space_key)
+                        if action_space_key is not None
+                        and not isinstance(action_space_key, bool)
+                        else None
+                    ),
+                ),
+            )
         admission_dollar_seconds = (
             admission_delay_s * self.config.cost_per_second_usd
         )
@@ -2013,24 +2034,29 @@ class ControlPlane:
         train_ring: TrajectoryRingBuffer,
         active_actor_count: int | None = None,
         admission_delay_s: float | None = None,
+        action_space_key: str | None = None,
     ) -> SchedulerDecision:
         if scheduler is not None:
-            return scheduler.select_rollout(
-                scenarios=scenarios,
-                action_codecs=action_codecs,
-                actor_id=actor_id,
-                policy_step=policy_step,
-                trajectory_queue_pressure=self._queue_pressure(trajectory_queue),
-                train_queue_pressure=self._train_queue_pressure(train_ring),
-                configured_train_batch_groups=self.config.train_batch_groups,
-                configured_max_policy_lag=self.config.max_policy_lag,
-                active_actor_count=active_actor_count,
-                rollout_admission_delay_ms=(
-                    None
-                    if admission_delay_s is None
-                    else max(0, int(round(admission_delay_s * 1000.0)))
-                ),
+            rollout_admission_delay_ms = (
+                None
+                if admission_delay_s is None
+                else max(0, int(round(admission_delay_s * 1000.0)))
             )
+            select_kwargs: dict[str, Any] = {
+                "scenarios": scenarios,
+                "action_codecs": action_codecs,
+                "actor_id": actor_id,
+                "policy_step": policy_step,
+                "trajectory_queue_pressure": self._queue_pressure(trajectory_queue),
+                "train_queue_pressure": self._train_queue_pressure(train_ring),
+                "configured_train_batch_groups": self.config.train_batch_groups,
+                "configured_max_policy_lag": self.config.max_policy_lag,
+                "active_actor_count": active_actor_count,
+                "rollout_admission_delay_ms": rollout_admission_delay_ms,
+            }
+            if action_space_key is not None:
+                select_kwargs["action_space_key"] = action_space_key
+            return scheduler.select_rollout(**select_kwargs)
         scenario = await sampler.next()
         codec = action_codecs[0]
         return SchedulerDecision(
@@ -2039,6 +2065,11 @@ class ControlPlane:
             arm_id=f"{scenario.id}|{getattr(codec, 'name', codec.__class__.__name__)}",
             target_train_batch_groups=self.config.train_batch_groups,
             max_policy_lag=self.config.max_policy_lag,
+            metadata=(
+                {"action_space_key": action_space_key}
+                if action_space_key is not None
+                else {}
+            ),
         )
 
     def _target_train_batch_groups(

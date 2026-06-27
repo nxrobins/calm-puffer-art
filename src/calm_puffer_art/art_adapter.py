@@ -14,6 +14,7 @@ from .actions import (
     ActionCodec,
     action_codec_key,
     action_space_checkpoint_metadata,
+    action_space_signature,
 )
 from .runtime import (
     TrajectoryRingBuffer,
@@ -774,36 +775,44 @@ class AsyncArtBackend:
         if not scenarios:
             raise ValueError("at least one scenario is required")
         if self.scheduler is not None:
-            return self.scheduler.select_rollout(
-                scenarios=scenarios,
-                action_codecs=codecs,
-                actor_id=actor_id,
-                policy_step=self._current_step,
-                trajectory_queue_pressure=max(0.0, trajectory_queue_pressure),
-                train_queue_pressure=self._train_queue_pressure(),
-                configured_train_batch_groups=self.config.train_batch_groups,
-                configured_max_policy_lag=self.config.max_policy_lag,
-                active_actor_count=active_actor_count,
-                rollout_admission_delay_ms=rollout_admission_delay_ms,
-            )
+            select_kwargs: dict[str, Any] = {
+                "scenarios": scenarios,
+                "action_codecs": codecs,
+                "actor_id": actor_id,
+                "policy_step": self._current_step,
+                "trajectory_queue_pressure": max(0.0, trajectory_queue_pressure),
+                "train_queue_pressure": self._train_queue_pressure(),
+                "configured_train_batch_groups": self.config.train_batch_groups,
+                "configured_max_policy_lag": self.config.max_policy_lag,
+                "active_actor_count": active_actor_count,
+                "rollout_admission_delay_ms": rollout_admission_delay_ms,
+            }
+            action_space_key = action_space_signature(self.action_space)
+            if action_space_key is not None:
+                select_kwargs["action_space_key"] = action_space_key
+            return self.scheduler.select_rollout(**select_kwargs)
         scenario = scenarios[0]
         codec = codecs[0]
+        action_space_key = action_space_signature(self.action_space)
+        metadata: dict[str, Any] = {
+            "actor_id": actor_id,
+            "policy_step": self._current_step,
+            "trajectory_queue_pressure": max(0.0, trajectory_queue_pressure),
+            "train_queue_pressure": self._train_queue_pressure(),
+            "score": 0.0,
+            "objective_score": 0.0,
+            "exploration_score": 0.0,
+            "coverage_forced": False,
+        }
+        if action_space_key is not None:
+            metadata["action_space_key"] = action_space_key
         return SchedulerDecision(
             scenario=scenario,
             action_codec=codec,
             arm_id=f"{scenario.id}|{action_codec_key(codec)}",
             target_train_batch_groups=self.config.train_batch_groups,
             max_policy_lag=self.config.max_policy_lag,
-            metadata={
-                "actor_id": actor_id,
-                "policy_step": self._current_step,
-                "trajectory_queue_pressure": max(0.0, trajectory_queue_pressure),
-                "train_queue_pressure": self._train_queue_pressure(),
-                "score": 0.0,
-                "objective_score": 0.0,
-                "exploration_score": 0.0,
-                "coverage_forced": False,
-            },
+            metadata=metadata,
         )
 
     async def submit_train(
@@ -1770,6 +1779,9 @@ def art_rollout_metadata(
     selected_joint_key = decision.metadata.get("joint_action_key")
     if selected_joint_key is not None and not isinstance(selected_joint_key, bool):
         metadata.setdefault("scheduler/joint_action_key", str(selected_joint_key))
+    action_space_key = decision.metadata.get("action_space_key")
+    if action_space_key is not None and not isinstance(action_space_key, bool):
+        metadata.setdefault("scheduler/action_space_key", str(action_space_key))
     if extra is not None:
         metadata.update(extra)
     active_actor_count = _optional_int(metadata.get("scheduler/active_actor_count"))
@@ -1785,6 +1797,12 @@ def art_rollout_metadata(
                 max_policy_lag=decision.max_policy_lag,
                 active_actor_count=active_actor_count,
                 admission_delay_ms=admission_delay_ms,
+                action_space_key=(
+                    str(action_space_key)
+                    if action_space_key is not None
+                    and not isinstance(action_space_key, bool)
+                    else None
+                ),
             ),
         )
     return metadata

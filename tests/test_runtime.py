@@ -31,6 +31,7 @@ from calm_puffer_art import (
     VersionedTrajectoryBatch,
     WeightBroadcastChannel,
     action_space_checkpoint_metadata,
+    action_space_signature,
     promotion_checkpoint_metadata,
     restore_control_state,
     scheduler_checkpoint_metadata,
@@ -296,6 +297,9 @@ class RuntimeTests(unittest.TestCase):
             train_queue_pressure=0.0,
             configured_train_batch_groups=2,
             configured_max_policy_lag=3,
+            active_actor_count=2,
+            rollout_admission_delay_ms=25,
+            action_space_key="runtime-space",
         )
         trajectory = Trajectory(
             scenario_id="task",
@@ -321,7 +325,55 @@ class RuntimeTests(unittest.TestCase):
                 max_policy_lag=decision.max_policy_lag,
                 active_actor_count=2,
                 admission_delay_ms=25,
+                action_space_key="runtime-space",
             ),
+        )
+        self.assertEqual(
+            trajectory.metadata["scheduler/action_space_key"],
+            "runtime_space",
+        )
+
+    def test_control_plane_passes_action_space_signature_to_scheduler(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                max_train_batch_groups=1,
+                max_policy_lag=1,
+                control_exploration_bonus=0.0,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
+            captured_metadata = []
+
+            async def workflow(policy, scenario, context):
+                captured_metadata.append(dict(context.decision_metadata))
+                return await counting_rollout(policy, scenario, context)
+
+            await ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    max_policy_lag=1,
+                )
+            ).run(
+                scenarios=[Scenario(id="task", payload={"target": 1})],
+                initial_policy=CountingPolicy(level=1),
+                trainer=CountingTrainer(),
+                workflow=workflow,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+            return captured_metadata, expected_signature
+
+        captured_metadata, expected_signature = asyncio.run(run())
+
+        self.assertGreaterEqual(len(captured_metadata), 1)
+        self.assertEqual(captured_metadata[0]["action_space_key"], expected_signature)
+        self.assertIn(
+            f"|action_space={expected_signature}",
+            captured_metadata[0]["joint_action_key"],
         )
 
     def test_actor_cap_lease_shares_one_control_decision_per_pool_sweep(self):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping as MappingABC
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 from math import exp, isfinite
 from typing import Any, Mapping, Protocol, Sequence
@@ -211,6 +212,51 @@ def action_codec_key(codec: ActionCodec) -> str:
 
 def safe_metric_key(value: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in value).strip("_")
+
+
+def action_space_signature(action_space: Any | None) -> str | None:
+    """Stable, metric-safe summary of the active action-space ladder."""
+
+    if action_space is None:
+        return None
+    active_keys: list[str] = []
+    disabled_keys: list[str] = []
+    state_dict = getattr(action_space, "state_dict", None)
+    if state_dict is not None:
+        state = state_dict()
+        if isinstance(state, MappingABC):
+            active = state.get("active_codecs")
+            if isinstance(active, SequenceABC) and not isinstance(
+                active, (str, bytes, bytearray)
+            ):
+                for codec_state in active:
+                    if not isinstance(codec_state, MappingABC):
+                        continue
+                    key = codec_state.get("key")
+                    if key is not None and not isinstance(key, bool):
+                        active_keys.append(str(key))
+            disabled = state.get("disabled_codec_keys")
+            if isinstance(disabled, SequenceABC) and not isinstance(
+                disabled, (str, bytes, bytearray)
+            ):
+                disabled_keys = [
+                    str(key)
+                    for key in disabled
+                    if key is not None and not isinstance(key, bool)
+                ]
+    if not active_keys:
+        codecs = getattr(action_space, "codecs", ())
+        if isinstance(codecs, SequenceABC) and not isinstance(
+            codecs, (str, bytes, bytearray)
+        ):
+            active_keys = [action_codec_key(codec) for codec in codecs]
+    if not active_keys and not disabled_keys:
+        return None
+    active = "_".join(safe_metric_key(key) for key in sorted(active_keys))
+    disabled = "_".join(safe_metric_key(key) for key in sorted(disabled_keys))
+    active = active or "none"
+    disabled = disabled or "none"
+    return f"v1_active_{active}__disabled_{disabled}"
 
 
 def _tokens(text: str) -> list[str]:

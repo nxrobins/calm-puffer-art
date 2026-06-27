@@ -11,6 +11,7 @@ from calm_puffer_art.actions import (
     action_codec_key,
     action_logprob_stats,
     action_space_checkpoint_metadata,
+    action_space_signature,
     semantic_bandwidth,
 )
 from calm_puffer_art.types import ActionUnit
@@ -26,6 +27,21 @@ class ActionCodecTests(unittest.TestCase):
         self.assertEqual(len(token_actions), 5)
         self.assertEqual(len(chunk_actions), 3)
         self.assertGreater(semantic_bandwidth(chunk_actions), semantic_bandwidth(token_actions))
+
+    def test_action_space_signature_tracks_active_codec_ladder(self):
+        action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+        base_signature = action_space_signature(action_space)
+
+        action_space.add_codec(ChunkActionCodec(chunk_size=4))
+        expanded_signature = action_space_signature(action_space)
+        restored = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+        restored.load_state_dict(action_space.state_dict())
+
+        self.assertIsNotNone(base_signature)
+        self.assertIn("chunk_chunk_size_2", base_signature)
+        self.assertNotEqual(base_signature, expanded_signature)
+        self.assertIn("chunk_chunk_size_4", expanded_signature)
+        self.assertEqual(action_space_signature(restored), expanded_signature)
 
     def test_latent_patch_codec_is_deterministic_and_decodable(self):
         codec = LatentPatchActionCodec(patch_size=3, latent_size=4)
