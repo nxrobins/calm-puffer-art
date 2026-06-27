@@ -1751,6 +1751,7 @@ class ControlPlane:
                             action_space=action_space,
                             train_ring=train_ring,
                             reason="runtime_train_ring_stale",
+                            cost_per_second_usd=self.config.cost_per_second_usd,
                         ),
                     )
                 )
@@ -2365,6 +2366,7 @@ class ControlPlane:
         action_space: AdaptiveActionSpace | None,
         train_ring: TrajectoryRingBuffer,
         reason: str,
+        cost_per_second_usd: float = 0.0,
     ) -> Callable[[VersionedTrajectoryBatch], None] | None:
         if scheduler is None:
             return None
@@ -2375,6 +2377,12 @@ class ControlPlane:
                 groups=batch.groups,
                 policy_step=train_ring.current_policy_step,
                 reason=reason,
+                additional_dollar_seconds=(
+                    ControlPlane._batch_train_ring_admission_wait_dollar_seconds_from_metadata(
+                        batch,
+                        cost_per_second_usd=cost_per_second_usd,
+                    )
+                ),
             )
             if (
                 action_space is not None
@@ -2564,6 +2572,17 @@ class ControlPlane:
         self,
         batch: VersionedTrajectoryBatch,
     ) -> float:
+        return self._batch_train_ring_admission_wait_dollar_seconds_from_metadata(
+            batch,
+            cost_per_second_usd=self.config.cost_per_second_usd,
+        )
+
+    @staticmethod
+    def _batch_train_ring_admission_wait_dollar_seconds_from_metadata(
+        batch: VersionedTrajectoryBatch,
+        *,
+        cost_per_second_usd: float,
+    ) -> float:
         explicit_cost = _first_nonnegative_float(
             batch.metadata,
             ("queue/train_ring_admission_wait_dollar_seconds",),
@@ -2574,7 +2593,7 @@ class ControlPlane:
             batch.metadata,
             ("queue/train_ring_admission_wait_s",),
         )
-        return (wait_s or 0.0) * self.config.cost_per_second_usd
+        return (wait_s or 0.0) * max(0.0, cost_per_second_usd)
 
     async def _put_trajectory_with_queue_cost(
         self,

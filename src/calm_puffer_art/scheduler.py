@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping, Protocol, Sequence
@@ -161,6 +162,7 @@ class AdaptiveScheduler(Protocol):
         groups: Sequence[TrajectoryGroup],
         policy_step: int,
         reason: str,
+        additional_dollar_seconds: float = 0.0,
     ) -> None:
         ...
 
@@ -576,6 +578,8 @@ class ObjectiveScheduler:
         self._stale_experience = 0.0
         self._stale_lost_reward_improving_experience = 0.0
         self._stale_sample_dollar_seconds = 0.0
+        self._stale_additional_dollar_seconds = 0.0
+        self._last_stale_additional_dollar_seconds = 0.0
         self._cadence_controls: dict[int, ControlStats] = {}
         self._lag_controls: dict[int, ControlStats] = {}
         self._admission_controls: dict[int, ControlStats] = {}
@@ -1508,6 +1512,7 @@ class ObjectiveScheduler:
         groups: Sequence[TrajectoryGroup],
         policy_step: int,
         reason: str,
+        additional_dollar_seconds: float = 0.0,
     ) -> None:
         """Record useful experience that was produced but never trained."""
 
@@ -1516,7 +1521,9 @@ class ObjectiveScheduler:
             for group in groups
         )
         stale_experience = _useful_experience_count(groups)
-        stale_cost = _groups_sample_dollar_seconds(groups)
+        stale_sample_cost = _groups_sample_dollar_seconds(groups)
+        stale_overhead_cost = max(0.0, additional_dollar_seconds)
+        stale_cost = stale_sample_cost + stale_overhead_cost
         if stale_cost <= 0.0:
             stale_cost = max(stale_experience, 1.0)
         lost_reward_improving_experience = (
@@ -1541,11 +1548,13 @@ class ObjectiveScheduler:
         self._stale_trajectories += stale_trajectories
         self._stale_experience += stale_experience
         self._stale_lost_reward_improving_experience += penalty_experience
-        self._stale_sample_dollar_seconds += stale_cost
+        self._stale_sample_dollar_seconds += stale_sample_cost
+        self._stale_additional_dollar_seconds += stale_overhead_cost
         self._last_stale_penalty_objective = penalty_objective
         self._last_stale_experience_count = stale_experience
         self._last_stale_lost_reward_improving_experience = penalty_experience
-        self._last_stale_sample_dollar_seconds = stale_cost
+        self._last_stale_sample_dollar_seconds = stale_sample_cost
+        self._last_stale_additional_dollar_seconds = stale_overhead_cost
         self._last_stale_policy_step = policy_step
         self._last_stale_reason = str(reason)
 
@@ -1886,6 +1895,9 @@ class ObjectiveScheduler:
                 "last_stale_sample_dollar_seconds": (
                     self._last_stale_sample_dollar_seconds
                 ),
+                "last_stale_additional_dollar_seconds": (
+                    self._last_stale_additional_dollar_seconds
+                ),
                 "last_stale_policy_step": self._last_stale_policy_step,
                 "last_stale_reason": self._last_stale_reason,
                 "last_train_batch_priority": self._last_train_batch_priority,
@@ -2004,6 +2016,9 @@ class ObjectiveScheduler:
                 ),
                 "stale_sample_dollar_seconds": (
                     self._stale_sample_dollar_seconds
+                ),
+                "stale_additional_dollar_seconds": (
+                    self._stale_additional_dollar_seconds
                 ),
             },
             "arms": {
@@ -2426,6 +2441,10 @@ class ObjectiveScheduler:
             learning_state.get("last_stale_sample_dollar_seconds"),
             self._last_stale_sample_dollar_seconds,
         )
+        self._last_stale_additional_dollar_seconds = _state_float(
+            learning_state.get("last_stale_additional_dollar_seconds"),
+            self._last_stale_additional_dollar_seconds,
+        )
         self._last_stale_policy_step = _state_int(
             learning_state.get("last_stale_policy_step"),
             self._last_stale_policy_step,
@@ -2645,6 +2664,10 @@ class ObjectiveScheduler:
             learning_state.get("stale_sample_dollar_seconds"),
             self._stale_sample_dollar_seconds,
         )
+        self._stale_additional_dollar_seconds = _state_float(
+            learning_state.get("stale_additional_dollar_seconds"),
+            self._stale_additional_dollar_seconds,
+        )
         self._last_decision = None
         self._last_decision_snapshot = _decision_state_from_mapping(
             state.get("last_decision")
@@ -2775,6 +2798,13 @@ class ObjectiveScheduler:
             "scheduler/stale_sample_dollar_seconds": (
                 self._stale_sample_dollar_seconds
             ),
+            "scheduler/stale_additional_dollar_seconds": (
+                self._stale_additional_dollar_seconds
+            ),
+            "scheduler/stale_total_dollar_seconds": (
+                self._stale_sample_dollar_seconds
+                + self._stale_additional_dollar_seconds
+            ),
             "scheduler/stale_last_penalty_objective": (
                 self._last_stale_penalty_objective
             ),
@@ -2786,6 +2816,13 @@ class ObjectiveScheduler:
             ),
             "scheduler/stale_last_sample_dollar_seconds": (
                 self._last_stale_sample_dollar_seconds
+            ),
+            "scheduler/stale_last_additional_dollar_seconds": (
+                self._last_stale_additional_dollar_seconds
+            ),
+            "scheduler/stale_last_total_dollar_seconds": (
+                self._last_stale_sample_dollar_seconds
+                + self._last_stale_additional_dollar_seconds
             ),
             "scheduler/stale_last_policy_step": float(self._last_stale_policy_step),
             "scheduler/last_train_batch_priority": self._last_train_batch_priority,
@@ -2927,6 +2964,13 @@ class ObjectiveScheduler:
                 self._rollout_admission_dollar_seconds
             ),
             "scheduler/costs/train_dollar_seconds": self._train_dollar_seconds,
+            "scheduler/costs/stale_additional_dollar_seconds": (
+                self._stale_additional_dollar_seconds
+            ),
+            "scheduler/costs/stale_total_dollar_seconds": (
+                self._stale_sample_dollar_seconds
+                + self._stale_additional_dollar_seconds
+            ),
             "scheduler/costs/total_dollar_seconds": accounted_dollar_seconds,
         }
         if self._last_decision_snapshot is not None:
@@ -4350,6 +4394,12 @@ class ObjectiveScheduler:
     ) -> float:
         lost_experience = 0.0
         explicit_cost = _groups_sample_dollar_seconds(groups)
+        extra_cost = max(0.0, stale_cost - explicit_cost)
+        quality_total = sum(
+            max(0.0, action_quality(trajectory))
+            for group in groups
+            for trajectory in group.trajectories
+        )
         for group in groups:
             for trajectory in group.trajectories:
                 quality = action_quality(trajectory)
@@ -4369,6 +4419,8 @@ class ObjectiveScheduler:
                     if explicit_cost > 0.0 or stale_experience <= 0.0:
                         continue
                     trajectory_cost = stale_cost * quality / stale_experience
+                elif extra_cost > 0.0 and quality_total > 0.0:
+                    trajectory_cost += extra_cost * quality / quality_total
                 lost_experience += objective * trajectory_cost
         return lost_experience
 
@@ -5560,6 +5612,7 @@ class ObjectiveScheduler:
             + self._queue_wait_dollar_seconds
             + self._rollout_admission_dollar_seconds
             + self._train_dollar_seconds
+            + self._stale_additional_dollar_seconds
         )
 
     def _accounted_budget_exhausted(self) -> bool:
@@ -5815,6 +5868,7 @@ def observe_stale_batch_feedback(
     groups: Sequence[TrajectoryGroup],
     policy_step: int,
     reason: str,
+    additional_dollar_seconds: float = 0.0,
 ) -> bool:
     """Notify schedulers that support stale-batch feedback."""
 
@@ -5823,8 +5877,32 @@ def observe_stale_batch_feedback(
     observer = getattr(scheduler, "observe_stale_batch", None)
     if observer is None:
         return False
+    extra_cost = max(0.0, additional_dollar_seconds)
+    if extra_cost > 0.0 and _call_accepts_keyword(
+        observer,
+        "additional_dollar_seconds",
+    ):
+        observer(
+            groups=groups,
+            policy_step=policy_step,
+            reason=reason,
+            additional_dollar_seconds=extra_cost,
+        )
+        return True
     observer(groups=groups, policy_step=policy_step, reason=reason)
     return True
+
+
+def _call_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in signature.parameters.values()
+    )
 
 
 def _first_int_metadata(

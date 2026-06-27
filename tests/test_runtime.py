@@ -2474,6 +2474,67 @@ class RuntimeTests(unittest.TestCase):
             admission_wait + max(0.001, admission_wait * 0.05),
         )
 
+    def test_runtime_stale_callback_charges_train_ring_admission_wait(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=1000.0))
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="stale-overhead",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("stale"),
+            reward=4.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "stale-overhead|token",
+                "scheduler/active_target_train_batch_groups": 1,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="stale-overhead",
+            trajectories=(trajectory,),
+        )
+        train_ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=1)
+        train_ring.current_policy_step = 3
+        batch = VersionedTrajectoryBatch(
+            groups=(group,),
+            assembled_at_step=0,
+            metadata={"queue/train_ring_admission_wait_s": 0.003},
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        callback = runtime._stale_batch_callback(
+            scheduler=scheduler,
+            action_space=None,
+            train_ring=train_ring,
+            reason="runtime_train_ring_stale",
+            cost_per_second_usd=1000.0,
+        )
+        self.assertIsNotNone(callback)
+        callback(batch)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/stale_additional_dollar_seconds"], 3.0)
+        self.assertEqual(
+            metrics["scheduler/stale_last_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/accounted_dollar_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/stale_last_policy_step"],
+            3.0,
+        )
+
     def test_runtime_stamps_rollout_cost_before_enqueue(self):
         runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
         trajectory = Trajectory(

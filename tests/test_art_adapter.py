@@ -20,6 +20,7 @@ from calm_puffer_art import (
     TokenActionCodec,
     Trajectory,
     TrajectoryGroup,
+    VersionedTrajectoryBatch,
     WeightBroadcastChannel,
     action_codec_key,
     action_space_signature,
@@ -1799,6 +1800,60 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertGreaterEqual(
             stats["art_backend/accounted_dollar_seconds"],
             51.0 + admission_wait,
+        )
+
+    def test_async_art_backend_charges_stale_train_ring_admission_wait(self):
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        async_backend = AsyncArtBackend(
+            backend=FakeArtBackend(),
+            scheduler=scheduler,
+            config=AsyncArtBackendConfig(cost_per_second_usd=1000.0),
+        )
+        trajectory = Trajectory(
+            scenario_id="stale-overhead",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("stale"),
+            reward=4.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "stale-overhead|token",
+                "scheduler/active_target_train_batch_groups": 1,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="stale-overhead",
+            trajectories=(trajectory,),
+        )
+        batch = VersionedTrajectoryBatch(
+            groups=(group,),
+            assembled_at_step=0,
+            metadata={"queue/train_ring_admission_wait_s": 0.004},
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        async_backend._current_step = 3
+        async_backend._discard_submitted_batch(batch)
+        stats = async_backend.stats()
+
+        self.assertEqual(stats["art_backend/stale_batches"], 1.0)
+        self.assertEqual(stats["art_backend/failed_batches"], 1.0)
+        self.assertEqual(stats["scheduler/stale_additional_dollar_seconds"], 4.0)
+        self.assertEqual(
+            stats["scheduler/stale_last_additional_dollar_seconds"],
+            4.0,
+        )
+        self.assertEqual(
+            stats["scheduler/budget/accounted_dollar_seconds"],
+            6.0,
         )
 
     def test_async_art_backend_submit_train_returns_future_before_training_finishes(self):

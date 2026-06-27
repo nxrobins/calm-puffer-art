@@ -3085,6 +3085,89 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/arm/valuable_token/marginal_objective_ema"],
         )
 
+    def test_stale_penalty_accounts_additional_overhead_cost(self):
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="valuable",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=4.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "valuable|token",
+                "scheduler/active_target_train_batch_groups": 2,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="valuable",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        scheduler.observe_stale_batch(
+            groups=[group],
+            policy_step=3,
+            reason="lagged",
+            additional_dollar_seconds=3.0,
+        )
+        metrics = scheduler.metrics()
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(metrics["scheduler/stale_sample_dollar_seconds"], 2.0)
+        self.assertEqual(metrics["scheduler/stale_additional_dollar_seconds"], 3.0)
+        self.assertEqual(metrics["scheduler/stale_total_dollar_seconds"], 5.0)
+        self.assertEqual(
+            metrics["scheduler/stale_last_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/stale_last_total_dollar_seconds"],
+            5.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/stale_last_lost_reward_improving_experience"],
+            10.0,
+        )
+        self.assertAlmostEqual(
+            metrics["scheduler/stale_last_penalty_objective"],
+            -2.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/accounted_dollar_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/costs/stale_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/costs/stale_total_dollar_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/stale_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/stale_last_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            restored_metrics["scheduler/stale_total_dollar_seconds"],
+            5.0,
+        )
+
     def test_train_objective_scales_by_useful_experience_count(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         useful = tuple(
@@ -5220,9 +5303,11 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/stale_last_experience_count",
             "scheduler/stale_last_lost_reward_improving_experience",
             "scheduler/stale_last_sample_dollar_seconds",
+            "scheduler/stale_last_total_dollar_seconds",
             "scheduler/stale_last_policy_step",
             "scheduler/stale_lost_reward_improving_experience",
             "scheduler/stale_sample_dollar_seconds",
+            "scheduler/stale_total_dollar_seconds",
             "scheduler/arm/stale_token/stale_updates",
             "scheduler/arm/stale_token/stale_experience",
             "scheduler/control/cadence_2/stale_updates",

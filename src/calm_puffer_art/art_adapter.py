@@ -1908,6 +1908,9 @@ class AsyncArtBackend:
             groups=batch.groups,
             policy_step=self._current_step,
             reason="art_train_ring_stale",
+            additional_dollar_seconds=(
+                self._batch_train_ring_admission_wait_dollar_seconds(batch)
+            ),
         )
         self._refresh_action_space_from_scheduler(
             allow_promotions=False,
