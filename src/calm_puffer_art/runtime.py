@@ -1687,6 +1687,7 @@ class ControlPlane:
                 scheduler=scheduler,
                 train_ring=train_ring,
                 policy_step=latest.step,
+                action_space_key=action_space_signature(action_space),
             )
             result = grouper.add(
                 trajectory,
@@ -1721,6 +1722,7 @@ class ControlPlane:
                 ready_groups=ready_groups,
                 train_ring=train_ring,
                 policy_step=latest.step,
+                action_space_key=action_space_signature(action_space),
             )
             while len(ready_groups) >= target_batch_groups:
                 groups = tuple(
@@ -1732,6 +1734,7 @@ class ControlPlane:
                     scheduler=scheduler,
                     train_ring=train_ring,
                     policy_step=latest.step,
+                    action_space_key=action_space_signature(action_space),
                 )
                 self._tag_batch_control_metadata(
                     groups,
@@ -1781,6 +1784,7 @@ class ControlPlane:
         actor_cap_lease = actor_cap_lease or _ActorCapLease()
         while not stop.is_set():
             snapshot = await registry.snapshot()
+            current_action_space_key = action_space_signature(action_space)
             if not self._should_continue_training(
                 scheduler=scheduler,
                 train_ring=train_ring,
@@ -1795,6 +1799,7 @@ class ControlPlane:
                     trajectory_queue=trajectory_queue,
                     train_ring=train_ring,
                     policy_step=snapshot.step,
+                    action_space_key=current_action_space_key,
                 ),
             )
             active_actor_count = actor_admission.active_count
@@ -1808,6 +1813,7 @@ class ControlPlane:
                 telemetry=telemetry,
                 policy_step=snapshot.step,
                 active_actor_count=active_actor_count,
+                action_space_key=current_action_space_key,
             )
             if admission_delay_s > 0.0:
                 snapshot = await registry.snapshot()
@@ -1836,7 +1842,7 @@ class ControlPlane:
                 train_ring=train_ring,
                 active_actor_count=active_actor_count,
                 admission_delay_s=admission_delay_s,
-                action_space_key=action_space_signature(action_space),
+                action_space_key=current_action_space_key,
             )
             if self._selected_rollout_exceeds_accounted_budget(scheduler):
                 self._should_continue_training(
@@ -2143,6 +2149,7 @@ class ControlPlane:
         trajectory_queue: asyncio.Queue[Trajectory],
         train_ring: TrajectoryRingBuffer,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> int:
         if scheduler is None:
             return self.config.num_actors
@@ -2161,6 +2168,7 @@ class ControlPlane:
                         ),
                         train_queue_pressure=self._train_queue_pressure(train_ring),
                         policy_step=policy_step,
+                        action_space_key=action_space_key,
                     )
                 ),
             ),
@@ -2175,6 +2183,7 @@ class ControlPlane:
         telemetry: RuntimeTelemetry,
         policy_step: int,
         active_actor_count: int | None = None,
+        action_space_key: str | None = None,
     ) -> float:
         if scheduler is None:
             return 0.0
@@ -2191,6 +2200,7 @@ class ControlPlane:
                     train_queue_pressure=self._train_queue_pressure(train_ring),
                     policy_step=policy_step,
                     active_actor_count=active_actor_count,
+                    action_space_key=action_space_key,
                 )
             ),
         )
@@ -2282,6 +2292,7 @@ class ControlPlane:
         ready_groups: deque[TrajectoryGroup],
         train_ring: TrajectoryRingBuffer,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> int:
         if scheduler is None:
             return self.config.train_batch_groups
@@ -2292,6 +2303,7 @@ class ControlPlane:
                 pending_groups=len(ready_groups),
                 train_queue_pressure=self._train_queue_pressure(train_ring),
                 policy_step=policy_step,
+                action_space_key=action_space_key,
             ),
         )
 
@@ -2301,6 +2313,7 @@ class ControlPlane:
         scheduler: AdaptiveScheduler | None,
         train_ring: TrajectoryRingBuffer,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> int:
         if scheduler is None:
             return self.config.max_policy_lag
@@ -2310,6 +2323,7 @@ class ControlPlane:
                 configured=self.config.max_policy_lag,
                 train_queue_pressure=self._train_queue_pressure(train_ring),
                 policy_step=policy_step,
+                action_space_key=action_space_key,
             ),
         )
 

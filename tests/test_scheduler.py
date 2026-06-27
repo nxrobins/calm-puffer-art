@@ -489,6 +489,123 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(decision.max_policy_lag, 1)
         self.assertEqual(decision.metadata["joint_action_key"], high_key)
 
+    def test_joint_scheduling_action_suffix_scopes_runtime_control_reuse(self):
+        current_space_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=0,
+            active_actor_count=1,
+            admission_delay_ms=0,
+            action_space_key="space-a",
+        )
+        other_space_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=2,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+            action_space_key="space-b",
+        )
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=2,
+            min_policy_lag=0,
+            max_policy_lag=1,
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "joint_action_controls": {
+                    current_space_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 0.5,
+                        "total_objective": 0.5,
+                    },
+                    other_space_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 10.0,
+                        "total_objective": 10.0,
+                    },
+                }
+            }
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=0,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+            action_space_key="space-a",
+        )
+
+        self.assertEqual(decision.target_train_batch_groups, 1)
+        self.assertEqual(decision.max_policy_lag, 0)
+        self.assertEqual(decision.metadata["joint_action_key"], current_space_key)
+
+    def test_joint_scheduling_action_suffix_falls_back_for_new_action_space(self):
+        other_space_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=2,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+            action_space_key="space-b",
+        )
+        expected_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=2,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+            action_space_key="space-c",
+        )
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=2,
+            min_policy_lag=0,
+            max_policy_lag=1,
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "joint_action_controls": {
+                    other_space_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 10.0,
+                        "total_objective": 10.0,
+                    },
+                }
+            }
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=0,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+            action_space_key="space-c",
+        )
+
+        self.assertEqual(decision.target_train_batch_groups, 2)
+        self.assertEqual(decision.max_policy_lag, 1)
+        self.assertEqual(decision.metadata["joint_action_key"], expected_key)
+
     def test_joint_scheduling_action_payoff_influences_actor_cap_and_delay(self):
         low_actor_key = scheduling_action_key(
             arm_id="task|token",

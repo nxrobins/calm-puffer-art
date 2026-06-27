@@ -514,6 +514,7 @@ class AsyncArtBackend:
         active_count = self.active_actor_count(
             configured=configured,
             trajectory_queue_pressure=queue_pressure,
+            action_space_key=action_space_signature(self.action_space),
         )
         base_metadata: dict[str, Any] = {
             "actor_id": actor_id,
@@ -532,6 +533,7 @@ class AsyncArtBackend:
         requested_delay_s = self.rollout_admission_delay_s(
             trajectory_queue_pressure=queue_pressure,
             active_actor_count=active_count,
+            action_space_key=action_space_signature(self.action_space),
         )
         elapsed_s = 0.0
         if requested_delay_s > 0.0:
@@ -743,6 +745,7 @@ class AsyncArtBackend:
         *,
         configured: int,
         trajectory_queue_pressure: float = 0.0,
+        action_space_key: str | None = None,
     ) -> int:
         configured = max(1, int(configured))
         if self.scheduler is None:
@@ -763,6 +766,7 @@ class AsyncArtBackend:
                         ),
                         train_queue_pressure=self._train_queue_pressure(),
                         policy_step=self._current_step,
+                        action_space_key=action_space_key,
                     )
                 ),
             ),
@@ -773,6 +777,7 @@ class AsyncArtBackend:
         *,
         trajectory_queue_pressure: float = 0.0,
         active_actor_count: int | None = None,
+        action_space_key: str | None = None,
     ) -> float:
         if self.scheduler is None:
             return 0.0
@@ -790,6 +795,7 @@ class AsyncArtBackend:
                     train_queue_pressure=self._train_queue_pressure(),
                     policy_step=self._current_step,
                     active_actor_count=active_actor_count,
+                    action_space_key=action_space_key,
                 )
             ),
         )
@@ -1840,6 +1846,7 @@ class AsyncArtBackend:
     def _target_train_batch_groups(self, *, pending_groups: int | None = None) -> int:
         if self.scheduler is None:
             return self.config.train_batch_groups
+        action_space_key = action_space_signature(self.action_space)
         return max(
             1,
             self.scheduler.target_train_batch_groups(
@@ -1851,18 +1858,21 @@ class AsyncArtBackend:
                 ),
                 train_queue_pressure=self._train_queue_pressure(),
                 policy_step=self._current_step,
+                action_space_key=action_space_key,
             ),
         )
 
     def _max_policy_lag(self) -> int:
         if self.scheduler is None:
             return self.config.max_policy_lag
+        action_space_key = action_space_signature(self.action_space)
         return max(
             0,
             self.scheduler.max_policy_lag(
                 configured=self.config.max_policy_lag,
                 train_queue_pressure=self._train_queue_pressure(),
                 policy_step=self._current_step,
+                action_space_key=action_space_key,
             ),
         )
 

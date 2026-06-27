@@ -86,6 +86,7 @@ class AdaptiveScheduler(Protocol):
         max_policy_lag: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> int:
         ...
 
@@ -98,6 +99,7 @@ class AdaptiveScheduler(Protocol):
         target_train_batch_groups: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> int:
         ...
 
@@ -108,6 +110,7 @@ class AdaptiveScheduler(Protocol):
         train_queue_pressure: float,
         policy_step: int,
         active_actor_count: int | None = None,
+        action_space_key: str | None = None,
     ) -> float:
         ...
 
@@ -118,6 +121,7 @@ class AdaptiveScheduler(Protocol):
         trajectory_queue_pressure: float,
         train_queue_pressure: float,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> int:
         ...
 
@@ -623,6 +627,7 @@ class ObjectiveScheduler:
             policy_step=policy_step,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         max_policy_lag = self.max_policy_lag(
             configured=configured_max_policy_lag,
@@ -631,6 +636,7 @@ class ObjectiveScheduler:
             target_train_batch_groups=target_train_batch_groups,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         arms = self._arm_candidates(scenarios, action_codecs)
         coverage_selection, coverage_cost_limited = self._coverage_candidate(
@@ -911,6 +917,7 @@ class ObjectiveScheduler:
         max_policy_lag: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> int:
         upper = self.max_train_batch_groups or configured
         upper = max(self.min_train_batch_groups, upper)
@@ -945,6 +952,7 @@ class ObjectiveScheduler:
             max_policy_lag=max_policy_lag,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         if (
             preferred == upper
@@ -981,6 +989,7 @@ class ObjectiveScheduler:
         target_train_batch_groups: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> int:
         upper = self.max_policy_lag_limit
         if upper is None:
@@ -1018,6 +1027,7 @@ class ObjectiveScheduler:
             target_train_batch_groups=target_train_batch_groups,
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
+            action_space_key=action_space_key,
         )
         if (
             protecting_unaccepted_arm
@@ -1051,6 +1061,7 @@ class ObjectiveScheduler:
         trajectory_queue_pressure: float,
         train_queue_pressure: float,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> int:
         upper = self.max_actor_count_limit
         if upper is None:
@@ -1080,6 +1091,7 @@ class ObjectiveScheduler:
         joint_scores = self._joint_action_scores_for_control_values(
             "actors",
             candidates,
+            action_space_key=action_space_key,
         )
         if (
             preferred == self.min_actor_count
@@ -1352,6 +1364,7 @@ class ObjectiveScheduler:
         train_queue_pressure: float,
         policy_step: int,
         active_actor_count: int | None = None,
+        action_space_key: str | None = None,
     ) -> float:
         """Return a pre-rollout delay when downstream buffers are saturated."""
 
@@ -1392,6 +1405,7 @@ class ObjectiveScheduler:
             "admission_ms",
             candidates,
             active_actor_count=active_actor_count,
+            action_space_key=action_space_key,
         )
         selected_ms = self._select_control_value(
             self._admission_controls,
@@ -4187,14 +4201,18 @@ class ObjectiveScheduler:
         max_policy_lag: int | None = None,
         active_actor_count: int | None = None,
         rollout_admission_delay_ms: int | None = None,
+        action_space_key: str | None = None,
     ) -> dict[int, float]:
         if self.joint_action_objective_weight <= 0.0 or not candidates:
             return {}
         candidate_set = set(int(value) for value in candidates)
+        action_space_key = _normalize_key_component(action_space_key)
         scores: dict[int, float] = {}
+        fallback_scores: dict[int, float] = {}
         for key, stats in self._joint_action_controls.items():
             if _control_feedback_updates(stats) <= 0:
                 continue
+            parts = _joint_action_key_parts(key)
             fields = _joint_action_control_fields(key)
             if fields is None:
                 continue
@@ -4230,10 +4248,17 @@ class ObjectiveScheduler:
                     -self.control_exploration_bonus,
                     min(self.control_exploration_bonus, score),
                 )
-            current = scores.get(candidate)
+            target_scores = scores
+            if action_space_key is not None:
+                historical_action_space_key = _normalize_key_component(
+                    parts.get("action_space")
+                )
+                if historical_action_space_key != action_space_key:
+                    target_scores = fallback_scores
+            current = target_scores.get(candidate)
             if current is None or score > current:
-                scores[candidate] = score
-        return scores
+                target_scores[candidate] = score
+        return scores or fallback_scores
 
     def _estimated_rollout_dollar_seconds(
         self,
@@ -6024,12 +6049,7 @@ def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
 
 
 def _joint_action_control_fields(key: str) -> dict[str, int] | None:
-    values: dict[str, str] = {}
-    for part in str(key).split("|"):
-        if "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        values[name] = value
+    values = _joint_action_key_parts(key)
     cadence = _state_optional_int(values.get("cadence"), None)
     lag = _state_optional_int(values.get("lag"), None)
     actors = _state_optional_int(values.get("actors"), None)
@@ -6042,6 +6062,16 @@ def _joint_action_control_fields(key: str) -> dict[str, int] | None:
         "actors": actors,
         "admission_ms": admission_ms,
     }
+
+
+def _joint_action_key_parts(key: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for part in str(key).split("|"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        values[name] = value
+    return values
 
 
 def _first_text_metadata(
