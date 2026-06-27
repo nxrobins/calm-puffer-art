@@ -340,6 +340,7 @@ class ObjectiveScheduler:
         control_exploration_bonus: float = 0.1,
         rollout_cadence_lag_control_weight: float = 0.0,
         joint_action_objective_weight: float = 1.0,
+        train_selection_objective_weight: float = 1.0,
         max_control_candidate_values: int = 8,
         min_rollout_coverage_fraction: float = 0.0,
         max_rollout_coverage_cost_fraction: float | None = None,
@@ -399,6 +400,10 @@ class ObjectiveScheduler:
             )
         if joint_action_objective_weight < 0:
             raise ValueError("joint_action_objective_weight must be non-negative")
+        if train_selection_objective_weight < 0:
+            raise ValueError(
+                "train_selection_objective_weight must be non-negative"
+            )
         if max_control_candidate_values <= 0:
             raise ValueError("max_control_candidate_values must be positive")
         if not 0 <= min_rollout_coverage_fraction <= 1:
@@ -473,6 +478,7 @@ class ObjectiveScheduler:
             rollout_cadence_lag_control_weight
         )
         self.joint_action_objective_weight = joint_action_objective_weight
+        self.train_selection_objective_weight = train_selection_objective_weight
         self.max_control_candidate_values = max_control_candidate_values
         self.min_rollout_coverage_fraction = min_rollout_coverage_fraction
         self.max_rollout_coverage_cost_fraction = (
@@ -544,6 +550,7 @@ class ObjectiveScheduler:
         self._last_train_batch_sample_dollar_seconds = 0.0
         self._last_train_batch_cost_normalized_priority = 0.0
         self._last_train_batch_joint_action_score = 0.0
+        self._last_train_batch_train_selection_score = 0.0
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -1480,9 +1487,11 @@ class ObjectiveScheduler:
         )
         arm_component = mean(arm_values)
         joint_action_component = mean(joint_action_scores)
+        train_selection_component = self._train_selection_priority_score(groups)
         uncosted_base_priority = (
             arm_component
             + joint_action_component
+            + train_selection_component
             + self.reward_efficiency_weight * raw_reward_component
         )
         experience_count = _useful_experience_count(groups)
@@ -1545,6 +1554,7 @@ class ObjectiveScheduler:
         self._last_train_batch_sample_dollar_seconds = sample_dollar_seconds
         self._last_train_batch_cost_normalized_priority = base_priority
         self._last_train_batch_joint_action_score = joint_action_component
+        self._last_train_batch_train_selection_score = train_selection_component
         return priority
 
     def record_train_batch_selection(
@@ -1634,6 +1644,9 @@ class ObjectiveScheduler:
                 ),
                 "joint_action_objective_weight": (
                     self.joint_action_objective_weight
+                ),
+                "train_selection_objective_weight": (
+                    self.train_selection_objective_weight
                 ),
                 "max_control_candidate_values": (
                     self.max_control_candidate_values
@@ -1758,6 +1771,9 @@ class ObjectiveScheduler:
                 ),
                 "last_train_batch_joint_action_score": (
                     self._last_train_batch_joint_action_score
+                ),
+                "last_train_batch_train_selection_score": (
+                    self._last_train_batch_train_selection_score
                 ),
                 "coverage_forced_decisions": self._coverage_forced_decisions,
                 "last_rollout_coverage_target": (
@@ -1962,6 +1978,13 @@ class ObjectiveScheduler:
             _state_float(
                 config.get("joint_action_objective_weight"),
                 self.joint_action_objective_weight,
+            ),
+        )
+        self.train_selection_objective_weight = max(
+            0.0,
+            _state_float(
+                config.get("train_selection_objective_weight"),
+                self.train_selection_objective_weight,
             ),
         )
         self.max_control_candidate_values = max(
@@ -2267,6 +2290,10 @@ class ObjectiveScheduler:
             learning_state.get("last_train_batch_joint_action_score"),
             self._last_train_batch_joint_action_score,
         )
+        self._last_train_batch_train_selection_score = _state_float(
+            learning_state.get("last_train_batch_train_selection_score"),
+            self._last_train_batch_train_selection_score,
+        )
         self._coverage_forced_decisions = _state_int(
             learning_state.get("coverage_forced_decisions"),
             self._coverage_forced_decisions,
@@ -2544,6 +2571,9 @@ class ObjectiveScheduler:
             "scheduler/last_train_batch_joint_action_score": (
                 self._last_train_batch_joint_action_score
             ),
+            "scheduler/last_train_batch_train_selection_score": (
+                self._last_train_batch_train_selection_score
+            ),
             "scheduler/low_roi_train_steps": float(self._low_roi_train_steps),
             "scheduler/stop_recommended": 1.0 if self._stop_recommended else 0.0,
             "scheduler/weights/rollout_objective": self.rollout_objective_weight,
@@ -2567,6 +2597,9 @@ class ObjectiveScheduler:
             ),
             "scheduler/weights/joint_action_objective": (
                 self.joint_action_objective_weight
+            ),
+            "scheduler/weights/train_selection_objective": (
+                self.train_selection_objective_weight
             ),
             "scheduler/reward_scale_normalization/arm_range": (
                 1.0
@@ -3461,6 +3494,21 @@ class ObjectiveScheduler:
             return 0.0
         return self.joint_action_objective_weight * self._score_control_value(
             self._joint_action_controls,
+            key,
+        )
+
+    def _train_selection_priority_score(
+        self,
+        groups: Sequence[TrajectoryGroup],
+    ) -> float:
+        if self.train_selection_objective_weight <= 0.0 or not groups:
+            return 0.0
+        key = _train_selection_key(groups)
+        stats = self._train_selection_controls.get(key)
+        if stats is None or _control_feedback_updates(stats) <= 0:
+            return 0.0
+        return self.train_selection_objective_weight * self._score_control_value(
+            self._train_selection_controls,
             key,
         )
 

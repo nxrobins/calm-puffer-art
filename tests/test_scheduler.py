@@ -3197,6 +3197,93 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0.0,
         )
 
+    def test_train_group_scoring_reuses_train_selection_payoff(self):
+        low_joint_key = scheduling_action_key(
+            arm_id="queued|token",
+            target_train_batch_groups=1,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        high_joint_key = scheduling_action_key(
+            arm_id="queued|token",
+            target_train_batch_groups=1,
+            max_policy_lag=1,
+            active_actor_count=2,
+            admission_delay_ms=0,
+        )
+        low_selection_key = (
+            f"arms=queued|token|joints={low_joint_key}|groups=1|trajectories=1"
+        )
+        high_selection_key = (
+            f"arms=queued|token|joints={high_joint_key}|groups=1|trajectories=1"
+        )
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=0.0,
+            train_selection_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "train_selection_controls": {
+                    low_selection_key: {
+                        "train_updates": 1,
+                        "objective_ema": -1.0,
+                        "total_objective": -1.0,
+                    },
+                    high_selection_key: {
+                        "train_updates": 1,
+                        "objective_ema": 1.0,
+                        "total_objective": 1.0,
+                    },
+                }
+            }
+        )
+        low = Trajectory(
+            scenario_id="queued",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            metadata={
+                "scheduler/arm_id": "queued|token",
+                "scheduler/joint_action_key": low_joint_key,
+            },
+        )
+        high = Trajectory(
+            scenario_id="queued",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            metadata={
+                "scheduler/arm_id": "queued|token",
+                "scheduler/joint_action_key": high_joint_key,
+            },
+        )
+
+        low_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="queued", trajectories=(low,))],
+            policy_step=0,
+        )
+        low_metrics = scheduler.metrics()
+        high_score = scheduler.score_train_groups(
+            [TrajectoryGroup(scenario_id="queued", trajectories=(high,))],
+            policy_step=0,
+        )
+        high_metrics = scheduler.metrics()
+
+        self.assertGreater(high_score, low_score)
+        self.assertLess(
+            low_metrics["scheduler/last_train_batch_train_selection_score"],
+            0.0,
+        )
+        self.assertGreater(
+            high_metrics["scheduler/last_train_batch_train_selection_score"],
+            0.0,
+        )
+
     def test_train_group_scoring_normalizes_queued_batch_by_sample_cost(self):
         scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         history = Trajectory(

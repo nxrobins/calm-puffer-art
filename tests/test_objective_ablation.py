@@ -75,6 +75,9 @@ def assert_train_selection_payoff_metrics(
         metrics["scheduler/train_selection/mean_objective_per_feedback_update"],
         0.0,
     )
+    test_case.assertTrue(
+        isfinite(metrics["scheduler/last_train_batch_train_selection_score"])
+    )
 
 
 class ObjectiveAblationTests(unittest.TestCase):
