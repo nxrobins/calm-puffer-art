@@ -111,6 +111,73 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(restored_metrics[f"{prefix}/feedback_updates"], 3.0)
 
+    def test_runtime_control_metrics_report_mean_objective_payoff(self):
+        scheduler = ObjectiveScheduler(control_exploration_bonus=0.0)
+        scheduler.load_state_dict(
+            {
+                "cadence_controls": {
+                    2: {
+                        "decisions": 2,
+                        "rollout_updates": 1,
+                        "train_updates": 2,
+                        "stale_updates": 1,
+                        "total_objective": 8.0,
+                    }
+                },
+                "lag_controls": {
+                    1: {
+                        "decisions": 4,
+                        "train_updates": 2,
+                        "total_objective": 6.0,
+                    }
+                },
+                "admission_controls": {
+                    25: {
+                        "decisions": 1,
+                        "rollout_updates": 1,
+                        "total_objective": 2.0,
+                    }
+                },
+                "actor_count_controls": {
+                    3: {
+                        "decisions": 5,
+                        "rollout_updates": 3,
+                        "train_updates": 1,
+                        "stale_updates": 1,
+                        "total_objective": 10.0,
+                    }
+                },
+            }
+        )
+
+        metrics = scheduler.metrics()
+
+        expected = {
+            "scheduler/control/cadence_2": (2.0, 4.0, 4.0, 2.0),
+            "scheduler/control/policy_lag_1": (4.0, 2.0, 1.5, 3.0),
+            "scheduler/control/admission_delay_ms_25": (1.0, 1.0, 2.0, 2.0),
+            "scheduler/control/actor_count_3": (5.0, 5.0, 2.0, 2.0),
+        }
+        for prefix, (
+            decisions,
+            feedback_updates,
+            mean_per_decision,
+            mean_per_feedback_update,
+        ) in expected.items():
+            self.assertEqual(metrics[f"{prefix}/decisions"], decisions)
+            self.assertEqual(
+                metrics[f"{prefix}/feedback_updates"],
+                feedback_updates,
+            )
+            self.assertAlmostEqual(
+                metrics[f"{prefix}/mean_objective_per_decision"],
+                mean_per_decision,
+            )
+            self.assertAlmostEqual(
+                metrics[f"{prefix}/mean_objective_per_feedback_update"],
+                mean_per_feedback_update,
+            )
+
     def test_joint_scheduling_action_decision_is_recorded_before_feedback(self):
         scheduler = ObjectiveScheduler(
             control_exploration_bonus=0.0,

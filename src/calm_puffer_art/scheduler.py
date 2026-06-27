@@ -2909,12 +2909,21 @@ class ObjectiveScheduler:
             )
         for value, stats in sorted(self._cadence_controls.items()):
             prefix = f"scheduler/control/cadence_{value}"
+            feedback_updates = _control_feedback_updates(stats)
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
             metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
-            metrics[f"{prefix}/feedback_updates"] = float(
-                _control_feedback_updates(stats)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
             metrics[f"{prefix}/score"] = self._score_control_value(
@@ -2931,12 +2940,21 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
         for value, stats in sorted(self._lag_controls.items()):
             prefix = f"scheduler/control/policy_lag_{value}"
+            feedback_updates = _control_feedback_updates(stats)
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
             metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
-            metrics[f"{prefix}/feedback_updates"] = float(
-                _control_feedback_updates(stats)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
             metrics[f"{prefix}/score"] = self._score_control_value(
@@ -2953,12 +2971,21 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
         for value, stats in sorted(self._admission_controls.items()):
             prefix = f"scheduler/control/admission_delay_ms_{value}"
+            feedback_updates = _control_feedback_updates(stats)
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
             metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
-            metrics[f"{prefix}/feedback_updates"] = float(
-                _control_feedback_updates(stats)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
             metrics[f"{prefix}/score"] = self._score_control_value(
@@ -2978,12 +3005,21 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
         for value, stats in sorted(self._actor_count_controls.items()):
             prefix = f"scheduler/control/actor_count_{value}"
+            feedback_updates = _control_feedback_updates(stats)
             metrics[f"{prefix}/decisions"] = float(stats.decisions)
             metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
             metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
             metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
-            metrics[f"{prefix}/feedback_updates"] = float(
-                _control_feedback_updates(stats)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
             )
             metrics[f"{prefix}/objective_ema"] = stats.objective_ema
             metrics[f"{prefix}/score"] = self._score_control_value(

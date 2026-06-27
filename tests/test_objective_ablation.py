@@ -13,6 +13,20 @@ from calm_puffer_art.objective_ablation import (
 )
 
 
+def assert_runtime_control_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+    prefixes: tuple[str, ...],
+) -> None:
+    for prefix in prefixes:
+        test_case.assertTrue(
+            isfinite(metrics[f"{prefix}/mean_objective_per_decision"])
+        )
+        test_case.assertTrue(
+            isfinite(metrics[f"{prefix}/mean_objective_per_feedback_update"])
+        )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -75,6 +89,18 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertTrue(
             isfinite(objective["scheduler/control/actor_count_2/score"])
+        )
+        assert_runtime_control_payoff_metrics(
+            self,
+            objective,
+            (
+                "scheduler/control/cadence_1",
+                "scheduler/control/policy_lag_1",
+                "scheduler/control/policy_lag_2",
+                "scheduler/control/admission_delay_ms_0",
+                "scheduler/control/actor_count_1",
+                "scheduler/control/actor_count_2",
+            ),
         )
 
     def test_adaptive_action_space_ablation_beats_fixed_bandwidth(self):
@@ -153,6 +179,18 @@ class ObjectiveAblationTests(unittest.TestCase):
             objective["scheduler/control/actor_count_2/rollout_updates"],
             0.0,
         )
+        assert_runtime_control_payoff_metrics(
+            self,
+            objective,
+            (
+                "scheduler/control/cadence_1",
+                "scheduler/control/policy_lag_1",
+                "scheduler/control/policy_lag_2",
+                "scheduler/control/admission_delay_ms_0",
+                "scheduler/control/actor_count_1",
+                "scheduler/control/actor_count_2",
+            ),
+        )
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
             objective["scheduler/joint_action/feedback_updates"],
@@ -218,6 +256,18 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertGreater(
             objective["scheduler/control/actor_count_2/rollout_updates"],
             0.0,
+        )
+        assert_runtime_control_payoff_metrics(
+            self,
+            objective,
+            (
+                "scheduler/control/cadence_1",
+                "scheduler/control/policy_lag_1",
+                "scheduler/control/policy_lag_2",
+                "scheduler/control/admission_delay_ms_0",
+                "scheduler/control/actor_count_1",
+                "scheduler/control/actor_count_2",
+            ),
         )
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
