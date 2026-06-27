@@ -900,9 +900,15 @@ class RuntimeTests(unittest.TestCase):
             1.0,
         )
         self.assertGreaterEqual(summary.metrics["action_space/promotions"], 1.0)
+        promotion_prefix = (
+            "action_space/decision/"
+            "promotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
+        )
+        self.assertIn(f"{promotion_prefix}/estimated_objective_payoff", summary.metrics)
         self.assertIn("scheduler/arm/adapt_chunk_chunk_size_4/pulls", summary.metrics)
         action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
         self.assertEqual(action_space_state["version"], 1)
+        self.assertIn("decision_stats", action_space_state)
         self.assertIn(
             "chunk(chunk_size=4)",
             [codec["key"] for codec in action_space_state["active_codecs"]],

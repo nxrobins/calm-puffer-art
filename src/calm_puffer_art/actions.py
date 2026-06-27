@@ -430,6 +430,10 @@ class AdaptiveActionSpace:
     _disabled_codec_keys: set[str] = field(default_factory=set, init=False)
     _promotions: int = field(default=0, init=False)
     _demotions: int = field(default=0, init=False)
+    _decision_stats: dict[str, "_ActionSpaceDecisionStats"] = field(
+        default_factory=dict,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         if self.min_chunk_size <= 0:
@@ -513,6 +517,7 @@ class AdaptiveActionSpace:
             self._demote_from_metrics(metrics) if allow_demotions else set()
         )
         if not allow_promotions:
+            self._refresh_decision_payoffs(metrics)
             return
         for codec in tuple(self._codecs):
             if not isinstance(codec, ChunkActionCodec):
@@ -561,6 +566,13 @@ class AdaptiveActionSpace:
                     pass
                 elif self.add_codec(candidate):
                     self._promotions += 1
+                    self._record_action_space_decision(
+                        kind="promotion",
+                        codec=candidate,
+                        parent=self._parent_codec(candidate),
+                        source=codec,
+                        metrics=metrics,
+                    )
             if self.promote_latent_patches:
                 latent_candidate = LatentPatchActionCodec(
                     patch_size=codec.chunk_size,
@@ -574,6 +586,14 @@ class AdaptiveActionSpace:
                     continue
                 if self.add_codec(latent_candidate):
                     self._promotions += 1
+                    self._record_action_space_decision(
+                        kind="promotion",
+                        codec=latent_candidate,
+                        parent=self._parent_codec(latent_candidate),
+                        source=codec,
+                        metrics=metrics,
+                    )
+        self._refresh_decision_payoffs(metrics)
 
     def _parent_allows_promotion(
         self,
@@ -626,7 +646,15 @@ class AdaptiveActionSpace:
                 continue
             for candidate in tuple(self._codecs):
                 if self._should_disable_with(codec, candidate):
+                    parent = self._parent_codec(candidate) or codec
                     key = action_codec_key(candidate)
+                    self._record_action_space_decision(
+                        kind="demotion",
+                        codec=candidate,
+                        parent=parent,
+                        source=codec,
+                        metrics=metrics,
+                    )
                     self._codecs.remove(candidate)
                     self._disabled_codec_keys.add(key)
                     disabled.add(key)
@@ -753,6 +781,77 @@ class AdaptiveActionSpace:
             return None
         return max(smaller, key=lambda candidate: candidate.chunk_size)
 
+    def _record_action_space_decision(
+        self,
+        *,
+        kind: str,
+        codec: ActionCodec,
+        parent: ActionCodec | None,
+        source: ActionCodec | None,
+        metrics: Mapping[str, float],
+    ) -> None:
+        codec_key = action_codec_key(codec)
+        parent_key = action_codec_key(parent) if parent is not None else None
+        source_key = action_codec_key(source) if source is not None else None
+        decision_key = _action_space_decision_key(
+            kind=kind,
+            codec_key=codec_key,
+            parent_key=parent_key,
+        )
+        stats = self._decision_stats.get(decision_key)
+        if stats is None:
+            stats = _ActionSpaceDecisionStats(
+                kind=kind,
+                codec_key=codec_key,
+                parent_codec_key=parent_key,
+                source_codec_key=source_key,
+            )
+            self._decision_stats[decision_key] = stats
+        stats.decisions += 1
+        stats.source_codec_key = source_key
+        self._update_decision_payoff(stats, metrics)
+
+    def _refresh_decision_payoffs(self, metrics: Mapping[str, float]) -> None:
+        for stats in self._decision_stats.values():
+            self._update_decision_payoff(stats, metrics)
+
+    def _update_decision_payoff(
+        self,
+        stats: "_ActionSpaceDecisionStats",
+        metrics: Mapping[str, float],
+    ) -> None:
+        target_signal = self._codec_signal_for_key(stats.codec_key, metrics)
+        parent_signal = (
+            self._codec_signal_for_key(stats.parent_codec_key, metrics)
+            if stats.parent_codec_key is not None
+            else _CodecSignal.empty()
+        )
+        stats.target_pulls = target_signal.pulls
+        stats.parent_pulls = parent_signal.pulls
+        stats.target_objective = target_signal.objective
+        stats.parent_objective = parent_signal.objective
+        stats.objective_delta_vs_parent = (
+            target_signal.objective - parent_signal.objective
+        )
+        stats.target_source_tokens_per_dollar_second = (
+            target_signal.source_tokens_per_dollar_second
+        )
+        stats.parent_source_tokens_per_dollar_second = (
+            parent_signal.source_tokens_per_dollar_second
+        )
+        stats.source_token_throughput_delta_vs_parent = (
+            target_signal.source_tokens_per_dollar_second
+            - parent_signal.source_tokens_per_dollar_second
+        )
+        if stats.kind == "demotion":
+            stats.estimated_objective_payoff = (
+                parent_signal.objective - target_signal.objective
+            )
+        else:
+            stats.estimated_objective_payoff = (
+                target_signal.objective - parent_signal.objective
+            )
+
     def state_dict(self) -> dict[str, Any]:
         """Return JSON-friendly action-space state for checkpoint/resume."""
 
@@ -818,6 +917,10 @@ class AdaptiveActionSpace:
             "learning_state": {
                 "promotions": self._promotions,
                 "demotions": self._demotions,
+            },
+            "decision_stats": {
+                key: _action_space_decision_stats_state(stats)
+                for key, stats in sorted(self._decision_stats.items())
             },
         }
 
@@ -1020,6 +1123,9 @@ class AdaptiveActionSpace:
             learning_state.get("demotions"),
             self._demotions,
         )
+        self._decision_stats = _action_space_decision_stats_from_state(
+            state.get("decision_stats")
+        )
 
     def metrics(self) -> dict[str, float]:
         values = {
@@ -1062,6 +1168,30 @@ class AdaptiveActionSpace:
             ] = 1.0
         for key in self._disabled_codec_keys:
             values[f"action_space/codec/{safe_metric_key(key)}/disabled"] = 1.0
+        for key, stats in sorted(self._decision_stats.items()):
+            prefix = f"action_space/decision/{safe_metric_key(key)}"
+            values[f"{prefix}/decisions"] = float(stats.decisions)
+            values[f"{prefix}/promotion"] = 1.0 if stats.kind == "promotion" else 0.0
+            values[f"{prefix}/demotion"] = 1.0 if stats.kind == "demotion" else 0.0
+            values[f"{prefix}/target_pulls"] = stats.target_pulls
+            values[f"{prefix}/parent_pulls"] = stats.parent_pulls
+            values[f"{prefix}/target_objective"] = stats.target_objective
+            values[f"{prefix}/parent_objective"] = stats.parent_objective
+            values[f"{prefix}/objective_delta_vs_parent"] = (
+                stats.objective_delta_vs_parent
+            )
+            values[f"{prefix}/estimated_objective_payoff"] = (
+                stats.estimated_objective_payoff
+            )
+            values[f"{prefix}/target_source_tokens_per_dollar_second"] = (
+                stats.target_source_tokens_per_dollar_second
+            )
+            values[f"{prefix}/parent_source_tokens_per_dollar_second"] = (
+                stats.parent_source_tokens_per_dollar_second
+            )
+            values[f"{prefix}/source_token_throughput_delta_vs_parent"] = (
+                stats.source_token_throughput_delta_vs_parent
+            )
         return values
 
     def _active_max_chunk_size(self) -> int:
@@ -1077,7 +1207,16 @@ class AdaptiveActionSpace:
         codec: ActionCodec,
         metrics: Mapping[str, float],
     ) -> "_CodecSignal":
-        fragment = safe_metric_key(action_codec_key(codec))
+        return self._codec_signal_for_key(action_codec_key(codec), metrics)
+
+    def _codec_signal_for_key(
+        self,
+        codec_key: str | None,
+        metrics: Mapping[str, float],
+    ) -> "_CodecSignal":
+        if codec_key is None:
+            return _CodecSignal.empty()
+        fragment = safe_metric_key(codec_key)
         scored_objective_values: list[float] = []
         fallback_objective_values: list[float] = []
         quality_values: list[float] = []
@@ -1188,6 +1327,39 @@ class _CodecSignal:
     new_logprob_coverage: float
     reference_logprob_coverage: float
 
+    @classmethod
+    def empty(cls) -> "_CodecSignal":
+        return cls(
+            objective=0.0,
+            quality=0.0,
+            unsafe_rate=0.0,
+            pulls=0.0,
+            semantic_bandwidth=0.0,
+            source_tokens_per_dollar_second=0.0,
+            reconstruction_drift=0.0,
+            old_logprob_coverage=0.0,
+            new_logprob_coverage=0.0,
+            reference_logprob_coverage=0.0,
+        )
+
+
+@dataclass
+class _ActionSpaceDecisionStats:
+    kind: str
+    codec_key: str
+    parent_codec_key: str | None = None
+    source_codec_key: str | None = None
+    decisions: int = 0
+    target_pulls: float = 0.0
+    parent_pulls: float = 0.0
+    target_objective: float = 0.0
+    parent_objective: float = 0.0
+    objective_delta_vs_parent: float = 0.0
+    estimated_objective_payoff: float = 0.0
+    target_source_tokens_per_dollar_second: float = 0.0
+    parent_source_tokens_per_dollar_second: float = 0.0
+    source_token_throughput_delta_vs_parent: float = 0.0
+
 
 def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:
     """Return checkpoint metadata for action spaces with snapshot support."""
@@ -1250,6 +1422,111 @@ def _codec_from_state(
     if codec_type == "reasoning_step":
         return ReasoningStepCodec()
     return existing_by_key.get(key)
+
+
+def _action_space_decision_key(
+    *,
+    kind: str,
+    codec_key: str,
+    parent_key: str | None,
+) -> str:
+    parent = safe_metric_key(parent_key) if parent_key is not None else "none"
+    return f"{kind}_{safe_metric_key(codec_key)}_from_{parent}"
+
+
+def _action_space_decision_stats_state(
+    stats: _ActionSpaceDecisionStats,
+) -> dict[str, Any]:
+    return {
+        "kind": stats.kind,
+        "codec_key": stats.codec_key,
+        "parent_codec_key": stats.parent_codec_key,
+        "source_codec_key": stats.source_codec_key,
+        "decisions": stats.decisions,
+        "target_pulls": stats.target_pulls,
+        "parent_pulls": stats.parent_pulls,
+        "target_objective": stats.target_objective,
+        "parent_objective": stats.parent_objective,
+        "objective_delta_vs_parent": stats.objective_delta_vs_parent,
+        "estimated_objective_payoff": stats.estimated_objective_payoff,
+        "target_source_tokens_per_dollar_second": (
+            stats.target_source_tokens_per_dollar_second
+        ),
+        "parent_source_tokens_per_dollar_second": (
+            stats.parent_source_tokens_per_dollar_second
+        ),
+        "source_token_throughput_delta_vs_parent": (
+            stats.source_token_throughput_delta_vs_parent
+        ),
+    }
+
+
+def _action_space_decision_stats_from_state(
+    value: Any,
+) -> dict[str, _ActionSpaceDecisionStats]:
+    if not isinstance(value, MappingABC):
+        return {}
+    restored: dict[str, _ActionSpaceDecisionStats] = {}
+    for key, raw_stats in value.items():
+        state = _mapping_state(raw_stats)
+        kind = str(state.get("kind", ""))
+        codec_key = str(state.get("codec_key", ""))
+        if kind not in {"promotion", "demotion"} or not codec_key:
+            continue
+        parent_codec_key = _optional_string_state(state.get("parent_codec_key"))
+        source_codec_key = _optional_string_state(state.get("source_codec_key"))
+        decision_key = str(key) or _action_space_decision_key(
+            kind=kind,
+            codec_key=codec_key,
+            parent_key=parent_codec_key,
+        )
+        restored[decision_key] = _ActionSpaceDecisionStats(
+            kind=kind,
+            codec_key=codec_key,
+            parent_codec_key=parent_codec_key,
+            source_codec_key=source_codec_key,
+            decisions=max(0, _state_int(state.get("decisions"), 0)),
+            target_pulls=max(0.0, _state_float(state.get("target_pulls"), 0.0)),
+            parent_pulls=max(0.0, _state_float(state.get("parent_pulls"), 0.0)),
+            target_objective=_state_float(state.get("target_objective"), 0.0),
+            parent_objective=_state_float(state.get("parent_objective"), 0.0),
+            objective_delta_vs_parent=_state_float(
+                state.get("objective_delta_vs_parent"),
+                0.0,
+            ),
+            estimated_objective_payoff=_state_float(
+                state.get("estimated_objective_payoff"),
+                0.0,
+            ),
+            target_source_tokens_per_dollar_second=max(
+                0.0,
+                _state_float(
+                    state.get("target_source_tokens_per_dollar_second"),
+                    0.0,
+                ),
+            ),
+            parent_source_tokens_per_dollar_second=max(
+                0.0,
+                _state_float(
+                    state.get("parent_source_tokens_per_dollar_second"),
+                    0.0,
+                ),
+            ),
+            source_token_throughput_delta_vs_parent=_state_float(
+                state.get("source_token_throughput_delta_vs_parent"),
+                0.0,
+            ),
+        )
+    return restored
+
+
+def _optional_string_state(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _mapping_state(value: Any) -> Mapping[str, Any]:
