@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from statistics import fmean
+import time
 from typing import Any, Mapping, Sequence
 
 from .actions import (
@@ -38,6 +39,24 @@ ART_NORTH_STAR = (
 ART_ACCOUNTED_NORTH_STAR = (
     "art_backend/accounted_published_policy_reward_improving_experience_per_dollar_second"
 )
+BENCHMARK_NORTH_STAR = (
+    "benchmark/published_policy_reward_improving_experience_per_dollar_second"
+)
+BENCHMARK_ACCOUNTED_NORTH_STAR = (
+    "benchmark/accounted_published_policy_reward_improving_experience_per_dollar_second"
+)
+
+RUNTIME_CONTROL_CONTEXT_SUMMARY_KEYS = [
+    "scheduler/control_context/keys",
+    "scheduler/control_context/decisions",
+    "scheduler/control_context/rollout_updates",
+    "scheduler/control_context/train_updates",
+    "scheduler/control_context/stale_updates",
+    "scheduler/control_context/feedback_updates",
+    "scheduler/control_context/total_objective",
+    "scheduler/control_context/mean_objective_per_decision",
+    "scheduler/control_context/mean_objective_per_feedback_update",
+]
 
 
 @dataclass(frozen=True)
@@ -335,6 +354,130 @@ async def run_art_bridge_ablation() -> dict[str, Any]:
     }
 
 
+async def run_stock_art_benchmark() -> dict[str, float]:
+    backend = _AblationArtBackend()
+    await backend.register("art-model")
+    sample_dollar_seconds = 0.0
+    trainer_dollar_seconds = 0.0
+    action_units = 0
+    source_tokens = 0
+    published_updates = 0
+    baseline_score = 0.0
+    reward_improving_experience = 0.0
+    started_at = time.perf_counter()
+    for _ in range(8):
+        actions = _bridge_actions_for_codec(
+            "token",
+            "alpha beta gamma delta epsilon zeta eta theta",
+        )
+        group = _art_bridge_group_from_assignment(
+            {
+                "scheduler/scenario_id": "stock_art",
+                "scheduler/action_codec": "token",
+                "scheduler/policy_step": backend.step,
+            }
+        )
+        sample_dollar_seconds += sum(
+            float(trajectory.metrics.get("rollout/dollar_seconds", 0.0))
+            for trajectory in group.trajectories
+        )
+        action_units += len(actions)
+        source_tokens += sum(action.token_count for action in actions)
+        result = await backend.train("art-model", [group])
+        trainer_dollar_seconds += float(
+            result.metrics.get("train/dollar_seconds", 0.0)
+        )
+        score = float(result.metrics.get("train/reward", 0.0))
+        improvement = max(0.0, score - baseline_score)
+        if improvement > 0.0:
+            reward_improving_experience += improvement * len(group.trajectories)
+            baseline_score = score
+        published_updates += 1
+
+    wall_s = max(time.perf_counter() - started_at, 1e-9)
+    accounted_dollar_seconds = sample_dollar_seconds + trainer_dollar_seconds
+    return {
+        BENCHMARK_NORTH_STAR: reward_improving_experience / wall_s,
+        BENCHMARK_ACCOUNTED_NORTH_STAR: (
+            reward_improving_experience / accounted_dollar_seconds
+            if accounted_dollar_seconds > 0.0
+            else 0.0
+        ),
+        "benchmark/wall_clock_s": wall_s,
+        "benchmark/accounted_dollar_seconds": accounted_dollar_seconds,
+        "benchmark/sample_dollar_seconds": sample_dollar_seconds,
+        "benchmark/trainer_dollar_seconds": trainer_dollar_seconds,
+        "benchmark/submitted_groups": 8.0,
+        "benchmark/completed_batches": float(published_updates),
+        "benchmark/published_policy_updates": float(published_updates),
+        "benchmark/published_policy_reward_improving_experience": (
+            reward_improving_experience
+        ),
+        "benchmark/groups_per_s": 8.0 / wall_s,
+        "benchmark/action_units": float(action_units),
+        "benchmark/source_tokens": float(source_tokens),
+        "benchmark/action_units_per_s": action_units / wall_s,
+        "benchmark/source_tokens_per_s": source_tokens / wall_s,
+        "actions/semantic_bandwidth_tokens_per_decision": (
+            source_tokens / action_units if action_units else 0.0
+        ),
+    }
+
+
+async def run_async_art_runtime_benchmark() -> dict[str, float]:
+    return _benchmark_metrics_from_bridge(
+        await _run_art_bridge(
+            scheduler=_objective_scheduler(),
+            action_space=None,
+            action_codecs=[TokenActionCodec()],
+        )
+    )
+
+
+async def run_async_semantic_art_benchmark() -> dict[str, float]:
+    return _benchmark_metrics_from_bridge(
+        await _run_art_bridge(
+            scheduler=_objective_scheduler(),
+            action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+            action_codecs=None,
+        )
+    )
+
+
+async def run_art_runtime_benchmark() -> dict[str, Any]:
+    stock = await run_stock_art_benchmark()
+    async_runtime = await run_async_art_runtime_benchmark()
+    async_semantic = await run_async_semantic_art_benchmark()
+    stock_score = stock[BENCHMARK_ACCOUNTED_NORTH_STAR]
+    async_score = async_runtime[BENCHMARK_ACCOUNTED_NORTH_STAR]
+    semantic_score = async_semantic[BENCHMARK_ACCOUNTED_NORTH_STAR]
+    return {
+        "stock_art": stock,
+        "art_async": async_runtime,
+        "art_async_semantic": async_semantic,
+        "lift": {
+            "async_vs_stock_accounted_north_star_absolute": (
+                async_score - stock_score
+            ),
+            "async_vs_stock_accounted_north_star_ratio": (
+                async_score / stock_score if stock_score > 0.0 else None
+            ),
+            "async_semantic_vs_async_accounted_north_star_absolute": (
+                semantic_score - async_score
+            ),
+            "async_semantic_vs_async_accounted_north_star_ratio": (
+                semantic_score / async_score if async_score > 0.0 else None
+            ),
+            "async_semantic_vs_stock_accounted_north_star_absolute": (
+                semantic_score - stock_score
+            ),
+            "async_semantic_vs_stock_accounted_north_star_ratio": (
+                semantic_score / stock_score if stock_score > 0.0 else None
+            ),
+        },
+    }
+
+
 async def _run(scheduler: ObjectiveScheduler | None) -> RunSummary:
     runtime = ControlPlane(
         ControlPlaneConfig(
@@ -581,6 +724,61 @@ def _objective_scheduler() -> ObjectiveScheduler:
     )
 
 
+def _benchmark_metrics_from_bridge(metrics: Mapping[str, float]) -> dict[str, float]:
+    benchmark = dict(metrics)
+    benchmark.update(
+        {
+            BENCHMARK_NORTH_STAR: float(metrics.get(ART_NORTH_STAR, 0.0)),
+            BENCHMARK_ACCOUNTED_NORTH_STAR: float(
+                metrics.get(ART_ACCOUNTED_NORTH_STAR, 0.0)
+            ),
+            "benchmark/wall_clock_s": float(
+                metrics.get("art_backend/wall_clock_s", 0.0)
+            ),
+            "benchmark/accounted_dollar_seconds": float(
+                metrics.get("art_backend/accounted_dollar_seconds", 0.0)
+            ),
+            "benchmark/sample_dollar_seconds": float(
+                metrics.get("art_backend/sample_dollar_seconds", 0.0)
+            ),
+            "benchmark/trainer_dollar_seconds": float(
+                metrics.get("art_backend/trainer_dollar_seconds", 0.0)
+            ),
+            "benchmark/submitted_groups": float(
+                metrics.get("art_backend/submitted_groups", 0.0)
+            ),
+            "benchmark/completed_batches": float(
+                metrics.get("art_backend/completed_batches", 0.0)
+            ),
+            "benchmark/published_policy_updates": float(
+                metrics.get("art_backend/published_policy_updates", 0.0)
+            ),
+            "benchmark/published_policy_reward_improving_experience": float(
+                metrics.get(
+                    "art_backend/published_policy_reward_improving_experience",
+                    0.0,
+                )
+            ),
+            "benchmark/groups_per_s": float(
+                metrics.get("art_backend/submitted_train_groups_per_s", 0.0)
+            ),
+            "benchmark/action_units": float(
+                metrics.get("art_backend/action_units", 0.0)
+            ),
+            "benchmark/source_tokens": float(
+                metrics.get("art_backend/source_tokens", 0.0)
+            ),
+            "benchmark/action_units_per_s": float(
+                metrics.get("art_backend/action_units_per_s", 0.0)
+            ),
+            "benchmark/source_tokens_per_s": float(
+                metrics.get("art_backend/source_tokens_per_s", 0.0)
+            ),
+        }
+    )
+    return benchmark
+
+
 def summary_metrics(summary: RunSummary) -> dict[str, float]:
     keys = [
         NORTH_STAR,
@@ -663,6 +861,7 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "scheduler/control/actor_count_2/mean_objective_per_feedback_update",
         "scheduler/control/actor_count_1/score",
         "scheduler/control/actor_count_2/score",
+        *RUNTIME_CONTROL_CONTEXT_SUMMARY_KEYS,
         "scheduler/coverage_control/keys",
         "scheduler/coverage_control/decisions",
         "scheduler/coverage_control/feedback_updates",
@@ -713,14 +912,24 @@ def bridge_summary_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
     keys = [
         ART_NORTH_STAR,
         ART_ACCOUNTED_NORTH_STAR,
+        "art_backend/wall_clock_s",
+        "art_backend/wall_clock_dollar_seconds",
         "art_backend/accounted_dollar_seconds",
         "art_backend/sample_dollar_seconds",
         "art_backend/trainer_dollar_seconds",
         "art_backend/submitted_groups",
         "art_backend/submitted_train_groups",
         "art_backend/completed_batches",
+        "art_backend/submitted_batches_per_s",
+        "art_backend/submitted_train_groups_per_s",
+        "art_backend/completed_batches_per_s",
+        "art_backend/sample_dollar_seconds_per_s",
         "art_backend/published_policy_updates",
         "art_backend/published_policy_reward_improving_experience",
+        "art_backend/action_units",
+        "art_backend/source_tokens",
+        "art_backend/action_units_per_s",
+        "art_backend/source_tokens_per_s",
         "art_backend/publication/decision/keys",
         "art_backend/publication/decision/decisions",
         "art_backend/publication/decision/published",
@@ -767,6 +976,7 @@ def bridge_summary_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "scheduler/control/actor_count_2/rollout_updates",
         "scheduler/control/actor_count_2/mean_objective_per_decision",
         "scheduler/control/actor_count_2/mean_objective_per_feedback_update",
+        *RUNTIME_CONTROL_CONTEXT_SUMMARY_KEYS,
         "scheduler/coverage_control/keys",
         "scheduler/coverage_control/decisions",
         "scheduler/coverage_control/feedback_updates",

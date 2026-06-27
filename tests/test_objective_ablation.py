@@ -5,9 +5,11 @@ import unittest
 from calm_puffer_art.objective_ablation import (
     ART_ACCOUNTED_NORTH_STAR,
     ACCOUNTED_NORTH_STAR,
+    BENCHMARK_ACCOUNTED_NORTH_STAR,
     NORTH_STAR,
     run_action_space_ablation,
     run_ablation,
+    run_art_runtime_benchmark,
     run_art_bridge_ablation,
     run_closed_loop_ablation,
 )
@@ -42,6 +44,28 @@ def assert_any_runtime_control_payoff_metric(
         test_case,
         metrics,
         tuple(observed_prefixes),
+    )
+
+
+def assert_control_context_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertGreater(metrics["scheduler/control_context/keys"], 0.0)
+    test_case.assertGreater(metrics["scheduler/control_context/decisions"], 0.0)
+    test_case.assertGreater(
+        metrics["scheduler/control_context/feedback_updates"],
+        0.0,
+    )
+    test_case.assertTrue(
+        isfinite(metrics["scheduler/control_context/mean_objective_per_decision"])
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "scheduler/control_context/mean_objective_per_feedback_update"
+            ]
+        )
     )
 
 
@@ -343,6 +367,7 @@ class ObjectiveAblationTests(unittest.TestCase):
             ],
         )
         assert_action_space_payoff_means(self, adaptive)
+        assert_control_context_payoff_metrics(self, adaptive)
         assert_promotion_decision_payoff_metrics(self, adaptive)
 
     def test_closed_loop_ablation_accounts_joint_scheduler_payoff(self):
@@ -422,6 +447,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/actor_count_2",
             ),
         )
+        assert_control_context_payoff_metrics(self, objective)
         assert_train_selection_payoff_metrics(self, objective)
         assert_continuation_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
@@ -523,6 +549,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/actor_count_2",
             ),
         )
+        assert_control_context_payoff_metrics(self, objective)
         assert_train_selection_payoff_metrics(self, objective)
         assert_continuation_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
@@ -545,6 +572,46 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertGreater(objective["art_backend/submitted_groups"], 0.0)
         self.assertGreater(objective["art_backend/completed_batches"], 0.0)
         assert_art_publication_decision_payoff_metrics(self, objective)
+
+    def test_art_runtime_benchmark_compares_stock_async_and_semantic_modes(self):
+        result = asyncio.run(run_art_runtime_benchmark())
+
+        stock = result["stock_art"]
+        async_runtime = result["art_async"]
+        async_semantic = result["art_async_semantic"]
+        lift = result["lift"]
+
+        self.assertGreater(stock[BENCHMARK_ACCOUNTED_NORTH_STAR], 0.0)
+        self.assertGreater(async_runtime[BENCHMARK_ACCOUNTED_NORTH_STAR], 0.0)
+        self.assertGreater(
+            async_semantic[BENCHMARK_ACCOUNTED_NORTH_STAR],
+            async_runtime[BENCHMARK_ACCOUNTED_NORTH_STAR],
+        )
+        self.assertGreater(
+            async_semantic[BENCHMARK_ACCOUNTED_NORTH_STAR],
+            stock[BENCHMARK_ACCOUNTED_NORTH_STAR],
+        )
+        self.assertGreater(
+            async_semantic["actions/semantic_bandwidth_tokens_per_decision"],
+            async_runtime["actions/semantic_bandwidth_tokens_per_decision"],
+        )
+        self.assertEqual(
+            stock["actions/semantic_bandwidth_tokens_per_decision"],
+            1.0,
+        )
+        self.assertGreater(async_runtime["benchmark/submitted_groups"], 0.0)
+        self.assertGreater(async_semantic["benchmark/submitted_groups"], 0.0)
+        self.assertGreater(async_runtime["scheduler/joint_action/decisions"], 0.0)
+        self.assertGreaterEqual(async_semantic["action_space/promotions"], 1.0)
+        assert_control_context_payoff_metrics(self, async_semantic)
+        self.assertGreater(
+            lift["async_semantic_vs_async_accounted_north_star_ratio"],
+            1.0,
+        )
+        self.assertGreater(
+            lift["async_semantic_vs_stock_accounted_north_star_ratio"],
+            1.0,
+        )
 
 
 if __name__ == "__main__":
