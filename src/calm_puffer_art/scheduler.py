@@ -3001,6 +3001,48 @@ class ObjectiveScheduler:
                 stats.total_stale_penalty_objective
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        joint_feedback_updates = {
+            key: _control_feedback_updates(stats)
+            for key, stats in self._joint_action_controls.items()
+        }
+        metrics["scheduler/joint_action/tuples"] = float(
+            len(self._joint_action_controls)
+        )
+        metrics["scheduler/joint_action/decisions"] = float(
+            sum(stats.decisions for stats in self._joint_action_controls.values())
+        )
+        metrics["scheduler/joint_action/rollout_updates"] = float(
+            sum(
+                stats.rollout_updates
+                for stats in self._joint_action_controls.values()
+            )
+        )
+        metrics["scheduler/joint_action/train_updates"] = float(
+            sum(stats.train_updates for stats in self._joint_action_controls.values())
+        )
+        metrics["scheduler/joint_action/stale_updates"] = float(
+            sum(stats.stale_updates for stats in self._joint_action_controls.values())
+        )
+        metrics["scheduler/joint_action/feedback_updates"] = float(
+            sum(joint_feedback_updates.values())
+        )
+        metrics["scheduler/joint_action/feedback_tuples"] = float(
+            sum(1 for updates in joint_feedback_updates.values() if updates > 0)
+        )
+        metrics["scheduler/joint_action/positive_objective_tuples"] = float(
+            sum(
+                1
+                for stats in self._joint_action_controls.values()
+                if stats.total_objective > 0.0
+            )
+        )
+        metrics["scheduler/joint_action/total_objective"] = sum(
+            stats.total_objective for stats in self._joint_action_controls.values()
+        )
+        metrics["scheduler/joint_action/total_stale_penalty_objective"] = sum(
+            stats.total_stale_penalty_objective
+            for stats in self._joint_action_controls.values()
+        )
         for key, stats in sorted(self._joint_action_controls.items()):
             prefix = f"scheduler/joint_action/{_safe_metric_key(key)}"
             metrics[f"{prefix}/decisions"] = float(stats.decisions)

@@ -48,6 +48,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It gates the static actor pool with a learned active actor cap, so actor count becomes a runtime control without changing the user-facing rollout API; local actors share each cap choice across a pool sweep, rejected slots yield without separate probes, and saturation and low-ROI backoff remain initial preferences that actor-count feedback can override after admitted rollout work has scored the cap.
 - It can delay actor admission before rollout under downstream queue saturation, then explore and reuse millisecond delay values based on rollout, train, and stale objective feedback.
 - It stamps each admitted local or ART-bridge rollout with a joint scheduling-action key covering the selected scenario/action arm, cadence, policy-lag limit, actor cap, admission delay, and active action-space signature when an adaptive ladder is attached, records the tuple decision at selection time, rolls it back on unspent cancellation, then credits rollout, train, and stale payoff to that tuple under `scheduler/joint_action/*` and reuses exact tuple payoff during future rollout selection plus partial tuple payoff during runtime-control selection.
+- It reports top-level joint-action aggregates for tuple count, decisions, feedback updates, positive-objective tuples, and total objective, so experiments can verify that scheduling actions are receiving payoff without knowing every tuple key in advance.
 - It scores candidate train batches so ready samples with higher estimated arm and joint-scheduling-tuple objective value train first, cost-normalizing queued batches by explicit sample/API/tool dollar-seconds when present, while applying current trajectory quality so unsafe batches from historically good arms lose priority before training.
 - It rescores queued train batches at consume time and boosts positive-value batches as they approach the active policy-lag limit, reducing stale reward-improving experience waste before it happens.
 - It can subtract a configurable confidence penalty from sparse or high-variance objective samples, so rollout and train-batch priority can prefer steadier marginal reward improvement per dollar-second over one-off spikes.
@@ -170,7 +171,7 @@ Phase 3: CALM action layer
 
 Phase 4: Measurement
 
-- Keep the deterministic static-vs-objective ablations green as local proof that scheduler control and adaptive action-space control improve the north-star on controlled workloads, including learned actor-count, cadence, lag, and chunk-granularity controls together.
+- Keep the deterministic static-vs-objective ablations green as local proof that scheduler control, adaptive action-space control, and the combined closed-loop controller improve the north-star on controlled workloads, including learned actor-count, cadence, lag, chunk-granularity, joint-action payoff, and realized action-space payoff together.
 - Benchmark stock ART, ART plus async runtime, and ART plus async runtime plus semantic actions.
 - Report reward-improving experience per dollar-second, not only throughput.
 - Report throughput and utilization next to the objective so rollouts/sec gains are distinguishable from reward-improving experience gains.

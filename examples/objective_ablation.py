@@ -6,6 +6,7 @@ import json
 from calm_puffer_art.objective_ablation import (
     run_ablation,
     run_action_space_ablation,
+    run_closed_loop_ablation,
 )
 
 
@@ -15,6 +16,7 @@ async def main() -> None:
             {
                 "scheduler_control": await run_ablation(),
                 "action_space_control": await run_action_space_ablation(),
+                "closed_loop_control": await run_closed_loop_ablation(),
             },
             indent=2,
             sort_keys=True,

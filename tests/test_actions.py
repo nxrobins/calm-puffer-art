@@ -329,6 +329,15 @@ class ActionCodecTests(unittest.TestCase):
             "action_space/decision/"
             "promotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
         )
+        self.assertEqual(metrics["action_space/decision/decisions"], 1.0)
+        self.assertEqual(
+            metrics["action_space/decision/post_decision_observations"],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            metrics["action_space/decision/realized_objective_payoff"],
+            1.4,
+        )
         self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(metrics[f"{prefix}/promotion"], 1.0)
         self.assertEqual(metrics[f"{prefix}/target_pulls"], 2.0)
@@ -356,6 +365,12 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             metrics[f"{prefix}/realized_source_token_throughput_payoff"],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "action_space/decision/realized_source_token_throughput_payoff"
+            ],
             3.0,
         )
 

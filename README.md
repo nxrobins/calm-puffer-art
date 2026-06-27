@@ -52,6 +52,11 @@ $env:PYTHONPATH = "src"
 python examples\objective_ablation.py
 ```
 
+The ablation output includes separate scheduler-control and action-space-control
+checks plus a combined closed-loop run where the objective scheduler controls
+rollout choice, cadence/lag/actor runtime settings, and adaptive chunk promotion
+in one measured loop.
+
 Run tests:
 
 ```powershell
@@ -93,6 +98,8 @@ The scheduler explores `(scenario, action_codec)` arms, estimates marginal rewar
 Runtime-control train credit defaults to `control_train_objective="accounted"`, so cadence, lag, actor-count, and admission-delay values learn from the train interval's reward-improving useful experience divided by rollout, queue, admission, trainer, trainer-wait, and promotion spend. In mixed batches, that accounted denominator is still distributed through each arm's actual train-improvement credit rather than raw trajectory reward, so a high-reward non-improving workflow cannot steal runtime-control credit from the lower-reward arm that moved the policy. Arm train credit still uses candidate train spend so rollout/action arms keep local policy-improvement attribution.
 
 Every admitted rollout is also stamped with a `scheduler/joint_action_key` that combines the selected scenario/action arm, train cadence, policy-lag limit, active actor cap, and admission-delay bucket. When an `AdaptiveActionSpace` is attached, the key also includes a stable `action_space_signature()` for the active/disabled codec ladder, so the same runtime tuple before and after a chunk promotion is credited as a different scheduling action. The tuple decision is recorded when rollout work is selected and rolled back if the reservation is cancelled before spend, so `scheduler/joint_action/*/decisions` tracks scheduling actions rather than only completed samples. Once a tuple has feedback, `joint_action_objective_weight` adds matching tuple payoff to future rollout scoring and to the bounded cadence, lag, actor-cap, and admission-delay candidate scores when the relevant control context is known. `ObjectiveScheduler.metrics()` reports rollout, train, stale, score, and objective totals under `scheduler/joint_action/*`, so operators can audit the payoff of the full scheduling action tuple when individual knobs hide interactions.
+
+Top-level joint-action aggregates under `scheduler/joint_action/*` report tuple count, decisions, feedback updates, positive-objective tuples, and total objective, while `action_space/decision/*` aggregates report semantic-bandwidth decision count, post-decision observations, and realized payoff. The combined ablation asserts those aggregates move alongside the accounted north-star, making the scheduling and action-space decisions auditable as control actions instead of hidden implementation details.
 
 Gate checkpoint promotion when train reward is not enough:
 

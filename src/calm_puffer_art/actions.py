@@ -1207,6 +1207,19 @@ class AdaptiveActionSpace:
         )
 
     def metrics(self) -> dict[str, float]:
+        decision_count = sum(stats.decisions for stats in self._decision_stats.values())
+        decision_post_observations = sum(
+            stats.post_decision_observations
+            for stats in self._decision_stats.values()
+        )
+        realized_objective_payoff = sum(
+            stats.realized_objective_payoff
+            for stats in self._decision_stats.values()
+        )
+        realized_source_token_throughput_payoff = sum(
+            stats.realized_source_token_throughput_payoff
+            for stats in self._decision_stats.values()
+        )
         values = {
             "action_space/active_codecs": float(len(self._codecs)),
             "action_space/promotions": float(self._promotions),
@@ -1239,6 +1252,16 @@ class AdaptiveActionSpace:
             ),
             "action_space/demote_on_stale_feedback": (
                 1.0 if self.demote_on_stale_feedback else 0.0
+            ),
+            "action_space/decision/decisions": float(decision_count),
+            "action_space/decision/post_decision_observations": (
+                decision_post_observations
+            ),
+            "action_space/decision/realized_objective_payoff": (
+                realized_objective_payoff
+            ),
+            "action_space/decision/realized_source_token_throughput_payoff": (
+                realized_source_token_throughput_payoff
             ),
         }
         for codec in self._codecs:

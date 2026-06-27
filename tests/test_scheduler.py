@@ -70,6 +70,17 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         prefix = f"scheduler/joint_action/{_test_metric_key(key)}"
         metrics = scheduler.metrics()
 
+        self.assertEqual(metrics["scheduler/joint_action/tuples"], 1.0)
+        self.assertEqual(metrics["scheduler/joint_action/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/joint_action/rollout_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/joint_action/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/joint_action/stale_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/joint_action/feedback_updates"], 3.0)
+        self.assertEqual(metrics["scheduler/joint_action/feedback_tuples"], 1.0)
+        self.assertLess(
+            metrics["scheduler/joint_action/total_stale_penalty_objective"],
+            0.0,
+        )
         self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(metrics[f"{prefix}/rollout_updates"], 1.0)
         self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
