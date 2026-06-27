@@ -773,6 +773,10 @@ class ArtAdapterTests(unittest.TestCase):
             metrics["scheduler/control/actor_count_1/rollout_updates"],
             1.0,
         )
+        self.assertEqual(
+            metrics["scheduler/control/actor_count_1/decisions"],
+            1.0,
+        )
         self.assertAlmostEqual(
             metrics["scheduler/actor/actor_0/admission_dollar_seconds"],
             admitted.delay_dollar_seconds,

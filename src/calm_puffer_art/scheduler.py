@@ -81,6 +81,9 @@ class AdaptiveScheduler(Protocol):
     ) -> int:
         ...
 
+    def cancel_actor_count_decision(self, active_actor_count: int) -> None:
+        ...
+
     def observe_rollout_admission_delay(
         self,
         *,
@@ -851,6 +854,14 @@ class ObjectiveScheduler:
                 preferred=preferred,
             ),
         )
+
+    def cancel_actor_count_decision(self, active_actor_count: int) -> None:
+        """Cancel an actor-count control choice that admitted no rollout work."""
+
+        active_count = max(0, int(active_actor_count))
+        if active_count <= 0:
+            return
+        self._cancel_control_decision(self._actor_count_controls, active_count)
 
     def observe_rollout(
         self,

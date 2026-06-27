@@ -1713,6 +1713,35 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             1.0,
         )
 
+    def test_cancel_actor_count_decision_removes_unadmitted_control_probe(self):
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=4,
+            exploration_bonus=0.0,
+        )
+
+        count = scheduler.active_actor_count(
+            configured=4,
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        selected_metrics = scheduler.metrics()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            selected_metrics["scheduler/control/actor_count_1/decisions"],
+            1.0,
+        )
+
+        scheduler.cancel_actor_count_decision(count)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(
+            metrics.get("scheduler/control/actor_count_1/decisions", 0.0),
+            0.0,
+        )
+
     def test_actor_count_pressure_uses_feedback_after_stale_waste(self):
         scheduler = ObjectiveScheduler(
             min_actor_count=1,

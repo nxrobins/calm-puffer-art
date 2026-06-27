@@ -1533,6 +1533,7 @@ class ControlPlane:
                 policy_step=snapshot.step,
             )
             if actor_id >= active_actor_count:
+                self._cancel_actor_count_decision(scheduler, active_actor_count)
                 await asyncio.sleep(0.001)
                 continue
             admission_delay_s = await self._apply_rollout_admission_delay(
@@ -1549,6 +1550,10 @@ class ControlPlane:
                     train_ring=train_ring,
                     policy_step=snapshot.step,
                 ):
+                    self._cancel_actor_count_decision(
+                        scheduler,
+                        active_actor_count,
+                    )
                     stop.set()
                     break
             decision = await self._select_rollout(
@@ -2082,6 +2087,17 @@ class ControlPlane:
                 metadata["scheduler/admission_observed"] = admission_delay_s > 0.0
             decision = replace(decision, metadata=metadata)
             cancel(decision)
+
+    @staticmethod
+    def _cancel_actor_count_decision(
+        scheduler: AdaptiveScheduler | None,
+        active_actor_count: int,
+    ) -> None:
+        if scheduler is None:
+            return
+        cancel = getattr(scheduler, "cancel_actor_count_decision", None)
+        if cancel is not None:
+            cancel(active_actor_count)
 
     def _trajectory_dollar_seconds(self, trajectory: Trajectory) -> float:
         explicit_total = _first_nonnegative_float(

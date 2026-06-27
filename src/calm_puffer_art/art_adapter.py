@@ -475,6 +475,7 @@ class AsyncArtBackend:
             "scheduler/admitted": actor_id < active_count,
         }
         if actor_id >= active_count:
+            self._cancel_actor_count_decision(active_count)
             return ArtRolloutAdmission(
                 actor_id=actor_id,
                 active_actor_count=active_count,
@@ -556,6 +557,7 @@ class AsyncArtBackend:
         if not self._should_continue_rollout_admission(
             trajectory_queue_pressure=trajectory_queue_pressure,
         ):
+            self._cancel_actor_count_decision(admission.active_actor_count)
             self._stopped_admissions += 1
             metadata = {
                 **admission.metadata,
@@ -1314,6 +1316,13 @@ class AsyncArtBackend:
                     metadata={**decision.metadata, **metadata},
                 )
             cancel(decision)
+
+    def _cancel_actor_count_decision(self, active_actor_count: int) -> None:
+        if self.scheduler is None:
+            return
+        cancel = getattr(self.scheduler, "cancel_actor_count_decision", None)
+        if cancel is not None:
+            cancel(active_actor_count)
 
     def _accounted_dollar_seconds(
         self,

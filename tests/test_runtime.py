@@ -1561,6 +1561,8 @@ class RuntimeTests(unittest.TestCase):
             scheduler = ObjectiveScheduler(
                 min_train_batch_groups=1,
                 max_train_batch_groups=1,
+                min_actor_count=2,
+                max_actor_count=2,
                 min_policy_lag=1,
                 max_policy_lag=1,
                 exploration_bonus=0.0,
@@ -2258,6 +2260,50 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(low_scheduler.calls[0]["configured"], 4)
         self.assertEqual(low_scheduler.calls[0]["policy_step"], 3)
         self.assertGreater(low_scheduler.calls[0]["trajectory_queue_pressure"], 0.0)
+
+    def test_runtime_cancels_actor_count_decisions_for_capped_actor_slots(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_actor_count=1,
+                max_actor_count=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=2,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=2,
+                    train_queue_capacity=2,
+                )
+            )
+
+            async def slow_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                await asyncio.sleep(0.01)
+                return await counting_rollout(policy, scenario, context)
+
+            return await runtime.run(
+                scenarios=[Scenario(id="cap", payload={"target": 1})],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=slow_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+        total_decisions = summary.metrics["scheduler/total_rollout_decisions"]
+
+        self.assertGreater(total_decisions, 0.0)
+        self.assertEqual(
+            summary.metrics["scheduler/control/actor_count_1/decisions"],
+            total_decisions,
+        )
 
     def test_runtime_telemetry_accepts_explicit_train_dollar_seconds(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)
