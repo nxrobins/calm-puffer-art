@@ -523,6 +523,7 @@ class ObjectiveScheduler:
         self._last_train_batch_reward_improving_experience = 0.0
         self._last_train_batch_sample_dollar_seconds = 0.0
         self._last_train_batch_cost_normalized_priority = 0.0
+        self._last_train_batch_joint_action_score = 0.0
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -1407,6 +1408,7 @@ class ObjectiveScheduler:
         """Estimate train-batch value before the trainer consumes it."""
 
         arm_values: list[float] = []
+        joint_action_scores: list[float] = []
         rewards: list[float] = []
         for group in groups:
             rewards.append(group.mean_reward)
@@ -1422,6 +1424,9 @@ class ObjectiveScheduler:
                         arm_values.append(min(arm_value, -self.unsafe_penalty))
                     else:
                         arm_values.append(arm_value * quality)
+                joint_action_scores.append(
+                    self._joint_action_priority_score(trajectory) * quality
+                )
         raw_reward_component = max(
             0.0,
             mean(
@@ -1433,8 +1438,11 @@ class ObjectiveScheduler:
             ),
         )
         arm_component = mean(arm_values)
+        joint_action_component = mean(joint_action_scores)
         uncosted_base_priority = (
-            arm_component + self.reward_efficiency_weight * raw_reward_component
+            arm_component
+            + joint_action_component
+            + self.reward_efficiency_weight * raw_reward_component
         )
         experience_count = _useful_experience_count(groups)
         batch_reward_improving_experience = (
@@ -1495,6 +1503,7 @@ class ObjectiveScheduler:
         )
         self._last_train_batch_sample_dollar_seconds = sample_dollar_seconds
         self._last_train_batch_cost_normalized_priority = base_priority
+        self._last_train_batch_joint_action_score = joint_action_component
         return priority
 
     def should_continue_training(
@@ -1678,6 +1687,9 @@ class ObjectiveScheduler:
                 ),
                 "last_train_batch_cost_normalized_priority": (
                     self._last_train_batch_cost_normalized_priority
+                ),
+                "last_train_batch_joint_action_score": (
+                    self._last_train_batch_joint_action_score
                 ),
                 "coverage_forced_decisions": self._coverage_forced_decisions,
                 "last_rollout_coverage_target": (
@@ -2176,6 +2188,10 @@ class ObjectiveScheduler:
             learning_state.get("last_train_batch_cost_normalized_priority"),
             self._last_train_batch_cost_normalized_priority,
         )
+        self._last_train_batch_joint_action_score = _state_float(
+            learning_state.get("last_train_batch_joint_action_score"),
+            self._last_train_batch_joint_action_score,
+        )
         self._coverage_forced_decisions = _state_int(
             learning_state.get("coverage_forced_decisions"),
             self._coverage_forced_decisions,
@@ -2449,6 +2465,9 @@ class ObjectiveScheduler:
             ),
             "scheduler/last_train_batch_cost_normalized_priority": (
                 self._last_train_batch_cost_normalized_priority
+            ),
+            "scheduler/last_train_batch_joint_action_score": (
+                self._last_train_batch_joint_action_score
             ),
             "scheduler/low_roi_train_steps": float(self._low_roi_train_steps),
             "scheduler/stop_recommended": 1.0 if self._stop_recommended else 0.0,
@@ -3157,6 +3176,20 @@ class ObjectiveScheduler:
             active_actor_count=active_actor_count,
             rollout_admission_delay_ms=rollout_admission_delay_ms,
         )
+        if key is None:
+            return 0.0
+        stats = self._joint_action_controls.get(key)
+        if stats is None or _control_feedback_updates(stats) <= 0:
+            return 0.0
+        return self.joint_action_objective_weight * self._score_control_value(
+            self._joint_action_controls,
+            key,
+        )
+
+    def _joint_action_priority_score(self, trajectory: Trajectory) -> float:
+        if self.joint_action_objective_weight <= 0.0:
+            return 0.0
+        key = _joint_action_key_from_metadata(trajectory.metadata)
         if key is None:
             return 0.0
         stats = self._joint_action_controls.get(key)
