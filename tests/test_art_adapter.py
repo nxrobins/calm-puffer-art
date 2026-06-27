@@ -1896,6 +1896,55 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(after["art_backend/completed_batches"], 1.0)
         self.assertEqual(len(backend.calls[0][1]), 1)
 
+    def test_async_art_backend_forced_flush_records_timing_response_payoff(self):
+        async def run():
+            backend = FakeArtBackend()
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=3,
+                max_train_batch_groups=3,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+            )
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_batch_groups=3,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                ),
+            )
+            group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[],
+                        reward=1.0,
+                        metrics={"cost/dollar_seconds": 1.0},
+                        metadata={"scenario_id": "forced-flush"},
+                    )
+                ],
+                metadata={"scenario_id": "forced-flush"},
+            )
+
+            future = await async_backend.submit_group("art-model", group)
+            flushed = await async_backend.flush_pending_groups()
+            result = await future
+            metrics = scheduler.metrics()
+            await async_backend.close()
+            return flushed, result, metrics
+
+        flushed, result, metrics = asyncio.run(run())
+
+        prefix = (
+            "scheduler/timing_response/"
+            "control_batch_flush_value_1_preference_manual_flush_pressure_low_pending_1"
+        )
+        self.assertFalse(result is None)
+        self.assertEqual(flushed, 1)
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
+        self.assertGreater(metrics[f"{prefix}/total_objective"], 0.0)
+
     def test_async_art_backend_drops_stale_pending_group_on_submit(self):
         async def run():
             backend = FakeArtBackend()

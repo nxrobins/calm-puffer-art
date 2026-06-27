@@ -1084,7 +1084,7 @@ class AsyncArtBackend:
         """Flush partial ART group batches that have not reached cadence yet."""
 
         async with self._pending_lock:
-            return await self._flush_pending_locked()
+            return await self._flush_pending_locked(reason="manual_flush")
 
     async def train(
         self,
@@ -1640,12 +1640,14 @@ class AsyncArtBackend:
         groups: Sequence[TrajectoryGroup],
         futures: Sequence[asyncio.Future[Any]],
         kwargs: Mapping[str, Any],
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         active_max_policy_lag = self._max_policy_lag()
         self._tag_batch_control_metadata(
             groups,
             target_train_batch_groups=len(groups),
             max_policy_lag=active_max_policy_lag,
+            extra_metadata=extra_metadata,
         )
         batch = VersionedTrajectoryBatch(
             groups=tuple(groups),
@@ -1662,20 +1664,44 @@ class AsyncArtBackend:
         self._submitted_train_groups += len(groups)
         await self.ring.put(batch)
 
-    async def _flush_pending_locked(self) -> int:
+    async def _flush_pending_locked(self, *, reason: str | None = None) -> int:
         self._discard_stale_pending_locked()
         if not self._pending_groups:
             return 0
         pending = tuple(self._pending_groups)
         self._pending_groups.clear()
         first = pending[0]
+        flush_metadata = self._record_pending_flush_response(
+            pending,
+            reason=reason,
+        )
         await self._submit_local_batch(
             model=first.model,
             groups=tuple(item.group for item in pending),
             futures=tuple(item.future for item in pending),
             kwargs=first.kwargs,
+            extra_metadata=flush_metadata,
         )
         return 1
+
+    def _record_pending_flush_response(
+        self,
+        pending: Sequence[_PendingArtGroup],
+        *,
+        reason: str | None,
+    ) -> Mapping[str, Any]:
+        if self.scheduler is None or reason is None or not pending:
+            return {}
+        recorder = getattr(self.scheduler, "record_train_batch_flush", None)
+        if recorder is None:
+            return {}
+        metadata = recorder(
+            flushed_groups=len(pending),
+            pending_groups=len(pending),
+            train_queue_pressure=self._train_queue_pressure(),
+            reason=reason,
+        )
+        return metadata if isinstance(metadata, Mapping) else {}
 
     async def _discard_stale_pending_groups(self) -> int:
         async with self._pending_lock:
@@ -1871,6 +1897,7 @@ class AsyncArtBackend:
         *,
         target_train_batch_groups: int | None = None,
         max_policy_lag: int | None = None,
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         timing_metadata = self._timing_response_metadata()
         for group in groups:
@@ -1886,6 +1913,9 @@ class AsyncArtBackend:
                 for key, value in timing_metadata.items():
                     if value is not None and not isinstance(value, bool):
                         trajectory.metadata.setdefault(key, str(value))
+                for key, value in (extra_metadata or {}).items():
+                    if value is not None and not isinstance(value, bool):
+                        trajectory.metadata.setdefault(str(key), str(value))
 
     def _timing_response_metadata(self) -> Mapping[str, Any]:
         if self.scheduler is None:

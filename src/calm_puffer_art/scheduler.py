@@ -1120,6 +1120,28 @@ class ObjectiveScheduler:
             )
         return metadata
 
+    def record_train_batch_flush(
+        self,
+        *,
+        flushed_groups: int,
+        pending_groups: int,
+        train_queue_pressure: float,
+        reason: str = "manual_flush",
+    ) -> dict[str, str]:
+        """Record a forced partial train-batch flush as a timing response."""
+
+        flushed = max(0, int(flushed_groups))
+        if flushed <= 0:
+            return {}
+        key = self._record_timing_response_decision(
+            knob="batch_flush",
+            value=flushed,
+            preference_reason=reason,
+            train_queue_pressure=train_queue_pressure,
+            pending_groups=pending_groups,
+        )
+        return {"scheduler/batch_flush_response_key": key}
+
     def observe_rollout(
         self,
         trajectory: Trajectory,
@@ -5472,7 +5494,7 @@ class ObjectiveScheduler:
         preference_reason: str,
         train_queue_pressure: float,
         pending_groups: int,
-    ) -> None:
+    ) -> str:
         key = _timing_response_key(
             knob=knob,
             value=value,
@@ -5487,6 +5509,7 @@ class ObjectiveScheduler:
         elif knob == "policy_lag":
             self._last_policy_lag_response_key = key
             self._last_policy_lag_response_reason = preference_reason
+        return key
 
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
@@ -5691,6 +5714,8 @@ def _timing_response_keys_from_metadata(
         "cadence_response_key",
         "scheduler/policy_lag_response_key",
         "policy_lag_response_key",
+        "scheduler/batch_flush_response_key",
+        "batch_flush_response_key",
     ):
         value = metadata.get(name)
         if value is None or isinstance(value, bool):
