@@ -341,9 +341,22 @@ class ActionCodecTests(unittest.TestCase):
             metrics[f"{prefix}/estimated_objective_payoff"],
             0.7,
         )
+        self.assertEqual(metrics[f"{prefix}/decision_target_pulls"], 0.0)
+        self.assertEqual(metrics[f"{prefix}/decision_parent_pulls"], 3.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_target_pulls"], 2.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_parent_pulls"], 2.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_observations"], 2.0)
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/realized_objective_payoff"],
+            1.4,
+        )
         self.assertAlmostEqual(
             metrics[f"{prefix}/source_token_throughput_delta_vs_parent"],
             1.5,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/realized_source_token_throughput_payoff"],
+            3.0,
         )
 
     def test_adaptive_action_space_can_promote_latent_patch_from_chunk_signal(self):
@@ -812,6 +825,78 @@ class ActionCodecTests(unittest.TestCase):
             -1.5,
         )
 
+    def test_adaptive_action_space_reports_realized_demotion_payoff(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            demotion_parent_margin=0.1,
+        )
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 8.0,
+            }
+        )
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 8.0,
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.9,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_4/source_tokens_per_dollar_second": 6.5,
+            }
+        )
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 6.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.1,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 8.5,
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.9,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_4/source_tokens_per_dollar_second": 6.5,
+            }
+        )
+
+        metrics = action_space.metrics()
+        prefix = (
+            "action_space/decision/"
+            "demotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
+        )
+        self.assertEqual(metrics[f"{prefix}/decision_target_pulls"], 2.0)
+        self.assertEqual(metrics[f"{prefix}/decision_parent_pulls"], 4.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_target_pulls"], 0.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_parent_pulls"], 2.0)
+        self.assertEqual(metrics[f"{prefix}/post_decision_observations"], 2.0)
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/estimated_objective_payoff"],
+            1.2,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/realized_objective_payoff"],
+            2.4,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/realized_source_token_throughput_payoff"],
+            4.0,
+        )
+
     def test_adaptive_action_space_demotes_bad_latent_patch_candidate(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -1051,6 +1136,16 @@ class ActionCodecTests(unittest.TestCase):
         self.assertEqual(
             metrics[f"{demotion_prefix}/demotion"],
             1.0,
+        )
+        self.assertIn(
+            "realized_objective_payoff",
+            state["decision_stats"][
+                "demotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
+            ],
+        )
+        self.assertIn(
+            f"{demotion_prefix}/realized_objective_payoff",
+            metrics,
         )
 
     def test_action_space_checkpoint_metadata_uses_named_state_key(self):

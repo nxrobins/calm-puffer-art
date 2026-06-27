@@ -855,7 +855,7 @@ class AdaptiveActionSpace:
             self._decision_stats[decision_key] = stats
         stats.decisions += 1
         stats.source_codec_key = source_key
-        self._update_decision_payoff(stats, metrics)
+        self._update_decision_payoff(stats, metrics, record_baseline=True)
 
     def _refresh_decision_payoffs(self, metrics: Mapping[str, float]) -> None:
         for stats in self._decision_stats.values():
@@ -865,6 +865,8 @@ class AdaptiveActionSpace:
         self,
         stats: "_ActionSpaceDecisionStats",
         metrics: Mapping[str, float],
+        *,
+        record_baseline: bool = False,
     ) -> None:
         target_signal = self._codec_signal_for_key(stats.codec_key, metrics)
         parent_signal = (
@@ -872,6 +874,10 @@ class AdaptiveActionSpace:
             if stats.parent_codec_key is not None
             else _CodecSignal.empty()
         )
+        if record_baseline and not stats.has_decision_baseline:
+            stats.decision_target_pulls = target_signal.pulls
+            stats.decision_parent_pulls = parent_signal.pulls
+            stats.has_decision_baseline = True
         stats.target_pulls = target_signal.pulls
         stats.parent_pulls = parent_signal.pulls
         stats.target_objective = target_signal.objective
@@ -897,6 +903,33 @@ class AdaptiveActionSpace:
             stats.estimated_objective_payoff = (
                 target_signal.objective - parent_signal.objective
             )
+        stats.post_decision_target_pulls = max(
+            0.0,
+            target_signal.pulls - stats.decision_target_pulls,
+        )
+        stats.post_decision_parent_pulls = max(
+            0.0,
+            parent_signal.pulls - stats.decision_parent_pulls,
+        )
+        if stats.kind == "demotion":
+            post_decision_observations = stats.post_decision_parent_pulls
+            source_token_payoff = (
+                parent_signal.source_tokens_per_dollar_second
+                - target_signal.source_tokens_per_dollar_second
+            )
+        else:
+            post_decision_observations = stats.post_decision_target_pulls
+            source_token_payoff = (
+                target_signal.source_tokens_per_dollar_second
+                - parent_signal.source_tokens_per_dollar_second
+            )
+        stats.post_decision_observations = post_decision_observations
+        stats.realized_objective_payoff = (
+            stats.estimated_objective_payoff * post_decision_observations
+        )
+        stats.realized_source_token_throughput_payoff = (
+            source_token_payoff * post_decision_observations
+        )
 
     def state_dict(self) -> dict[str, Any]:
         """Return JSON-friendly action-space state for checkpoint/resume."""
@@ -1238,6 +1271,27 @@ class AdaptiveActionSpace:
             values[f"{prefix}/source_token_throughput_delta_vs_parent"] = (
                 stats.source_token_throughput_delta_vs_parent
             )
+            values[f"{prefix}/decision_target_pulls"] = (
+                stats.decision_target_pulls
+            )
+            values[f"{prefix}/decision_parent_pulls"] = (
+                stats.decision_parent_pulls
+            )
+            values[f"{prefix}/post_decision_target_pulls"] = (
+                stats.post_decision_target_pulls
+            )
+            values[f"{prefix}/post_decision_parent_pulls"] = (
+                stats.post_decision_parent_pulls
+            )
+            values[f"{prefix}/post_decision_observations"] = (
+                stats.post_decision_observations
+            )
+            values[f"{prefix}/realized_objective_payoff"] = (
+                stats.realized_objective_payoff
+            )
+            values[f"{prefix}/realized_source_token_throughput_payoff"] = (
+                stats.realized_source_token_throughput_payoff
+            )
         return values
 
     def _active_max_chunk_size(self) -> int:
@@ -1405,6 +1459,14 @@ class _ActionSpaceDecisionStats:
     target_source_tokens_per_dollar_second: float = 0.0
     parent_source_tokens_per_dollar_second: float = 0.0
     source_token_throughput_delta_vs_parent: float = 0.0
+    has_decision_baseline: bool = False
+    decision_target_pulls: float = 0.0
+    decision_parent_pulls: float = 0.0
+    post_decision_target_pulls: float = 0.0
+    post_decision_parent_pulls: float = 0.0
+    post_decision_observations: float = 0.0
+    realized_objective_payoff: float = 0.0
+    realized_source_token_throughput_payoff: float = 0.0
 
 
 def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:
@@ -1504,6 +1566,16 @@ def _action_space_decision_stats_state(
         "source_token_throughput_delta_vs_parent": (
             stats.source_token_throughput_delta_vs_parent
         ),
+        "has_decision_baseline": stats.has_decision_baseline,
+        "decision_target_pulls": stats.decision_target_pulls,
+        "decision_parent_pulls": stats.decision_parent_pulls,
+        "post_decision_target_pulls": stats.post_decision_target_pulls,
+        "post_decision_parent_pulls": stats.post_decision_parent_pulls,
+        "post_decision_observations": stats.post_decision_observations,
+        "realized_objective_payoff": stats.realized_objective_payoff,
+        "realized_source_token_throughput_payoff": (
+            stats.realized_source_token_throughput_payoff
+        ),
     }
 
 
@@ -1560,6 +1632,38 @@ def _action_space_decision_stats_from_state(
             ),
             source_token_throughput_delta_vs_parent=_state_float(
                 state.get("source_token_throughput_delta_vs_parent"),
+                0.0,
+            ),
+            has_decision_baseline=_state_bool(
+                state.get("has_decision_baseline"),
+                False,
+            ),
+            decision_target_pulls=max(
+                0.0,
+                _state_float(state.get("decision_target_pulls"), 0.0),
+            ),
+            decision_parent_pulls=max(
+                0.0,
+                _state_float(state.get("decision_parent_pulls"), 0.0),
+            ),
+            post_decision_target_pulls=max(
+                0.0,
+                _state_float(state.get("post_decision_target_pulls"), 0.0),
+            ),
+            post_decision_parent_pulls=max(
+                0.0,
+                _state_float(state.get("post_decision_parent_pulls"), 0.0),
+            ),
+            post_decision_observations=max(
+                0.0,
+                _state_float(state.get("post_decision_observations"), 0.0),
+            ),
+            realized_objective_payoff=_state_float(
+                state.get("realized_objective_payoff"),
+                0.0,
+            ),
+            realized_source_token_throughput_payoff=_state_float(
+                state.get("realized_source_token_throughput_payoff"),
                 0.0,
             ),
         )
