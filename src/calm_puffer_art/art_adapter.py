@@ -495,8 +495,10 @@ class AsyncArtBackend:
 
         configured = max(1, int(configured_actor_count))
         queue_pressure = max(0.0, float(trajectory_queue_pressure))
+        action_space_key = action_space_signature(self.action_space)
         if not self._should_continue_rollout_admission(
             trajectory_queue_pressure=queue_pressure,
+            action_space_key=action_space_key,
         ):
             self._stopped_admissions += 1
             return ArtRolloutAdmission(
@@ -514,7 +516,7 @@ class AsyncArtBackend:
         active_count = self.active_actor_count(
             configured=configured,
             trajectory_queue_pressure=queue_pressure,
-            action_space_key=action_space_signature(self.action_space),
+            action_space_key=action_space_key,
         )
         base_metadata: dict[str, Any] = {
             "actor_id": actor_id,
@@ -533,7 +535,7 @@ class AsyncArtBackend:
         requested_delay_s = self.rollout_admission_delay_s(
             trajectory_queue_pressure=queue_pressure,
             active_actor_count=active_count,
-            action_space_key=action_space_signature(self.action_space),
+            action_space_key=action_space_key,
         )
         elapsed_s = 0.0
         if requested_delay_s > 0.0:
@@ -605,6 +607,7 @@ class AsyncArtBackend:
             )
         if not self._should_continue_rollout_admission(
             trajectory_queue_pressure=trajectory_queue_pressure,
+            action_space_key=action_space_signature(self.action_space),
         ):
             self._cancel_actor_count_decision(admission.active_actor_count)
             self._stopped_admissions += 1
@@ -1481,6 +1484,7 @@ class AsyncArtBackend:
         self,
         *,
         trajectory_queue_pressure: float,
+        action_space_key: str | None = None,
     ) -> bool:
         if self.scheduler is None:
             return True
@@ -1502,6 +1506,7 @@ class AsyncArtBackend:
                     self._train_queue_pressure(),
                     max(0.0, min(1.0, trajectory_queue_pressure)),
                 ),
+                action_space_key=action_space_key,
             )
         )
 

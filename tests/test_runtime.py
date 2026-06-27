@@ -1648,6 +1648,8 @@ class RuntimeTests(unittest.TestCase):
     def test_actor_loop_stops_before_rollout_when_scheduler_stops(self):
         async def run():
             scheduler = StopImmediatelyScheduler()
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
             runtime = ControlPlane(
                 ControlPlaneConfig(
                     num_actors=1,
@@ -1681,7 +1683,7 @@ class RuntimeTests(unittest.TestCase):
                     scenarios=(Scenario(id="stop"),),
                     workflow=workflow,
                     action_codecs=(TokenActionCodec(),),
-                    action_space=None,
+                    action_space=action_space,
                     trajectory_queue=asyncio.Queue(maxsize=1),
                     telemetry=RuntimeTelemetry(cost_per_second_usd=1.0),
                     train_ring=TrajectoryRingBuffer(capacity=1, max_policy_lag=1),
@@ -1689,15 +1691,16 @@ class RuntimeTests(unittest.TestCase):
                 ),
                 timeout=1.0,
             )
-            return stop.is_set(), workflow_calls, scheduler.calls
+            return stop.is_set(), workflow_calls, scheduler.calls, expected_signature
 
-        stopped, workflow_calls, calls = asyncio.run(run())
+        stopped, workflow_calls, calls, expected_signature = asyncio.run(run())
 
         self.assertTrue(stopped)
         self.assertEqual(workflow_calls, 0)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["policy_step"], 0)
         self.assertEqual(calls[0]["pending_train_batches"], 0)
+        self.assertEqual(calls[0]["action_space_key"], expected_signature)
 
     def test_control_plane_stops_rollout_production_when_rollout_budget_is_exhausted(
         self,

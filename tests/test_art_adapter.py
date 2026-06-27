@@ -157,6 +157,15 @@ class FixedCadenceScheduler:
         return {}
 
 
+class StopAdmissionScheduler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def should_continue_training(self, **kwargs):
+        self.calls.append(kwargs)
+        return False
+
+
 class ArtAdapterTests(unittest.TestCase):
     def test_art_group_to_local_preserves_versions_messages_actions_and_raw_group(self):
         art_trajectory = FakeArtTrajectory(
@@ -920,6 +929,32 @@ class ArtAdapterTests(unittest.TestCase):
             metrics["scheduler/actor/actor_0/admission_dollar_seconds"],
             admitted.delay_dollar_seconds,
         )
+
+    def test_async_art_backend_passes_action_space_signature_to_admission_gate(self):
+        async def run():
+            scheduler = StopAdmissionScheduler()
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
+            async_backend = AsyncArtBackend(
+                backend=FakeArtBackend(),
+                scheduler=scheduler,
+                action_space=action_space,
+            )
+
+            admission = await async_backend.admit_rollout(
+                actor_id=0,
+                configured_actor_count=1,
+                trajectory_queue_pressure=0.0,
+                apply_delay=False,
+            )
+            await async_backend.close()
+            return admission, scheduler.calls, expected_signature
+
+        admission, calls, expected_signature = asyncio.run(run())
+
+        self.assertFalse(admission.admitted)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["action_space_key"], expected_signature)
 
     def test_async_art_backend_admission_stops_when_budget_exhausted(self):
         async def run():

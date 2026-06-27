@@ -1455,16 +1455,19 @@ class ControlPlane:
         try:
             for _ in range(self.config.max_train_steps):
                 current = await registry.snapshot()
+                current_action_space_key = action_space_signature(action_space)
                 if not self._should_continue_training(
                     scheduler=scheduler,
                     train_ring=train_ring,
                     policy_step=current.step,
+                    action_space_key=current_action_space_key,
                 ):
                     break
                 train_ring.max_policy_lag = self._max_policy_lag(
                     scheduler=scheduler,
                     train_ring=train_ring,
                     policy_step=current.step,
+                    action_space_key=current_action_space_key,
                 )
                 train_wait_started = time.perf_counter()
                 batch = await self._get_train_batch_or_stop(
@@ -1789,6 +1792,7 @@ class ControlPlane:
                 scheduler=scheduler,
                 train_ring=train_ring,
                 policy_step=snapshot.step,
+                action_space_key=current_action_space_key,
             ):
                 stop.set()
                 break
@@ -1817,10 +1821,12 @@ class ControlPlane:
             )
             if admission_delay_s > 0.0:
                 snapshot = await registry.snapshot()
+                current_action_space_key = action_space_signature(action_space)
                 if not self._should_continue_training(
                     scheduler=scheduler,
                     train_ring=train_ring,
                     policy_step=snapshot.step,
+                    action_space_key=current_action_space_key,
                 ):
                     if await actor_cap_lease.release_unspent(actor_admission):
                         self._cancel_actor_count_decision(
@@ -1849,6 +1855,7 @@ class ControlPlane:
                     scheduler=scheduler,
                     train_ring=train_ring,
                     policy_step=snapshot.step,
+                    action_space_key=current_action_space_key,
                 )
                 cancel_actor_count = await actor_cap_lease.release_unspent(
                     actor_admission
@@ -2418,6 +2425,7 @@ class ControlPlane:
         scheduler: AdaptiveScheduler | None,
         train_ring: TrajectoryRingBuffer,
         policy_step: int,
+        action_space_key: str | None = None,
     ) -> bool:
         if scheduler is None:
             return policy_step < self.config.max_train_steps
@@ -2426,6 +2434,7 @@ class ControlPlane:
             max_train_steps=self.config.max_train_steps,
             pending_train_batches=train_ring.pending_batches,
             train_queue_pressure=self._train_queue_pressure(train_ring),
+            action_space_key=action_space_key,
         )
 
     def _selected_rollout_exceeds_accounted_budget(

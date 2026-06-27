@@ -194,6 +194,7 @@ class AdaptiveScheduler(Protocol):
         max_train_steps: int,
         pending_train_batches: int,
         train_queue_pressure: float,
+        action_space_key: str | None = None,
     ) -> bool:
         ...
 
@@ -1745,6 +1746,7 @@ class ObjectiveScheduler:
         max_train_steps: int,
         pending_train_batches: int,
         train_queue_pressure: float,
+        action_space_key: str | None = None,
     ) -> bool:
         if policy_step >= max_train_steps:
             self._stop_recommended = True
@@ -1754,6 +1756,7 @@ class ObjectiveScheduler:
                 reason="max_steps",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         if self._accounted_budget_exhausted():
             self._stop_recommended = True
@@ -1763,6 +1766,7 @@ class ObjectiveScheduler:
                 reason="budget",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         if self.roi_patience is None:
             return self._record_continuation_decision(
@@ -1771,6 +1775,7 @@ class ObjectiveScheduler:
                 reason="no_patience",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         if policy_step < self.min_train_steps:
             return self._record_continuation_decision(
@@ -1779,6 +1784,7 @@ class ObjectiveScheduler:
                 reason="warmup",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         if self._has_unaccepted_known_arm():
             return self._record_continuation_decision(
@@ -1787,6 +1793,7 @@ class ObjectiveScheduler:
                 reason="exploration",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         if self._low_roi_train_steps >= self.roi_patience:
             self._stop_recommended = True
@@ -1796,6 +1803,7 @@ class ObjectiveScheduler:
                 reason="low_roi",
                 pending_train_batches=pending_train_batches,
                 train_queue_pressure=train_queue_pressure,
+                action_space_key=action_space_key,
             )
         return self._record_continuation_decision(
             policy_step=policy_step,
@@ -1803,6 +1811,7 @@ class ObjectiveScheduler:
             reason="roi_ok",
             pending_train_batches=pending_train_batches,
             train_queue_pressure=train_queue_pressure,
+            action_space_key=action_space_key,
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -4870,12 +4879,14 @@ class ObjectiveScheduler:
         reason: str,
         pending_train_batches: int,
         train_queue_pressure: float,
+        action_space_key: str | None = None,
     ) -> bool:
         key = _continuation_decision_key(
             continue_training=continue_training,
             reason=reason,
             pending_train_batches=pending_train_batches,
             train_queue_pressure=train_queue_pressure,
+            action_space_key=action_space_key,
         )
         self._last_continuation_decision_continue = continue_training
         self._last_continuation_decision_key = key
@@ -5844,14 +5855,19 @@ def _continuation_decision_key(
     reason: str,
     pending_train_batches: int,
     train_queue_pressure: float,
+    action_space_key: str | None = None,
 ) -> str:
     action = "continue" if continue_training else "stop"
-    return (
+    key = (
         f"action={action}"
         f"|reason={_continuation_reason_key(reason)}"
         f"|pending={_pending_batch_bucket(pending_train_batches)}"
         f"|pressure={_queue_pressure_bucket(train_queue_pressure)}"
     )
+    normalized_action_space_key = _normalize_key_component(action_space_key)
+    if normalized_action_space_key is not None:
+        key = f"{key}|action_space={normalized_action_space_key}"
+    return key
 
 
 def _continuation_reason_key(reason: str) -> str:
