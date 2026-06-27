@@ -42,6 +42,7 @@ from calm_puffer_art.runtime import (
     RuntimeTelemetry,
     ScenarioSampler,
     TrajectoryGrouper,
+    _ActorCapLease,
 )
 
 
@@ -277,6 +278,70 @@ async def adaptive_chunk_size_rollout(
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_actor_cap_lease_shares_one_control_decision_per_pool_sweep(self):
+        async def run():
+            lease = _ActorCapLease()
+            calls = 0
+
+            def active_count_factory() -> int:
+                nonlocal calls
+                calls += 1
+                return 2
+
+            first = [
+                await lease.admit(
+                    actor_id=actor_id,
+                    active_count_factory=active_count_factory,
+                )
+                for actor_id in range(4)
+            ]
+            await lease.spend(first[0])
+            second = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            return first, second, calls
+
+        first, second, calls = asyncio.run(run())
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([admission.active_count for admission in first], [2] * 4)
+        self.assertEqual(
+            [admission.admitted for admission in first],
+            [True, True, False, False],
+        )
+        self.assertTrue(second.admitted)
+        self.assertNotEqual(second.lease_id, first[0].lease_id)
+
+    def test_actor_cap_lease_cancels_only_when_no_admitted_work_was_spent(self):
+        async def run():
+            lease = _ActorCapLease()
+
+            def active_count_factory() -> int:
+                return 2
+
+            first = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            second = await lease.admit(
+                actor_id=1,
+                active_count_factory=active_count_factory,
+            )
+            first_cancelled = await lease.release_unspent(first)
+            second_cancelled = await lease.release_unspent(second)
+            replacement = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            return first, replacement, first_cancelled, second_cancelled
+
+        first, replacement, first_cancelled, second_cancelled = asyncio.run(run())
+
+        self.assertFalse(first_cancelled)
+        self.assertTrue(second_cancelled)
+        self.assertNotEqual(replacement.lease_id, first.lease_id)
+
     def test_control_plane_trains_continuously_and_improves_reward(self):
         async def run():
             channel = WeightBroadcastChannel()

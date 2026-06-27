@@ -148,6 +148,8 @@ async def run_ablation() -> dict[str, Any]:
     objective = await run_objective_ablation()
     static_score = float(static.metrics[NORTH_STAR])
     objective_score = float(objective.metrics[NORTH_STAR])
+    accounted_static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
+    accounted_objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
     return {
         "static": summary_metrics(static),
         "objective": summary_metrics(objective),
@@ -155,6 +157,14 @@ async def run_ablation() -> dict[str, Any]:
             "north_star_absolute": objective_score - static_score,
             "north_star_ratio": (
                 objective_score / static_score if static_score > 0.0 else None
+            ),
+            "accounted_north_star_absolute": (
+                accounted_objective_score - accounted_static_score
+            ),
+            "accounted_north_star_ratio": (
+                accounted_objective_score / accounted_static_score
+                if accounted_static_score > 0.0
+                else None
             ),
         },
     }

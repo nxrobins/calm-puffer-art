@@ -764,6 +764,75 @@ class ScenarioSampler:
             return scenario
 
 
+@dataclass(frozen=True)
+class _ActorCapAdmission:
+    actor_id: int
+    active_count: int
+    admitted: bool
+    lease_id: int
+
+
+class _ActorCapLease:
+    """Share one actor-count control decision across a local actor sweep."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._lease_id = 0
+        self._active_count: int | None = None
+        self._admitted_actor_ids: set[int] = set()
+        self._spent_actor_ids: set[int] = set()
+
+    async def admit(
+        self,
+        *,
+        actor_id: int,
+        active_count_factory: Callable[[], int],
+    ) -> _ActorCapAdmission:
+        async with self._lock:
+            if (
+                self._active_count is None
+                or actor_id in self._admitted_actor_ids
+                or actor_id in self._spent_actor_ids
+            ):
+                self._lease_id += 1
+                self._active_count = max(1, int(active_count_factory()))
+                self._admitted_actor_ids.clear()
+                self._spent_actor_ids.clear()
+            active_count = self._active_count
+            admitted = actor_id < active_count
+            if admitted:
+                self._admitted_actor_ids.add(actor_id)
+            return _ActorCapAdmission(
+                actor_id=actor_id,
+                active_count=active_count,
+                admitted=admitted,
+                lease_id=self._lease_id,
+            )
+
+    async def spend(self, admission: _ActorCapAdmission) -> None:
+        if not admission.admitted:
+            return
+        async with self._lock:
+            if admission.lease_id == self._lease_id:
+                self._spent_actor_ids.add(admission.actor_id)
+
+    async def release_unspent(self, admission: _ActorCapAdmission) -> bool:
+        """Return true when the shared actor-count decision should be cancelled."""
+
+        if not admission.admitted:
+            return False
+        async with self._lock:
+            if admission.lease_id != self._lease_id:
+                return False
+            if admission.actor_id in self._spent_actor_ids:
+                return False
+            self._admitted_actor_ids.discard(admission.actor_id)
+            if self._admitted_actor_ids or self._spent_actor_ids:
+                return False
+            self._active_count = None
+            return True
+
+
 class RuntimeTelemetry:
     def __init__(self, *, cost_per_second_usd: float) -> None:
         self.cost_per_second_usd = cost_per_second_usd
@@ -1179,6 +1248,7 @@ class ControlPlane:
         broadcaster = weight_channel or WeightBroadcastChannel()
         stop = asyncio.Event()
         ready_groups: deque[TrajectoryGroup] = deque()
+        actor_cap_lease = _ActorCapLease()
         actors = [
             asyncio.create_task(
                 self._actor_loop(
@@ -1194,6 +1264,7 @@ class ControlPlane:
                     telemetry=telemetry,
                     train_ring=train_ring,
                     scheduler=scheduler,
+                    actor_cap_lease=actor_cap_lease,
                 )
             )
             for actor_id in range(self.config.num_actors)
@@ -1516,7 +1587,9 @@ class ControlPlane:
         telemetry: RuntimeTelemetry,
         train_ring: TrajectoryRingBuffer,
         scheduler: AdaptiveScheduler | None,
+        actor_cap_lease: _ActorCapLease | None = None,
     ) -> None:
+        actor_cap_lease = actor_cap_lease or _ActorCapLease()
         while not stop.is_set():
             snapshot = await registry.snapshot()
             if not self._should_continue_training(
@@ -1526,14 +1599,17 @@ class ControlPlane:
             ):
                 stop.set()
                 break
-            active_actor_count = self._active_actor_count(
-                scheduler=scheduler,
-                trajectory_queue=trajectory_queue,
-                train_ring=train_ring,
-                policy_step=snapshot.step,
+            actor_admission = await actor_cap_lease.admit(
+                actor_id=actor_id,
+                active_count_factory=lambda: self._active_actor_count(
+                    scheduler=scheduler,
+                    trajectory_queue=trajectory_queue,
+                    train_ring=train_ring,
+                    policy_step=snapshot.step,
+                ),
             )
-            if actor_id >= active_actor_count:
-                self._cancel_actor_count_decision(scheduler, active_actor_count)
+            active_actor_count = actor_admission.active_count
+            if not actor_admission.admitted:
                 await asyncio.sleep(0.001)
                 continue
             admission_delay_s = await self._apply_rollout_admission_delay(
@@ -1550,10 +1626,11 @@ class ControlPlane:
                     train_ring=train_ring,
                     policy_step=snapshot.step,
                 ):
-                    self._cancel_actor_count_decision(
-                        scheduler,
-                        active_actor_count,
-                    )
+                    if await actor_cap_lease.release_unspent(actor_admission):
+                        self._cancel_actor_count_decision(
+                            scheduler,
+                            active_actor_count,
+                        )
                     stop.set()
                     break
             decision = await self._select_rollout(
@@ -1574,14 +1651,20 @@ class ControlPlane:
                     train_ring=train_ring,
                     policy_step=snapshot.step,
                 )
+                cancel_actor_count = await actor_cap_lease.release_unspent(
+                    actor_admission
+                )
                 self._cancel_rollout_decision(
                     scheduler,
                     decision,
-                    active_actor_count=active_actor_count,
+                    active_actor_count=(
+                        active_actor_count if cancel_actor_count else None
+                    ),
                     admission_delay_s=admission_delay_s,
                 )
                 stop.set()
                 break
+            await actor_cap_lease.spend(actor_admission)
             context = RolloutContext(
                 actor_id=actor_id,
                 policy_step=snapshot.step,
