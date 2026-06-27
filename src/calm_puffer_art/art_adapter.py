@@ -1768,6 +1768,7 @@ class AsyncArtBackend:
             pending_groups=len(pending),
             train_queue_pressure=self._train_queue_pressure(),
             reason=reason,
+            action_space_key=action_space_signature(self.action_space),
         )
         return metadata if isinstance(metadata, Mapping) else {}
 

@@ -2062,9 +2062,12 @@ class ArtAdapterTests(unittest.TestCase):
                 exploration_bonus=0.0,
                 control_exploration_bonus=0.0,
             )
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
             async_backend = AsyncArtBackend(
                 backend=backend,
                 scheduler=scheduler,
+                action_space=action_space,
                 config=AsyncArtBackendConfig(
                     train_batch_groups=3,
                     train_queue_capacity=2,
@@ -2088,13 +2091,14 @@ class ArtAdapterTests(unittest.TestCase):
             result = await future
             metrics = scheduler.metrics()
             await async_backend.close()
-            return flushed, result, metrics
+            return flushed, result, metrics, expected_signature
 
-        flushed, result, metrics = asyncio.run(run())
+        flushed, result, metrics, expected_signature = asyncio.run(run())
 
         prefix = (
             "scheduler/timing_response/"
-            "control_batch_flush_value_1_preference_manual_flush_pressure_low_pending_1"
+            "control_batch_flush_value_1_preference_manual_flush_pressure_low_"
+            f"pending_1_action_space_{expected_signature}"
         )
         self.assertFalse(result is None)
         self.assertEqual(flushed, 1)
@@ -2111,9 +2115,12 @@ class ArtAdapterTests(unittest.TestCase):
                 exploration_bonus=0.0,
                 control_exploration_bonus=0.0,
             )
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
             async_backend = AsyncArtBackend(
                 backend=backend,
                 scheduler=scheduler,
+                action_space=action_space,
                 config=AsyncArtBackendConfig(
                     train_batch_groups=3,
                     train_queue_capacity=3,
@@ -2158,14 +2165,14 @@ class ArtAdapterTests(unittest.TestCase):
             second_result = await second_future
             metrics = scheduler.metrics()
             await async_backend.close()
-            return first_result, second_result, metrics
+            return first_result, second_result, metrics, expected_signature
 
-        first_result, second_result, metrics = asyncio.run(run())
+        first_result, second_result, metrics, expected_signature = asyncio.run(run())
 
         prefix = (
             "scheduler/timing_response/"
             "control_batch_flush_value_1_preference_compatibility_flush_"
-            "pressure_low_pending_1"
+            f"pressure_low_pending_1_action_space_{expected_signature}"
         )
         self.assertFalse(first_result is None)
         self.assertFalse(second_result is None)

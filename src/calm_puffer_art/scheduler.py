@@ -978,6 +978,7 @@ class ObjectiveScheduler:
             preference_reason=preference_reason,
             train_queue_pressure=train_queue_pressure,
             pending_groups=pending_groups,
+            action_space_key=action_space_key,
         )
         return self._record_control_decision(self._cadence_controls, selected)
 
@@ -1052,6 +1053,7 @@ class ObjectiveScheduler:
             preference_reason=preference_reason,
             train_queue_pressure=train_queue_pressure,
             pending_groups=0,
+            action_space_key=action_space_key,
         )
         return self._record_control_decision(self._lag_controls, selected)
 
@@ -1146,6 +1148,7 @@ class ObjectiveScheduler:
         pending_groups: int,
         train_queue_pressure: float,
         reason: str = "manual_flush",
+        action_space_key: str | None = None,
     ) -> dict[str, str]:
         """Record a forced partial train-batch flush as a timing response."""
 
@@ -1158,6 +1161,7 @@ class ObjectiveScheduler:
             preference_reason=reason,
             train_queue_pressure=train_queue_pressure,
             pending_groups=pending_groups,
+            action_space_key=action_space_key,
         )
         return {"scheduler/batch_flush_response_key": key}
 
@@ -5615,6 +5619,7 @@ class ObjectiveScheduler:
         preference_reason: str,
         train_queue_pressure: float,
         pending_groups: int,
+        action_space_key: str | None = None,
     ) -> str:
         key = _timing_response_key(
             knob=knob,
@@ -5622,6 +5627,7 @@ class ObjectiveScheduler:
             preference_reason=preference_reason,
             train_queue_pressure=train_queue_pressure,
             pending_groups=pending_groups,
+            action_space_key=action_space_key,
         )
         self._timing_response_controls.setdefault(key, ControlStats()).decisions += 1
         if knob == "cadence":
@@ -5818,14 +5824,19 @@ def _timing_response_key(
     preference_reason: str,
     train_queue_pressure: float,
     pending_groups: int,
+    action_space_key: str | None = None,
 ) -> str:
-    return (
+    key = (
         f"control={_safe_metric_key(str(knob)) or 'unknown'}"
         f"|value={max(0, int(value))}"
         f"|preference={_safe_metric_key(str(preference_reason)) or 'unknown'}"
         f"|pressure={_queue_pressure_bucket(train_queue_pressure)}"
         f"|pending={_pending_batch_bucket(pending_groups)}"
     )
+    normalized_action_space_key = _normalize_key_component(action_space_key)
+    if normalized_action_space_key is not None:
+        key = f"{key}|action_space={normalized_action_space_key}"
+    return key
 
 
 def _timing_response_keys_from_metadata(

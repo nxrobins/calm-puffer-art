@@ -2630,11 +2630,13 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             pending_groups=4,
             train_queue_pressure=0.9,
             policy_step=0,
+            action_space_key="active chunk2",
         )
         lag = scheduler.max_policy_lag(
             configured=2,
             train_queue_pressure=0.9,
             policy_step=0,
+            action_space_key="active chunk2",
         )
         timing_metadata = scheduler.timing_response_metadata()
         cadence_key = timing_metadata["scheduler/cadence_response_key"]
@@ -2682,6 +2684,8 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(lag, 0)
         self.assertIn("preference=train_queue_pressure", cadence_key)
         self.assertIn("pressure=high", cadence_key)
+        self.assertIn("action_space=active_chunk2", cadence_key)
+        self.assertIn("action_space=active_chunk2", lag_key)
         self.assertEqual(metrics["scheduler/timing_response/keys"], 2.0)
         self.assertEqual(metrics["scheduler/timing_response/decisions"], 2.0)
         self.assertEqual(metrics["scheduler/timing_response/rollout_updates"], 2.0)
