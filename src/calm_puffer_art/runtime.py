@@ -462,14 +462,23 @@ class TrajectoryRingBuffer:
         self._batches: deque[VersionedTrajectoryBatch] = deque()
         self._condition = asyncio.Condition()
 
-    async def put(self, batch: VersionedTrajectoryBatch) -> None:
+    async def put(self, batch: VersionedTrajectoryBatch) -> float:
+        wait_started: float | None = None
+        wait_s = 0.0
         async with self._condition:
             while len(self._batches) >= self.capacity:
+                if wait_started is None:
+                    wait_started = time.perf_counter()
                 self.backpressure_events += 1
                 await self._condition.wait()
+            if wait_started is not None:
+                wait_s = max(0.0, time.perf_counter() - wait_started)
+                if isinstance(batch.metadata, dict):
+                    batch.metadata["queue/train_ring_admission_wait_s"] = wait_s
             self._batches.append(batch)
             self.total_produced += 1
             self._condition.notify_all()
+        return wait_s
 
     async def get(
         self,

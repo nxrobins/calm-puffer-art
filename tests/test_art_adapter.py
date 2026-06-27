@@ -102,6 +102,8 @@ class FakeArtBackend:
 
 class CostedFakeArtBackend(FakeArtBackend):
     async def train(self, model, trajectory_groups, **kwargs):
+        if self.block_event is not None:
+            await self.block_event.wait()
         self.step += 1
         self.calls.append((model, trajectory_groups, kwargs))
         return FakeArtTrainResult(
@@ -1736,6 +1738,67 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(
             scheduler.observed_dollar_seconds[0],
             17.0 + stats["art_backend/trainer_wait_dollar_seconds"],
+        )
+
+    def test_async_art_backend_charges_train_ring_admission_wait_to_scheduler(self):
+        async def run():
+            backend = CostedFakeArtBackend()
+            backend.block_event = asyncio.Event()
+            scheduler = FixedCadenceScheduler(target=1)
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                scheduler=scheduler,
+                config=AsyncArtBackendConfig(
+                    train_queue_capacity=1,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1000.0,
+                ),
+            )
+            groups = [
+                FakeArtGroup(
+                    trajectories=[
+                        FakeArtTrajectory(
+                            messages_and_choices=[],
+                            reward=1.0,
+                            initial_policy_version=0,
+                            metadata={"scenario_id": f"ring-wait-{index}"},
+                        )
+                    ],
+                    metadata={"scenario_id": f"ring-wait-{index}"},
+                )
+                for index in range(3)
+            ]
+
+            first_future = await async_backend.submit_train("art-model", [groups[0]])
+            await asyncio.sleep(0)
+            second_future = await async_backend.submit_train("art-model", [groups[1]])
+            third_submit = asyncio.create_task(
+                async_backend.submit_train("art-model", [groups[2]])
+            )
+            await asyncio.sleep(0.001)
+            blocked_before_release = not third_submit.done()
+            backend.block_event.set()
+            third_future = await third_submit
+            await asyncio.gather(first_future, second_future, third_future)
+            stats = async_backend.stats()
+            observed_dollar_seconds = tuple(scheduler.observed_dollar_seconds)
+            await async_backend.close()
+            return blocked_before_release, stats, observed_dollar_seconds
+
+        blocked_before_release, stats, observed_dollar_seconds = asyncio.run(run())
+
+        admission_wait = stats["art_backend/train_ring_admission_wait_dollar_seconds"]
+        self.assertTrue(blocked_before_release)
+        self.assertGreater(admission_wait, 0.0)
+        self.assertEqual(len(observed_dollar_seconds), 3)
+        self.assertAlmostEqual(
+            observed_dollar_seconds[-1],
+            17.0 + admission_wait,
+            delta=max(0.001, admission_wait * 0.05),
+        )
+        self.assertGreaterEqual(
+            stats["art_backend/accounted_dollar_seconds"],
+            51.0 + admission_wait,
         )
 
     def test_async_art_backend_submit_train_returns_future_before_training_finishes(self):

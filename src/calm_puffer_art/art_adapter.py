@@ -330,6 +330,8 @@ class AsyncArtBackend:
         self._stopped_admissions = 0
         self._trainer_wait_s = 0.0
         self._trainer_wait_dollar_seconds = 0.0
+        self._train_ring_admission_wait_s = 0.0
+        self._train_ring_admission_wait_dollar_seconds = 0.0
         self._trainer_dollar_seconds = 0.0
         self._actor_admission_delay_s = 0.0
         self._actor_admission_dollar_seconds = 0.0
@@ -417,6 +419,10 @@ class AsyncArtBackend:
             ),
             "latest_published_policy_score": self._latest_published_policy_score,
             "last_published_policy_score": self._last_published_policy_score,
+            "train_ring_admission_wait_s": self._train_ring_admission_wait_s,
+            "train_ring_admission_wait_dollar_seconds": (
+                self._train_ring_admission_wait_dollar_seconds
+            ),
             "publication_decision_stats": _publication_decision_stats_state(
                 self._publication_decision_stats
             ),
@@ -453,6 +459,20 @@ class AsyncArtBackend:
         self._last_published_policy_score = _state_float(
             state.get("last_published_policy_score"),
             self._last_published_policy_score,
+        )
+        self._train_ring_admission_wait_s = max(
+            0.0,
+            _state_float(
+                state.get("train_ring_admission_wait_s"),
+                self._train_ring_admission_wait_s,
+            ),
+        )
+        self._train_ring_admission_wait_dollar_seconds = max(
+            0.0,
+            _state_float(
+                state.get("train_ring_admission_wait_dollar_seconds"),
+                self._train_ring_admission_wait_dollar_seconds,
+            ),
         )
         self._publication_decision_stats = _publication_decision_stats_from_state(
             state.get("publication_decision_stats")
@@ -1179,6 +1199,12 @@ class AsyncArtBackend:
         stats["art_backend/trainer_wait_dollar_seconds"] = (
             self._trainer_wait_dollar_seconds
         )
+        stats["art_backend/train_ring_admission_wait_s"] = (
+            self._train_ring_admission_wait_s
+        )
+        stats["art_backend/train_ring_admission_wait_dollar_seconds"] = (
+            self._train_ring_admission_wait_dollar_seconds
+        )
         stats["art_backend/trainer_dollar_seconds"] = self._trainer_dollar_seconds
         stats["art_backend/actor_admission_delay_s"] = (
             self._actor_admission_delay_s
@@ -1328,6 +1354,9 @@ class AsyncArtBackend:
             futures = self._batch_futures(batch)
             if not futures:
                 continue
+            train_ring_admission_wait_dollar_seconds = (
+                self._batch_train_ring_admission_wait_dollar_seconds(batch)
+            )
             self._record_train_batch_selection(batch, policy_step=self._current_step)
             self._tag_batch_control_metadata(
                 batch.groups,
@@ -1367,6 +1396,7 @@ class AsyncArtBackend:
                         duration_s=duration_s,
                         dollar_seconds=(
                             train_dollar_seconds + train_wait_dollar_seconds
+                            + train_ring_admission_wait_dollar_seconds
                         ),
                         policy_step=policy_step,
                     )
@@ -1380,6 +1410,7 @@ class AsyncArtBackend:
                     batch.groups,
                     dollar_seconds=(
                         train_dollar_seconds + train_wait_dollar_seconds
+                        + train_ring_admission_wait_dollar_seconds
                     ),
                     reason="async_train_result",
                 )
@@ -1518,7 +1549,7 @@ class AsyncArtBackend:
                 "scheduler/costs/rollout_dollar_seconds",
                 "scheduler/costs/queue_wait_dollar_seconds",
                 "scheduler/costs/rollout_admission_dollar_seconds",
-                "scheduler/costs/train_dollar_seconds",
+            "scheduler/costs/train_dollar_seconds",
             )
         )
         if scheduler_accounted > 0.0:
@@ -1527,6 +1558,7 @@ class AsyncArtBackend:
             self._sample_dollar_seconds
             + self._trainer_dollar_seconds
             + self._trainer_wait_dollar_seconds
+            + self._train_ring_admission_wait_dollar_seconds
         )
 
     def _score_groups(self, groups: Sequence[TrajectoryGroup]) -> float:
@@ -1662,7 +1694,25 @@ class AsyncArtBackend:
         )
         self._submitted_batches += 1
         self._submitted_train_groups += len(groups)
-        await self.ring.put(batch)
+        train_ring_admission_wait_s = await self.ring.put(batch)
+        train_ring_admission_wait_dollar_seconds = (
+            train_ring_admission_wait_s * self.config.cost_per_second_usd
+        )
+        if train_ring_admission_wait_dollar_seconds > 0.0:
+            self._train_ring_admission_wait_s += train_ring_admission_wait_s
+            self._train_ring_admission_wait_dollar_seconds += (
+                train_ring_admission_wait_dollar_seconds
+            )
+
+    def _batch_train_ring_admission_wait_dollar_seconds(
+        self,
+        batch: VersionedTrajectoryBatch,
+    ) -> float:
+        wait_s = _state_float(
+            batch.metadata.get("queue/train_ring_admission_wait_s"),
+            0.0,
+        )
+        return max(0.0, wait_s) * self.config.cost_per_second_usd
 
     async def _flush_pending_locked(self, *, reason: str | None = None) -> int:
         self._discard_stale_pending_locked()
