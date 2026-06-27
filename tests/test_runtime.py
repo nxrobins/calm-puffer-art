@@ -1,7 +1,7 @@
 import asyncio
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import fmean
 from typing import Sequence
 
@@ -301,6 +301,13 @@ class RuntimeTests(unittest.TestCase):
             rollout_admission_delay_ms=25,
             action_space_key="runtime-space",
         )
+        decision = replace(
+            decision,
+            metadata={
+                **decision.metadata,
+                "coverage_control_key": "forced|arm=task_token",
+            },
+        )
         trajectory = Trajectory(
             scenario_id="task",
             policy_step=0,
@@ -331,6 +338,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             trajectory.metadata["scheduler/action_space_key"],
             "runtime_space",
+        )
+        self.assertEqual(
+            trajectory.metadata["scheduler/coverage_control_key"],
+            "forced|arm=task_token",
         )
 
     def test_control_plane_passes_action_space_signature_to_scheduler(self):

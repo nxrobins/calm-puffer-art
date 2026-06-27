@@ -579,6 +579,7 @@ class ObjectiveScheduler:
         self._joint_action_controls: dict[str, ControlStats] = {}
         self._train_selection_controls: dict[str, ControlStats] = {}
         self._continuation_controls: dict[str, ControlStats] = {}
+        self._coverage_controls: dict[str, ControlStats] = {}
         self._pending_continuation_decisions: dict[int, str] = {}
         self._recorded_continuation_stop_decisions: set[tuple[int, str]] = set()
         self._actors: dict[int, ActorStats] = {}
@@ -661,6 +662,9 @@ class ObjectiveScheduler:
             ) = coverage_selection
             coverage_forced = True
             self._coverage_forced_decisions += 1
+        coverage_control_key = (
+            _coverage_control_key(arm_id) if coverage_forced else None
+        )
         coverage_cost_limit = self.max_rollout_coverage_cost_fraction or 0.0
         selected_stats = self._arms[arm_id]
         estimated_rollout_dollar_seconds = (
@@ -760,6 +764,15 @@ class ObjectiveScheduler:
                     "action_space_key": action_space_key,
                 },
             )
+        if coverage_control_key is not None:
+            decision = replace(
+                decision,
+                metadata={
+                    **decision.metadata,
+                    "coverage_control_key": coverage_control_key,
+                },
+            )
+            self._record_coverage_decision(coverage_control_key)
         if joint_action_key is not None:
             decision = replace(
                 decision,
@@ -799,6 +812,12 @@ class ObjectiveScheduler:
             self._cancel_control_decision(
                 self._joint_action_controls,
                 joint_action_key,
+            )
+        coverage_control_key = _coverage_control_key_from_metadata(metadata)
+        if coverage_control_key is not None:
+            self._cancel_control_decision(
+                self._coverage_controls,
+                coverage_control_key,
             )
 
         self._cancel_control_decision(
@@ -1205,6 +1224,10 @@ class ObjectiveScheduler:
             marginal_objective,
         )
         self._credit_rollout_objective_to_joint_action(
+            trajectory,
+            marginal_objective,
+        )
+        self._credit_rollout_objective_to_coverage_control(
             trajectory,
             marginal_objective,
         )
@@ -1919,6 +1942,10 @@ class ObjectiveScheduler:
                 key: _dataclass_state(stats)
                 for key, stats in self._continuation_controls.items()
             },
+            "coverage_controls": {
+                key: _dataclass_state(stats)
+                for key, stats in self._coverage_controls.items()
+            },
             "actors": {
                 str(actor_id): _actor_stats_state(stats)
                 for actor_id, stats in self._actors.items()
@@ -2183,6 +2210,9 @@ class ObjectiveScheduler:
         )
         self._continuation_controls = _string_control_family_from_state(
             state.get("continuation_controls")
+        )
+        self._coverage_controls = _string_control_family_from_state(
+            state.get("coverage_controls")
         )
         self._pending_continuation_decisions = {}
         self._recorded_continuation_stop_decisions = set()
@@ -3230,6 +3260,110 @@ class ObjectiveScheduler:
                 stats.total_stale_penalty_objective
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        coverage_feedback_updates = {
+            key: _control_feedback_updates(stats)
+            for key, stats in self._coverage_controls.items()
+        }
+        coverage_decisions = sum(
+            stats.decisions for stats in self._coverage_controls.values()
+        )
+        coverage_rollout_updates = sum(
+            stats.rollout_updates for stats in self._coverage_controls.values()
+        )
+        coverage_train_updates = sum(
+            stats.train_updates for stats in self._coverage_controls.values()
+        )
+        coverage_stale_updates = sum(
+            stats.stale_updates for stats in self._coverage_controls.values()
+        )
+        coverage_total_feedback_updates = sum(coverage_feedback_updates.values())
+        coverage_total_objective = sum(
+            stats.total_objective for stats in self._coverage_controls.values()
+        )
+        coverage_total_stale_penalty_objective = sum(
+            stats.total_stale_penalty_objective
+            for stats in self._coverage_controls.values()
+        )
+        metrics["scheduler/coverage_control/keys"] = float(
+            len(self._coverage_controls)
+        )
+        metrics["scheduler/coverage_control/decisions"] = float(
+            coverage_decisions
+        )
+        metrics["scheduler/coverage_control/rollout_updates"] = float(
+            coverage_rollout_updates
+        )
+        metrics["scheduler/coverage_control/train_updates"] = float(
+            coverage_train_updates
+        )
+        metrics["scheduler/coverage_control/stale_updates"] = float(
+            coverage_stale_updates
+        )
+        metrics["scheduler/coverage_control/feedback_updates"] = float(
+            coverage_total_feedback_updates
+        )
+        metrics["scheduler/coverage_control/feedback_keys"] = float(
+            sum(1 for updates in coverage_feedback_updates.values() if updates > 0)
+        )
+        metrics["scheduler/coverage_control/positive_objective_keys"] = float(
+            sum(
+                1
+                for stats in self._coverage_controls.values()
+                if stats.total_objective > 0.0
+            )
+        )
+        metrics["scheduler/coverage_control/total_objective"] = (
+            coverage_total_objective
+        )
+        metrics["scheduler/coverage_control/mean_objective_per_decision"] = (
+            coverage_total_objective / coverage_decisions
+            if coverage_decisions
+            else 0.0
+        )
+        metrics[
+            "scheduler/coverage_control/mean_objective_per_feedback_update"
+        ] = (
+            coverage_total_objective / coverage_total_feedback_updates
+            if coverage_total_feedback_updates
+            else 0.0
+        )
+        metrics["scheduler/coverage_control/total_stale_penalty_objective"] = (
+            coverage_total_stale_penalty_objective
+        )
+        for key, stats in sorted(self._coverage_controls.items()):
+            prefix = f"scheduler/coverage_control/{_safe_metric_key(key)}"
+            feedback_updates = _control_feedback_updates(stats)
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._coverage_controls,
+                key,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._coverage_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
         continuation_feedback_updates = {
             key: _control_feedback_updates(stats)
             for key, stats in self._continuation_controls.items()
@@ -4180,6 +4314,11 @@ class ObjectiveScheduler:
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
+        self._credit_train_objective_to_coverage_controls(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
 
     def _credit_train_objective_to_control_family(
         self,
@@ -4286,6 +4425,43 @@ class ObjectiveScheduler:
 
         for key, credit in key_credit.items():
             stats = self._train_selection_controls.setdefault(key, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
+    def _credit_train_objective_to_coverage_controls(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        key_credit: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                key = _coverage_control_key_from_metadata(trajectory.metadata)
+                if key is None:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                key_credit[key] = key_credit.get(key, 0.0) + credit
+
+        for key, credit in key_credit.items():
+            stats = self._coverage_controls.setdefault(key, ControlStats())
             stats.train_updates += 1
             stats.total_objective += credit
             stats.objective_ema = self._ema(
@@ -4455,6 +4631,12 @@ class ObjectiveScheduler:
             stale_feedback=stale_feedback,
             stale_experience=stale_experience,
         )
+        self._credit_objective_to_coverage_controls(
+            groups,
+            objective,
+            stale_feedback=stale_feedback,
+            stale_experience=stale_experience,
+        )
 
     def _credit_objective_to_joint_actions(
         self,
@@ -4480,6 +4662,49 @@ class ObjectiveScheduler:
         total_weight = sum(key_weights.values())
         for key, weight in key_weights.items():
             stats = self._joint_action_controls.setdefault(key, ControlStats())
+            credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
+            stale_credit = (
+                stale_experience * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
+            if stale_feedback:
+                stats.stale_updates += 1
+                stats.stale_experience += stale_credit
+                stats.total_stale_penalty_objective += credit
+            else:
+                stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
+    def _credit_objective_to_coverage_controls(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        objective: float,
+        *,
+        stale_feedback: bool,
+        stale_experience: float,
+    ) -> None:
+        key_weights: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                key = _coverage_control_key_from_metadata(trajectory.metadata)
+                if key is None:
+                    continue
+                quality = action_quality(trajectory)
+                if quality <= 0.0:
+                    weight = 0.0
+                else:
+                    weight = max(0.0, trajectory.reward * quality) or quality
+                key_weights[key] = key_weights.get(key, 0.0) + weight
+
+        total_weight = sum(key_weights.values())
+        for key, weight in key_weights.items():
+            stats = self._coverage_controls.setdefault(key, ControlStats())
             credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
             stale_credit = (
                 stale_experience * weight / total_weight
@@ -4538,6 +4763,25 @@ class ObjectiveScheduler:
         if key is None:
             return
         stats = self._joint_action_controls.setdefault(key, ControlStats())
+        if stats.decisions <= stats.rollout_updates:
+            stats.decisions += 1
+        stats.rollout_updates += 1
+        stats.total_objective += objective
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _control_feedback_updates(stats),
+        )
+
+    def _credit_rollout_objective_to_coverage_control(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        key = _coverage_control_key_from_metadata(trajectory.metadata)
+        if key is None:
+            return
+        stats = self._coverage_controls.setdefault(key, ControlStats())
         if stats.decisions <= stats.rollout_updates:
             stats.decisions += 1
         stats.rollout_updates += 1
@@ -4890,6 +5134,9 @@ class ObjectiveScheduler:
     def _record_joint_action_decision(self, key: str) -> None:
         self._joint_action_controls.setdefault(key, ControlStats()).decisions += 1
 
+    def _record_coverage_decision(self, key: str) -> None:
+        self._coverage_controls.setdefault(key, ControlStats()).decisions += 1
+
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
 
@@ -5033,6 +5280,38 @@ def _train_selection_key_from_metadata(metadata: Mapping[str, Any]) -> str | Non
         return None
     key = str(raw_key)
     return key if key else None
+
+
+def _coverage_control_key(arm_id: str) -> str:
+    normalized_arm = _normalize_key_component(arm_id) or "unassigned"
+    return f"forced|arm={normalized_arm}"
+
+
+def _coverage_control_key_from_metadata(
+    metadata: Mapping[str, Any],
+) -> str | None:
+    raw_key = metadata.get("scheduler/coverage_control_key")
+    if raw_key is None:
+        raw_key = metadata.get("coverage_control_key")
+    if raw_key is not None and not isinstance(raw_key, bool):
+        key = str(raw_key)
+        if key:
+            return key
+
+    coverage_forced = any(
+        _state_bool(metadata.get(key), False)
+        for key in (
+            "coverage_forced",
+            "scheduler/coverage_forced",
+            "scheduler/decision/coverage_forced",
+        )
+    )
+    if not coverage_forced:
+        return None
+    arm_id = metadata.get("scheduler/arm_id")
+    if arm_id is None or isinstance(arm_id, bool):
+        return None
+    return _coverage_control_key(str(arm_id))
 
 
 def _continuation_decision_key(

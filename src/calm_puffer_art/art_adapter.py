@@ -1813,6 +1813,15 @@ def art_rollout_metadata(
     selected_joint_key = decision.metadata.get("joint_action_key")
     if selected_joint_key is not None and not isinstance(selected_joint_key, bool):
         metadata.setdefault("scheduler/joint_action_key", str(selected_joint_key))
+    coverage_control_key = decision.metadata.get("coverage_control_key")
+    if (
+        coverage_control_key is not None
+        and not isinstance(coverage_control_key, bool)
+    ):
+        metadata.setdefault(
+            "scheduler/coverage_control_key",
+            str(coverage_control_key),
+        )
     action_space_key = decision.metadata.get("action_space_key")
     if action_space_key is not None and not isinstance(action_space_key, bool):
         metadata.setdefault("scheduler/action_space_key", str(action_space_key))

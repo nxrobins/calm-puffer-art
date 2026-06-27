@@ -1826,6 +1826,15 @@ class ControlPlane:
                     ),
                 ),
             )
+        coverage_control_key = decision.metadata.get("coverage_control_key")
+        if (
+            coverage_control_key is not None
+            and not isinstance(coverage_control_key, bool)
+        ):
+            trajectory.metadata.setdefault(
+                "scheduler/coverage_control_key",
+                str(coverage_control_key),
+            )
         admission_dollar_seconds = (
             admission_delay_s * self.config.cost_per_second_usd
         )

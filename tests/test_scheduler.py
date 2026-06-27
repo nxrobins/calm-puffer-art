@@ -3848,6 +3848,7 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "task|chunk(chunk_size=2)": 0.1,
         }
         decisions = []
+        forced_trajectory = None
         for _ in range(6):
             decision = scheduler.select_rollout(
                 scenarios=scenarios,
@@ -3860,15 +3861,25 @@ class ObjectiveSchedulerTests(unittest.TestCase):
                 configured_max_policy_lag=2,
             )
             decisions.append(decision)
+            reward = rewards[decision.arm_id]
+            if decision.metadata.get("coverage_forced"):
+                reward = 0.6
+            trajectory = Trajectory(
+                scenario_id=decision.scenario.id,
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=reward,
+                metrics={"cost/dollar_seconds": 1.0},
+                metadata={
+                    "scheduler/arm_id": decision.arm_id,
+                    **decision.metadata,
+                },
+            )
+            if decision.metadata.get("coverage_forced"):
+                forced_trajectory = trajectory
             scheduler.observe_rollout(
-                Trajectory(
-                    scenario_id=decision.scenario.id,
-                    policy_step=0,
-                    messages=[],
-                    actions=[],
-                    reward=rewards[decision.arm_id],
-                    metadata={"scheduler/arm_id": decision.arm_id},
-                ),
+                trajectory,
                 accepted=True,
                 dollar_seconds=1.0,
             )
@@ -3887,6 +3898,8 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             ],
         )
         self.assertTrue(decisions[-1].metadata["coverage_forced"])
+        self.assertIsNotNone(forced_trajectory)
+        self.assertIn("coverage_control_key", decisions[-1].metadata)
         self.assertEqual(metrics["scheduler/coverage/min_fraction"], 0.25)
         self.assertEqual(metrics["scheduler/coverage/forced_decisions"], 1.0)
         self.assertEqual(
@@ -3899,6 +3912,63 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             ],
             metrics["scheduler/arm/task_token/decision_share"],
         )
+        coverage_key = decisions[-1].metadata["coverage_control_key"]
+        coverage_prefix = f"scheduler/coverage_control/{_test_metric_key(coverage_key)}"
+        self.assertEqual(metrics["scheduler/coverage_control/keys"], 1.0)
+        self.assertEqual(metrics["scheduler/coverage_control/decisions"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/coverage_control/rollout_updates"],
+            1.0,
+        )
+        self.assertEqual(metrics[f"{coverage_prefix}/decisions"], 1.0)
+        self.assertGreater(metrics[f"{coverage_prefix}/total_objective"], 0.0)
+
+        group = TrajectoryGroup(
+            scenario_id=forced_trajectory.scenario_id,
+            trajectories=(forced_trajectory,),
+        )
+        scheduler.observe_stale_batch(
+            groups=(group,),
+            policy_step=1,
+            reason="coverage-test",
+        )
+        scheduler.observe_train(
+            groups=(group,),
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(metrics["scheduler/coverage_control/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/coverage_control/stale_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/coverage_control/feedback_updates"], 3.0)
+        self.assertEqual(metrics["scheduler/coverage_control/feedback_keys"], 1.0)
+        self.assertGreater(
+            metrics["scheduler/coverage_control/positive_objective_keys"],
+            0.0,
+        )
+        self.assertLess(
+            metrics["scheduler/coverage_control/total_stale_penalty_objective"],
+            0.0,
+        )
+        for key in (
+            "scheduler/coverage_control/keys",
+            "scheduler/coverage_control/decisions",
+            "scheduler/coverage_control/rollout_updates",
+            "scheduler/coverage_control/train_updates",
+            "scheduler/coverage_control/stale_updates",
+            "scheduler/coverage_control/feedback_updates",
+            "scheduler/coverage_control/total_objective",
+            f"{coverage_prefix}/feedback_updates",
+            f"{coverage_prefix}/total_objective",
+            f"{coverage_prefix}/total_stale_penalty_objective",
+        ):
+            self.assertAlmostEqual(restored_metrics[key], metrics[key])
 
     def test_rollout_coverage_floor_respects_cost_cap(self):
         scenarios = [Scenario(id="task")]

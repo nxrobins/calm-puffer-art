@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from calm_puffer_art import (
     ACTION_SPACE_STATE_KEY,
@@ -720,10 +720,21 @@ class ArtAdapterTests(unittest.TestCase):
             rollout_admission_delay_ms=25,
             action_space_key="bridge-space",
         )
+        decision = replace(
+            decision,
+            metadata={
+                **decision.metadata,
+                "coverage_control_key": "forced|arm=external_select_token",
+            },
+        )
 
         metadata = art_rollout_metadata(decision)
 
         self.assertEqual(metadata["scheduler/action_space_key"], "bridge_space")
+        self.assertEqual(
+            metadata["scheduler/coverage_control_key"],
+            "forced|arm=external_select_token",
+        )
         self.assertEqual(
             metadata["scheduler/joint_action_key"],
             scheduling_action_key(
