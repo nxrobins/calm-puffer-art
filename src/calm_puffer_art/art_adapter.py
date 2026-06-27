@@ -1703,13 +1703,14 @@ class AsyncArtBackend:
             allow_demotions=allow_demotions,
         )
 
-    @staticmethod
     def _tag_batch_control_metadata(
+        self,
         groups: Sequence[TrajectoryGroup],
         *,
         target_train_batch_groups: int | None = None,
         max_policy_lag: int | None = None,
     ) -> None:
+        timing_metadata = self._timing_response_metadata()
         for group in groups:
             for trajectory in group.trajectories:
                 if target_train_batch_groups is not None:
@@ -1720,6 +1721,18 @@ class AsyncArtBackend:
                     trajectory.metadata["scheduler/active_max_policy_lag"] = (
                         max_policy_lag
                     )
+                for key, value in timing_metadata.items():
+                    if value is not None and not isinstance(value, bool):
+                        trajectory.metadata.setdefault(key, str(value))
+
+    def _timing_response_metadata(self) -> Mapping[str, Any]:
+        if self.scheduler is None:
+            return {}
+        accessor = getattr(self.scheduler, "timing_response_metadata", None)
+        if accessor is None:
+            return {}
+        metadata = accessor()
+        return metadata if isinstance(metadata, Mapping) else {}
 
 
 def train_result_from_art(
@@ -1822,6 +1835,13 @@ def art_rollout_metadata(
             "scheduler/coverage_control_key",
             str(coverage_control_key),
         )
+    for source_key, target_key in (
+        ("cadence_response_key", "scheduler/cadence_response_key"),
+        ("policy_lag_response_key", "scheduler/policy_lag_response_key"),
+    ):
+        value = decision.metadata.get(source_key)
+        if value is not None and not isinstance(value, bool):
+            metadata.setdefault(target_key, str(value))
     action_space_key = decision.metadata.get("action_space_key")
     if action_space_key is not None and not isinstance(action_space_key, bool):
         metadata.setdefault("scheduler/action_space_key", str(action_space_key))

@@ -2498,6 +2498,100 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             0,
         )
 
+    def test_timing_response_decisions_receive_rollout_train_and_stale_credit(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            min_policy_lag=0,
+            max_policy_lag=3,
+            exploration_bonus=0.0,
+            rollout_cadence_lag_control_weight=1.0,
+        )
+
+        target = scheduler.target_train_batch_groups(
+            configured=2,
+            pending_groups=4,
+            train_queue_pressure=0.9,
+            policy_step=0,
+        )
+        lag = scheduler.max_policy_lag(
+            configured=2,
+            train_queue_pressure=0.9,
+            policy_step=0,
+        )
+        timing_metadata = scheduler.timing_response_metadata()
+        cadence_key = timing_metadata["scheduler/cadence_response_key"]
+        lag_key = timing_metadata["scheduler/policy_lag_response_key"]
+        cadence_prefix = f"scheduler/timing_response/{_test_metric_key(cadence_key)}"
+        lag_prefix = f"scheduler/timing_response/{_test_metric_key(lag_key)}"
+        trajectory = Trajectory(
+            scenario_id="timing",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metrics={"cost/dollar_seconds": 1.0},
+            metadata={
+                "scheduler/arm_id": "timing|token",
+                "scheduler/active_target_train_batch_groups": target,
+                "scheduler/active_max_policy_lag": lag,
+                **timing_metadata,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="timing",
+            trajectories=(trajectory,),
+        )
+
+        scheduler.observe_rollout(trajectory, accepted=True, dollar_seconds=1.0)
+        scheduler.observe_stale_batch(
+            groups=(group,),
+            policy_step=1,
+            reason="timing-response-test",
+        )
+        scheduler.observe_train(
+            groups=(group,),
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=1,
+        )
+        metrics = scheduler.metrics()
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(target, 4)
+        self.assertEqual(lag, 0)
+        self.assertIn("preference=train_queue_pressure", cadence_key)
+        self.assertIn("pressure=high", cadence_key)
+        self.assertEqual(metrics["scheduler/timing_response/keys"], 2.0)
+        self.assertEqual(metrics["scheduler/timing_response/decisions"], 2.0)
+        self.assertEqual(metrics["scheduler/timing_response/rollout_updates"], 2.0)
+        self.assertEqual(metrics["scheduler/timing_response/train_updates"], 2.0)
+        self.assertEqual(metrics["scheduler/timing_response/stale_updates"], 2.0)
+        self.assertEqual(metrics["scheduler/timing_response/feedback_updates"], 6.0)
+        self.assertEqual(metrics[f"{cadence_prefix}/feedback_updates"], 3.0)
+        self.assertEqual(metrics[f"{lag_prefix}/feedback_updates"], 3.0)
+        self.assertGreater(metrics[f"{cadence_prefix}/total_objective"], 0.0)
+        self.assertGreater(metrics[f"{lag_prefix}/total_objective"], 0.0)
+        self.assertLess(
+            metrics["scheduler/timing_response/total_stale_penalty_objective"],
+            0.0,
+        )
+        for key in (
+            "scheduler/timing_response/keys",
+            "scheduler/timing_response/decisions",
+            "scheduler/timing_response/rollout_updates",
+            "scheduler/timing_response/train_updates",
+            "scheduler/timing_response/stale_updates",
+            "scheduler/timing_response/feedback_updates",
+            "scheduler/timing_response/total_objective",
+            f"{cadence_prefix}/total_objective",
+            f"{lag_prefix}/total_objective",
+        ):
+            self.assertAlmostEqual(restored_metrics[key], metrics[key])
+
     def test_train_objective_credits_and_reuses_cadence_and_lag_controls(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,
@@ -5032,6 +5126,12 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             "scheduler/coverage/last_deficit",
             "scheduler/coverage/last_cost_share",
             "scheduler/coverage/last_cost_limited",
+            "scheduler/timing_response/keys",
+            "scheduler/timing_response/decisions",
+            "scheduler/timing_response/feedback_updates",
+            "scheduler/timing_response/total_objective",
+            "scheduler/timing_response/last_cadence_has_key",
+            "scheduler/timing_response/last_policy_lag_has_key",
             "scheduler/max_control_candidate_values",
         ):
             self.assertAlmostEqual(restored_metrics[key], before_metrics[key])

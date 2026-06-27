@@ -343,6 +343,8 @@ class RuntimeTests(unittest.TestCase):
             trajectory.metadata["scheduler/coverage_control_key"],
             "forced|arm=task_token",
         )
+        self.assertIn("scheduler/cadence_response_key", trajectory.metadata)
+        self.assertIn("scheduler/policy_lag_response_key", trajectory.metadata)
 
     def test_control_plane_passes_action_space_signature_to_scheduler(self):
         async def run():

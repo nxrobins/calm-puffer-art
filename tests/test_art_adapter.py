@@ -731,6 +731,8 @@ class ArtAdapterTests(unittest.TestCase):
         metadata = art_rollout_metadata(decision)
 
         self.assertEqual(metadata["scheduler/action_space_key"], "bridge_space")
+        self.assertIn("scheduler/cadence_response_key", metadata)
+        self.assertIn("scheduler/policy_lag_response_key", metadata)
         self.assertEqual(
             metadata["scheduler/coverage_control_key"],
             "forced|arm=external_select_token",

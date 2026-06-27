@@ -556,6 +556,10 @@ class ObjectiveScheduler:
         self._last_continuation_decision_reason = ""
         self._last_continuation_pending_train_batches = 0
         self._last_continuation_train_queue_pressure = 0.0
+        self._last_cadence_response_key = ""
+        self._last_cadence_response_reason = ""
+        self._last_policy_lag_response_key = ""
+        self._last_policy_lag_response_reason = ""
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -580,6 +584,7 @@ class ObjectiveScheduler:
         self._train_selection_controls: dict[str, ControlStats] = {}
         self._continuation_controls: dict[str, ControlStats] = {}
         self._coverage_controls: dict[str, ControlStats] = {}
+        self._timing_response_controls: dict[str, ControlStats] = {}
         self._pending_continuation_decisions: dict[int, str] = {}
         self._recorded_continuation_stop_decisions: set[tuple[int, str]] = set()
         self._actors: dict[int, ActorStats] = {}
@@ -773,6 +778,18 @@ class ObjectiveScheduler:
                 },
             )
             self._record_coverage_decision(coverage_control_key)
+        timing_metadata = self.timing_response_metadata()
+        if timing_metadata:
+            decision = replace(
+                decision,
+                metadata={
+                    **decision.metadata,
+                    **{
+                        key.removeprefix("scheduler/"): value
+                        for key, value in timing_metadata.items()
+                    },
+                },
+            )
         if joint_action_key is not None:
             decision = replace(
                 decision,
@@ -818,6 +835,11 @@ class ObjectiveScheduler:
             self._cancel_control_decision(
                 self._coverage_controls,
                 coverage_control_key,
+            )
+        for timing_response_key in _timing_response_keys_from_metadata(metadata):
+            self._cancel_control_decision(
+                self._timing_response_controls,
+                timing_response_key,
             )
 
         self._cancel_control_decision(
@@ -897,13 +919,20 @@ class ObjectiveScheduler:
         self._last_cadence_off_policy_tightened = False
         if self._has_positive_objective_signal():
             preferred = self.min_train_batch_groups
+            preference_reason = "positive_signal"
         elif off_policy_penalty > self.off_policy_cadence_tightening_threshold:
             preferred = self.min_train_batch_groups
+            preference_reason = "off_policy_tighten"
             self._last_cadence_off_policy_tightened = True
-        elif train_queue_pressure >= 0.75 or pending_groups >= upper:
+        elif train_queue_pressure >= 0.75:
             preferred = upper
+            preference_reason = "train_queue_pressure"
+        elif pending_groups >= upper:
+            preferred = upper
+            preference_reason = "pending_groups"
         else:
             preferred = configured
+            preference_reason = "configured"
         joint_scores = self._joint_action_scores_for_control_values(
             "cadence",
             candidates,
@@ -920,16 +949,22 @@ class ObjectiveScheduler:
             )
             and not joint_scores
         ):
-            return self._record_control_decision(self._cadence_controls, upper)
-        return self._record_control_decision(
-            self._cadence_controls,
-            self._select_control_value(
+            selected = upper
+        else:
+            selected = self._select_control_value(
                 self._cadence_controls,
                 candidates,
                 preferred=preferred,
                 joint_scores=joint_scores,
-            ),
+            )
+        self._record_timing_response_decision(
+            knob="cadence",
+            value=selected,
+            preference_reason=preference_reason,
+            train_queue_pressure=train_queue_pressure,
+            pending_groups=pending_groups,
         )
+        return self._record_control_decision(self._cadence_controls, selected)
 
     def max_policy_lag(
         self,
@@ -957,15 +992,20 @@ class ObjectiveScheduler:
         protecting_unaccepted_arm = self._has_unaccepted_known_arm()
         if protecting_unaccepted_arm:
             preferred = configured
+            preference_reason = "protect_unaccepted"
         elif train_queue_pressure >= 0.75:
             preferred = self.min_policy_lag
+            preference_reason = "train_queue_pressure"
         elif off_policy_penalty > self.off_policy_lag_tightening_threshold:
             preferred = self.min_policy_lag
+            preference_reason = "off_policy_tighten"
             self._last_policy_lag_off_policy_tightened = True
         elif self._has_positive_objective_signal():
             preferred = self.min_policy_lag
+            preference_reason = "positive_signal"
         else:
             preferred = configured
+            preference_reason = "configured"
         joint_scores = self._joint_action_scores_for_control_values(
             "lag",
             candidates,
@@ -981,16 +1021,22 @@ class ObjectiveScheduler:
             )
             and not joint_scores
         ):
-            return self._record_control_decision(self._lag_controls, configured)
-        return self._record_control_decision(
-            self._lag_controls,
-            self._select_control_value(
+            selected = configured
+        else:
+            selected = self._select_control_value(
                 self._lag_controls,
                 candidates,
                 preferred=preferred,
                 joint_scores=joint_scores,
-            ),
+            )
+        self._record_timing_response_decision(
+            knob="policy_lag",
+            value=selected,
+            preference_reason=preference_reason,
+            train_queue_pressure=train_queue_pressure,
+            pending_groups=0,
         )
+        return self._record_control_decision(self._lag_controls, selected)
 
     def active_actor_count(
         self,
@@ -1059,6 +1105,20 @@ class ObjectiveScheduler:
         if active_count <= 0:
             return
         self._cancel_control_decision(self._actor_count_controls, active_count)
+
+    def timing_response_metadata(self) -> dict[str, str]:
+        """Return metadata keys for the most recent cadence/lag responses."""
+
+        metadata: dict[str, str] = {}
+        if self._last_cadence_response_key:
+            metadata["scheduler/cadence_response_key"] = (
+                self._last_cadence_response_key
+            )
+        if self._last_policy_lag_response_key:
+            metadata["scheduler/policy_lag_response_key"] = (
+                self._last_policy_lag_response_key
+            )
+        return metadata
 
     def observe_rollout(
         self,
@@ -1212,6 +1272,10 @@ class ObjectiveScheduler:
                 cadence_lag_objective,
             )
             self._credit_rollout_objective_to_lag_control(
+                trajectory,
+                cadence_lag_objective,
+            )
+            self._credit_rollout_objective_to_timing_responses(
                 trajectory,
                 cadence_lag_objective,
             )
@@ -1867,6 +1931,16 @@ class ObjectiveScheduler:
                 "last_continuation_train_queue_pressure": (
                     self._last_continuation_train_queue_pressure
                 ),
+                "last_cadence_response_key": self._last_cadence_response_key,
+                "last_cadence_response_reason": (
+                    self._last_cadence_response_reason
+                ),
+                "last_policy_lag_response_key": (
+                    self._last_policy_lag_response_key
+                ),
+                "last_policy_lag_response_reason": (
+                    self._last_policy_lag_response_reason
+                ),
                 "coverage_forced_decisions": self._coverage_forced_decisions,
                 "last_rollout_coverage_target": (
                     self._last_rollout_coverage_target
@@ -1945,6 +2019,10 @@ class ObjectiveScheduler:
             "coverage_controls": {
                 key: _dataclass_state(stats)
                 for key, stats in self._coverage_controls.items()
+            },
+            "timing_response_controls": {
+                key: _dataclass_state(stats)
+                for key, stats in self._timing_response_controls.items()
             },
             "actors": {
                 str(actor_id): _actor_stats_state(stats)
@@ -2214,6 +2292,9 @@ class ObjectiveScheduler:
         self._coverage_controls = _string_control_family_from_state(
             state.get("coverage_controls")
         )
+        self._timing_response_controls = _string_control_family_from_state(
+            state.get("timing_response_controls")
+        )
         self._pending_continuation_decisions = {}
         self._recorded_continuation_stop_decisions = set()
         self._actors = _actor_family_from_state(state.get("actors"))
@@ -2425,6 +2506,34 @@ class ObjectiveScheduler:
         self._last_continuation_train_queue_pressure = _state_float(
             learning_state.get("last_continuation_train_queue_pressure"),
             self._last_continuation_train_queue_pressure,
+        )
+        self._last_cadence_response_key = str(
+            learning_state.get(
+                "last_cadence_response_key",
+                self._last_cadence_response_key,
+            )
+            or ""
+        )
+        self._last_cadence_response_reason = str(
+            learning_state.get(
+                "last_cadence_response_reason",
+                self._last_cadence_response_reason,
+            )
+            or ""
+        )
+        self._last_policy_lag_response_key = str(
+            learning_state.get(
+                "last_policy_lag_response_key",
+                self._last_policy_lag_response_key,
+            )
+            or ""
+        )
+        self._last_policy_lag_response_reason = str(
+            learning_state.get(
+                "last_policy_lag_response_reason",
+                self._last_policy_lag_response_reason,
+            )
+            or ""
         )
         self._coverage_forced_decisions = _state_int(
             learning_state.get("coverage_forced_decisions"),
@@ -3356,6 +3465,114 @@ class ObjectiveScheduler:
             metrics[f"{prefix}/exploration_score"] = (
                 self._control_exploration_value(
                     self._coverage_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        timing_feedback_updates = {
+            key: _control_feedback_updates(stats)
+            for key, stats in self._timing_response_controls.items()
+        }
+        timing_decisions = sum(
+            stats.decisions for stats in self._timing_response_controls.values()
+        )
+        timing_rollout_updates = sum(
+            stats.rollout_updates for stats in self._timing_response_controls.values()
+        )
+        timing_train_updates = sum(
+            stats.train_updates for stats in self._timing_response_controls.values()
+        )
+        timing_stale_updates = sum(
+            stats.stale_updates for stats in self._timing_response_controls.values()
+        )
+        timing_total_feedback_updates = sum(timing_feedback_updates.values())
+        timing_total_objective = sum(
+            stats.total_objective for stats in self._timing_response_controls.values()
+        )
+        timing_total_stale_penalty_objective = sum(
+            stats.total_stale_penalty_objective
+            for stats in self._timing_response_controls.values()
+        )
+        metrics["scheduler/timing_response/keys"] = float(
+            len(self._timing_response_controls)
+        )
+        metrics["scheduler/timing_response/decisions"] = float(timing_decisions)
+        metrics["scheduler/timing_response/rollout_updates"] = float(
+            timing_rollout_updates
+        )
+        metrics["scheduler/timing_response/train_updates"] = float(
+            timing_train_updates
+        )
+        metrics["scheduler/timing_response/stale_updates"] = float(
+            timing_stale_updates
+        )
+        metrics["scheduler/timing_response/feedback_updates"] = float(
+            timing_total_feedback_updates
+        )
+        metrics["scheduler/timing_response/feedback_keys"] = float(
+            sum(1 for updates in timing_feedback_updates.values() if updates > 0)
+        )
+        metrics["scheduler/timing_response/positive_objective_keys"] = float(
+            sum(
+                1
+                for stats in self._timing_response_controls.values()
+                if stats.total_objective > 0.0
+            )
+        )
+        metrics["scheduler/timing_response/total_objective"] = (
+            timing_total_objective
+        )
+        metrics["scheduler/timing_response/mean_objective_per_decision"] = (
+            timing_total_objective / timing_decisions
+            if timing_decisions
+            else 0.0
+        )
+        metrics[
+            "scheduler/timing_response/mean_objective_per_feedback_update"
+        ] = (
+            timing_total_objective / timing_total_feedback_updates
+            if timing_total_feedback_updates
+            else 0.0
+        )
+        metrics["scheduler/timing_response/total_stale_penalty_objective"] = (
+            timing_total_stale_penalty_objective
+        )
+        metrics["scheduler/timing_response/last_cadence_has_key"] = (
+            1.0 if self._last_cadence_response_key else 0.0
+        )
+        metrics["scheduler/timing_response/last_policy_lag_has_key"] = (
+            1.0 if self._last_policy_lag_response_key else 0.0
+        )
+        for key, stats in sorted(self._timing_response_controls.items()):
+            prefix = f"scheduler/timing_response/{_safe_metric_key(key)}"
+            feedback_updates = _control_feedback_updates(stats)
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._timing_response_controls,
+                key,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._timing_response_controls,
                     stats,
                 )
             )
@@ -4319,6 +4536,11 @@ class ObjectiveScheduler:
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
+        self._credit_train_objective_to_timing_responses(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
 
     def _credit_train_objective_to_control_family(
         self,
@@ -4462,6 +4684,44 @@ class ObjectiveScheduler:
 
         for key, credit in key_credit.items():
             stats = self._coverage_controls.setdefault(key, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
+    def _credit_train_objective_to_timing_responses(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        key_credit: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                keys = _timing_response_keys_from_metadata(trajectory.metadata)
+                if not keys:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                for key in keys:
+                    key_credit[key] = key_credit.get(key, 0.0) + credit
+
+        for key, credit in key_credit.items():
+            stats = self._timing_response_controls.setdefault(key, ControlStats())
             stats.train_updates += 1
             stats.total_objective += credit
             stats.objective_ema = self._ema(
@@ -4637,6 +4897,12 @@ class ObjectiveScheduler:
             stale_feedback=stale_feedback,
             stale_experience=stale_experience,
         )
+        self._credit_objective_to_timing_responses(
+            groups,
+            objective,
+            stale_feedback=stale_feedback,
+            stale_experience=stale_experience,
+        )
 
     def _credit_objective_to_joint_actions(
         self,
@@ -4724,6 +4990,50 @@ class ObjectiveScheduler:
                 _control_feedback_updates(stats),
             )
 
+    def _credit_objective_to_timing_responses(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        objective: float,
+        *,
+        stale_feedback: bool,
+        stale_experience: float,
+    ) -> None:
+        key_weights: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                keys = _timing_response_keys_from_metadata(trajectory.metadata)
+                if not keys:
+                    continue
+                quality = action_quality(trajectory)
+                if quality <= 0.0:
+                    weight = 0.0
+                else:
+                    weight = max(0.0, trajectory.reward * quality) or quality
+                for key in keys:
+                    key_weights[key] = key_weights.get(key, 0.0) + weight
+
+        total_weight = sum(key_weights.values())
+        for key, weight in key_weights.items():
+            stats = self._timing_response_controls.setdefault(key, ControlStats())
+            credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
+            stale_credit = (
+                stale_experience * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
+            if stale_feedback:
+                stats.stale_updates += 1
+                stats.stale_experience += stale_credit
+                stats.total_stale_penalty_objective += credit
+            else:
+                stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
     def _credit_rollout_objective_to_admission_control(
         self,
         trajectory: Trajectory,
@@ -4791,6 +5101,23 @@ class ObjectiveScheduler:
             objective,
             _control_feedback_updates(stats),
         )
+
+    def _credit_rollout_objective_to_timing_responses(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        for key in _timing_response_keys_from_metadata(trajectory.metadata):
+            stats = self._timing_response_controls.setdefault(key, ControlStats())
+            if stats.decisions <= stats.rollout_updates:
+                stats.decisions += 1
+            stats.rollout_updates += 1
+            stats.total_objective += objective
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                objective,
+                _control_feedback_updates(stats),
+            )
 
     def _credit_rollout_objective_to_cadence_control(
         self,
@@ -5137,6 +5464,30 @@ class ObjectiveScheduler:
     def _record_coverage_decision(self, key: str) -> None:
         self._coverage_controls.setdefault(key, ControlStats()).decisions += 1
 
+    def _record_timing_response_decision(
+        self,
+        *,
+        knob: str,
+        value: int,
+        preference_reason: str,
+        train_queue_pressure: float,
+        pending_groups: int,
+    ) -> None:
+        key = _timing_response_key(
+            knob=knob,
+            value=value,
+            preference_reason=preference_reason,
+            train_queue_pressure=train_queue_pressure,
+            pending_groups=pending_groups,
+        )
+        self._timing_response_controls.setdefault(key, ControlStats()).decisions += 1
+        if knob == "cadence":
+            self._last_cadence_response_key = key
+            self._last_cadence_response_reason = preference_reason
+        elif knob == "policy_lag":
+            self._last_policy_lag_response_key = key
+            self._last_policy_lag_response_reason = preference_reason
+
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
 
@@ -5312,6 +5663,42 @@ def _coverage_control_key_from_metadata(
     if arm_id is None or isinstance(arm_id, bool):
         return None
     return _coverage_control_key(str(arm_id))
+
+
+def _timing_response_key(
+    *,
+    knob: str,
+    value: int,
+    preference_reason: str,
+    train_queue_pressure: float,
+    pending_groups: int,
+) -> str:
+    return (
+        f"control={_safe_metric_key(str(knob)) or 'unknown'}"
+        f"|value={max(0, int(value))}"
+        f"|preference={_safe_metric_key(str(preference_reason)) or 'unknown'}"
+        f"|pressure={_queue_pressure_bucket(train_queue_pressure)}"
+        f"|pending={_pending_batch_bucket(pending_groups)}"
+    )
+
+
+def _timing_response_keys_from_metadata(
+    metadata: Mapping[str, Any],
+) -> tuple[str, ...]:
+    keys: list[str] = []
+    for name in (
+        "scheduler/cadence_response_key",
+        "cadence_response_key",
+        "scheduler/policy_lag_response_key",
+        "policy_lag_response_key",
+    ):
+        value = metadata.get(name)
+        if value is None or isinstance(value, bool):
+            continue
+        key = str(value)
+        if key and key not in keys:
+            keys.append(key)
+    return tuple(keys)
 
 
 def _continuation_decision_key(

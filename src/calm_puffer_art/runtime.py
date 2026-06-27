@@ -1324,6 +1324,7 @@ class ControlPlane:
                 self._tag_batch_control_metadata(
                     batch.groups,
                     max_policy_lag=train_ring.max_policy_lag,
+                    extra_metadata=self._timing_response_metadata(scheduler),
                 )
                 train_started = time.perf_counter()
                 result = await trainer.train(current, batch.groups)
@@ -1560,6 +1561,7 @@ class ControlPlane:
                     groups,
                     target_train_batch_groups=target_batch_groups,
                     max_policy_lag=active_max_policy_lag,
+                    extra_metadata=self._timing_response_metadata(scheduler),
                 )
                 await train_ring.put(
                     VersionedTrajectoryBatch(
@@ -1835,6 +1837,13 @@ class ControlPlane:
                 "scheduler/coverage_control_key",
                 str(coverage_control_key),
             )
+        for source_key, target_key in (
+            ("cadence_response_key", "scheduler/cadence_response_key"),
+            ("policy_lag_response_key", "scheduler/policy_lag_response_key"),
+        ):
+            value = decision.metadata.get(source_key)
+            if value is not None and not isinstance(value, bool):
+                trajectory.metadata.setdefault(target_key, str(value))
         admission_dollar_seconds = (
             admission_delay_s * self.config.cost_per_second_usd
         )
@@ -2408,6 +2417,7 @@ class ControlPlane:
         *,
         target_train_batch_groups: int | None = None,
         max_policy_lag: int | None = None,
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         for group in groups:
             for trajectory in group.trajectories:
@@ -2419,6 +2429,22 @@ class ControlPlane:
                     trajectory.metadata["scheduler/active_max_policy_lag"] = (
                         max_policy_lag
                     )
+                if extra_metadata is not None:
+                    for key, value in extra_metadata.items():
+                        if value is not None and not isinstance(value, bool):
+                            trajectory.metadata.setdefault(key, str(value))
+
+    @staticmethod
+    def _timing_response_metadata(
+        scheduler: AdaptiveScheduler | None,
+    ) -> Mapping[str, Any]:
+        if scheduler is None:
+            return {}
+        accessor = getattr(scheduler, "timing_response_metadata", None)
+        if accessor is None:
+            return {}
+        metadata = accessor()
+        return metadata if isinstance(metadata, Mapping) else {}
 
     @staticmethod
     def _queue_pressure(queue: asyncio.Queue[Trajectory]) -> float:
