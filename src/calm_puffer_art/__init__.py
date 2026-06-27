@@ -82,6 +82,7 @@ from .objective_ablation import (
     run_static_ablation,
     run_static_closed_loop_ablation,
 )
+from .scalability import run_scheduler_scalability_profile
 from .scheduler import (
     AdaptiveScheduler,
     ObjectiveScheduler,
@@ -192,6 +193,7 @@ __all__ = [
     "run_static_art_bridge_ablation",
     "run_static_ablation",
     "run_static_closed_loop_ablation",
+    "run_scheduler_scalability_profile",
     "scheduler_checkpoint_metadata",
     "scheduling_action_key",
     "semantic_bandwidth",

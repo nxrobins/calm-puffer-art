@@ -52,6 +52,13 @@ $env:PYTHONPATH = "src"
 python examples\objective_ablation.py
 ```
 
+Run the scheduler scalability/readiness profile:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\scalability_profile.py
+```
+
 The ablation output includes separate scheduler-control and action-space-control
 checks, a combined local closed-loop run, an ART-bridge run where external
 producer-style submissions use `admit_and_select_rollout()` plus `submit_group()`,
@@ -59,6 +66,13 @@ and a three-way benchmark comparing stock token-level ART, async ART producer
 control, and async ART plus adaptive semantic actions on the accounted north-star.
 It also emits a control-dimension sensitivity report for policy lag, train-ring
 capacity, actor count, and token-only action granularity.
+
+The scalability profile is a deterministic local probe for the combinatorial
+controller risk: it reports arm count, joint scheduling-action keys,
+action-space-scoped runtime-control keys, metric count, checkpoint JSON bytes,
+and rollout-selector timing as the synthetic scenario/action/runtime/action-space
+lattice grows. It is not a substitute for a live ART/CALM training job; it is a
+guardrail for spotting scheduler state growth before that integration run.
 
 Run tests:
 

@@ -177,6 +177,7 @@ Phase 4: Measurement
 
 - Keep the deterministic static-vs-objective ablations green as local proof that scheduler control, adaptive action-space control, the combined local closed-loop controller, and the ART-bridge external-producer path improve the north-star on controlled workloads, including learned actor-count, cadence, lag, chunk-granularity, joint-action payoff, and realized action-space payoff together.
 - Benchmark stock ART, ART plus async runtime, and ART plus async runtime plus semantic actions; the deterministic `examples/objective_ablation.py` benchmark reports those three modes under common accounted north-star keys.
+- Profile scheduler key growth as the joint action lattice expands; `examples/scalability_profile.py` reports arm count, joint scheduling-action keys, action-space-scoped runtime-control keys, metric count, checkpoint JSON bytes, and selector timing from deterministic synthetic feedback.
 - Report reward-improving experience per dollar-second, not only throughput.
 - Report throughput and utilization next to the objective so rollouts/sec gains are distinguishable from reward-improving experience gains.
 - Compare both wall-clock infrastructure cost and accounted rollout/trainer/queue cost, including explicit rollout dollar-seconds for API, token, tool, or GPU spend when available.
