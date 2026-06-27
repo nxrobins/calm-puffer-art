@@ -620,7 +620,14 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "action_space/decision/decisions",
         "action_space/decision/post_decision_observations",
         "action_space/decision/realized_objective_payoff",
+        "action_space/decision/mean_realized_objective_payoff_per_decision",
+        "action_space/decision/"
+        "mean_realized_objective_payoff_per_post_decision_observation",
         "action_space/decision/realized_source_token_throughput_payoff",
+        "action_space/decision/"
+        "mean_realized_source_token_throughput_payoff_per_decision",
+        "action_space/decision/"
+        "mean_realized_source_token_throughput_payoff_per_post_decision_observation",
         "scheduler/control/cadence_1/train_updates",
         "scheduler/control/cadence_1/mean_objective_per_decision",
         "scheduler/control/cadence_1/mean_objective_per_feedback_update",
@@ -678,6 +685,9 @@ def bridge_summary_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "action_space/decision/decisions",
         "action_space/decision/post_decision_observations",
         "action_space/decision/realized_objective_payoff",
+        "action_space/decision/mean_realized_objective_payoff_per_decision",
+        "action_space/decision/"
+        "mean_realized_objective_payoff_per_post_decision_observation",
         "scheduler/arm/art_bridge_chunk_chunk_size_2/pulls",
         "scheduler/arm/art_bridge_chunk_chunk_size_4/pulls",
         "scheduler/arm/art_bridge_token/pulls",

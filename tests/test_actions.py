@@ -338,6 +338,20 @@ class ActionCodecTests(unittest.TestCase):
             metrics["action_space/decision/realized_objective_payoff"],
             1.4,
         )
+        self.assertAlmostEqual(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_decision"
+            ],
+            1.4,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ],
+            0.7,
+        )
         self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(metrics[f"{prefix}/promotion"], 1.0)
         self.assertEqual(metrics[f"{prefix}/target_pulls"], 2.0)
@@ -360,6 +374,17 @@ class ActionCodecTests(unittest.TestCase):
             1.4,
         )
         self.assertAlmostEqual(
+            metrics[f"{prefix}/mean_realized_objective_payoff_per_decision"],
+            1.4,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                f"{prefix}/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ],
+            0.7,
+        )
+        self.assertAlmostEqual(
             metrics[f"{prefix}/source_token_throughput_delta_vs_parent"],
             1.5,
         )
@@ -372,6 +397,36 @@ class ActionCodecTests(unittest.TestCase):
                 "action_space/decision/realized_source_token_throughput_payoff"
             ],
             3.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_source_token_throughput_payoff_per_decision"
+            ],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_source_token_throughput_payoff_per_"
+                "post_decision_observation"
+            ],
+            1.5,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_decision"
+            ],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_"
+                "post_decision_observation"
+            ],
+            1.5,
         )
 
     def test_adaptive_action_space_can_promote_latent_patch_from_chunk_signal(self):

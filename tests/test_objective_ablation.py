@@ -27,6 +27,28 @@ def assert_runtime_control_payoff_metrics(
         )
 
 
+def assert_action_space_payoff_means(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_decision"
+            ]
+        )
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ]
+        )
+    )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -133,6 +155,7 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/arm/semantic_chunk_chunk_size_2/total_improvement_per_dollar_second"
             ],
         )
+        assert_action_space_payoff_means(self, adaptive)
 
     def test_closed_loop_ablation_accounts_joint_scheduler_payoff(self):
         result = asyncio.run(run_closed_loop_ablation())
@@ -160,6 +183,20 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertGreater(
             objective["action_space/decision/realized_objective_payoff"],
+            0.0,
+        )
+        self.assertGreater(
+            objective[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_decision"
+            ],
+            0.0,
+        )
+        self.assertGreater(
+            objective[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ],
             0.0,
         )
         self.assertGreater(
@@ -238,6 +275,20 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         self.assertGreater(
             objective["action_space/decision/realized_objective_payoff"],
+            0.0,
+        )
+        self.assertGreater(
+            objective[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_decision"
+            ],
+            0.0,
+        )
+        self.assertGreater(
+            objective[
+                "action_space/decision/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ],
             0.0,
         )
         self.assertGreater(

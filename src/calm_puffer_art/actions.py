@@ -1260,8 +1260,34 @@ class AdaptiveActionSpace:
             "action_space/decision/realized_objective_payoff": (
                 realized_objective_payoff
             ),
+            "action_space/decision/"
+            "mean_realized_objective_payoff_per_decision": (
+                realized_objective_payoff / decision_count
+                if decision_count
+                else 0.0
+            ),
+            "action_space/decision/"
+            "mean_realized_objective_payoff_per_post_decision_observation": (
+                realized_objective_payoff / decision_post_observations
+                if decision_post_observations
+                else 0.0
+            ),
             "action_space/decision/realized_source_token_throughput_payoff": (
                 realized_source_token_throughput_payoff
+            ),
+            "action_space/decision/"
+            "mean_realized_source_token_throughput_payoff_per_decision": (
+                realized_source_token_throughput_payoff / decision_count
+                if decision_count
+                else 0.0
+            ),
+            "action_space/decision/"
+            "mean_realized_source_token_throughput_payoff_per_"
+            "post_decision_observation": (
+                realized_source_token_throughput_payoff
+                / decision_post_observations
+                if decision_post_observations
+                else 0.0
             ),
         }
         for codec in self._codecs:
@@ -1312,8 +1338,39 @@ class AdaptiveActionSpace:
             values[f"{prefix}/realized_objective_payoff"] = (
                 stats.realized_objective_payoff
             )
+            values[f"{prefix}/mean_realized_objective_payoff_per_decision"] = (
+                stats.realized_objective_payoff / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ] = (
+                stats.realized_objective_payoff / stats.post_decision_observations
+                if stats.post_decision_observations
+                else 0.0
+            )
             values[f"{prefix}/realized_source_token_throughput_payoff"] = (
                 stats.realized_source_token_throughput_payoff
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_decision"
+            ] = (
+                stats.realized_source_token_throughput_payoff / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_"
+                "post_decision_observation"
+            ] = (
+                stats.realized_source_token_throughput_payoff
+                / stats.post_decision_observations
+                if stats.post_decision_observations
+                else 0.0
             )
         return values
 
