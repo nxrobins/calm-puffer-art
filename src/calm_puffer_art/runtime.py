@@ -880,6 +880,7 @@ class RuntimeTelemetry:
         self.rollout_dollar_seconds = 0.0
         self.actor_admission_delay_s = 0.0
         self.actor_queue_wait_s = 0.0
+        self.train_ring_admission_wait_s = 0.0
         self.trainer_wait_s = 0.0
         self.trainer_s = 0.0
         self.trainer_dollar_seconds = 0.0
@@ -911,6 +912,9 @@ class RuntimeTelemetry:
 
     def record_actor_queue_wait(self, seconds: float) -> None:
         self.actor_queue_wait_s += max(0.0, seconds)
+
+    def record_train_ring_admission_wait(self, seconds: float) -> None:
+        self.train_ring_admission_wait_s += max(0.0, seconds)
 
     def record_train_wait(self, seconds: float) -> None:
         self.trainer_wait_s += max(0.0, seconds)
@@ -1052,12 +1056,16 @@ class RuntimeTelemetry:
         queue_wait_dollar_seconds = (
             self.actor_queue_wait_s * self.cost_per_second_usd
         )
+        train_ring_admission_wait_dollar_seconds = (
+            self.train_ring_admission_wait_s * self.cost_per_second_usd
+        )
         accounted_dollar_seconds = (
             rollout_dollar_seconds
             + trainer_dollar_seconds
             + trainer_wait_dollar_seconds
             + admission_delay_dollar_seconds
             + queue_wait_dollar_seconds
+            + train_ring_admission_wait_dollar_seconds
             + self.promotion_eval_dollar_seconds
         )
         if dollar_seconds > 0:
@@ -1130,6 +1138,9 @@ class RuntimeTelemetry:
             "time/trainer_wait_s": self.trainer_wait_s,
             "time/actor_admission_delay_s": self.actor_admission_delay_s,
             "time/actor_queue_wait_s": self.actor_queue_wait_s,
+            "time/train_ring_admission_wait_s": (
+                self.train_ring_admission_wait_s
+            ),
             "data/trajectories_seen": float(self.trajectories_seen),
             "data/trajectories_accepted": float(self.trajectories_accepted),
             "data/trajectories_failed": float(self.trajectories_failed),
@@ -1175,6 +1186,9 @@ class RuntimeTelemetry:
             ),
             "utilization/actor_queue_wait_parallelism": (
                 self.actor_queue_wait_s / wall_s
+            ),
+            "utilization/train_ring_admission_wait_parallelism": (
+                self.train_ring_admission_wait_s / wall_s
             ),
             "actions/semantic_bandwidth_tokens_per_decision": self.source_tokens
             / self.action_units
@@ -1232,6 +1246,9 @@ class RuntimeTelemetry:
                 admission_delay_dollar_seconds
             ),
             "costs/actor_queue_wait_dollar_seconds": queue_wait_dollar_seconds,
+            "costs/train_ring_admission_wait_dollar_seconds": (
+                train_ring_admission_wait_dollar_seconds
+            ),
             "costs/accounted_dollar_seconds": accounted_dollar_seconds,
             "promotion/evaluations": float(self.promotion_evaluations),
             "promotion/promoted": float(self.promotions),
@@ -1499,10 +1516,15 @@ class ControlPlane:
                     0.0,
                     promotion.dollar_seconds - promotion_rollout_dollar_seconds,
                 )
-                candidate_dollar_seconds = train_dollar_seconds + max(
-                    0.0,
-                    promotion_overhead_dollar_seconds,
-                ) + train_wait_dollar_seconds
+                train_ring_admission_wait_dollar_seconds = (
+                    self._batch_train_ring_admission_wait_dollar_seconds(batch)
+                )
+                candidate_dollar_seconds = (
+                    train_dollar_seconds
+                    + max(0.0, promotion_overhead_dollar_seconds)
+                    + train_wait_dollar_seconds
+                    + train_ring_admission_wait_dollar_seconds
+                )
                 if scheduler is not None:
                     self._observe_promotion_rollouts(
                         scheduler=scheduler,
@@ -1715,7 +1737,7 @@ class ControlPlane:
                     max_policy_lag=active_max_policy_lag,
                     extra_metadata=self._timing_response_metadata(scheduler),
                 )
-                await train_ring.put(
+                train_ring_admission_wait_s = await train_ring.put(
                     VersionedTrajectoryBatch(
                         groups=groups,
                         assembled_at_step=latest.step,
@@ -1731,6 +1753,9 @@ class ControlPlane:
                             reason="runtime_train_ring_stale",
                         ),
                     )
+                )
+                telemetry.record_train_ring_admission_wait(
+                    train_ring_admission_wait_s
                 )
 
     async def _actor_loop(
@@ -2534,6 +2559,22 @@ class ControlPlane:
                 ),
             )
         return explicit_cost or 0.0
+
+    def _batch_train_ring_admission_wait_dollar_seconds(
+        self,
+        batch: VersionedTrajectoryBatch,
+    ) -> float:
+        explicit_cost = _first_nonnegative_float(
+            batch.metadata,
+            ("queue/train_ring_admission_wait_dollar_seconds",),
+        )
+        if explicit_cost is not None:
+            return explicit_cost
+        wait_s = _first_nonnegative_float(
+            batch.metadata,
+            ("queue/train_ring_admission_wait_s",),
+        )
+        return (wait_s or 0.0) * self.config.cost_per_second_usd
 
     async def _put_trajectory_with_queue_cost(
         self,

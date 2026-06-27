@@ -2310,6 +2310,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["costs/trainer_wait_dollar_seconds"], 10.0)
         self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
 
+    def test_runtime_telemetry_attributes_train_ring_admission_wait_cost(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=5.0)
+
+        telemetry.record_train_ring_admission_wait(2.0)
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/train_ring_admission_wait_s"], 2.0)
+        self.assertEqual(
+            metrics["costs/train_ring_admission_wait_dollar_seconds"],
+            10.0,
+        )
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+
     def test_runtime_telemetry_accepts_explicit_rollout_dollar_seconds(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)
         trajectory = Trajectory(
@@ -2373,6 +2386,92 @@ class RuntimeTests(unittest.TestCase):
         self.assertGreater(
             queued.metrics["cost/actor_queue_wait_dollar_seconds"],
             0.0,
+        )
+
+    def test_control_plane_charges_train_ring_admission_wait_to_scheduler(self):
+        async def run():
+            class SlowCostedTrainer:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def train(
+                    self,
+                    current: PolicySnapshot,
+                    groups: Sequence[TrajectoryGroup],
+                ) -> TrainResult:
+                    self.calls += 1
+                    if self.calls == 1:
+                        await asyncio.sleep(0.05)
+                    return TrainResult(
+                        policy=current.policy,
+                        checkpoint_id=f"step-{current.step + 1}",
+                        metrics={
+                            "train/reward": float(self.calls),
+                            "train/dollar_seconds": 17.0,
+                        },
+                    )
+
+            async def fast_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                return Trajectory(
+                    scenario_id=scenario.id,
+                    policy_step=context.policy_step,
+                    messages=[Message(role="user", content="fast")],
+                    actions=context.action_codec.encode("fast"),
+                    reward=1.0,
+                    duration_s=0.0,
+                    metrics={"rollout/dollar_seconds": 0.0},
+                )
+
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=10,
+                max_policy_lag=10,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+            )
+            summary = await asyncio.wait_for(
+                ControlPlane(
+                    ControlPlaneConfig(
+                        num_actors=4,
+                        group_size=1,
+                        train_batch_groups=1,
+                        max_train_steps=3,
+                        queue_max_trajectories=20,
+                        train_queue_capacity=1,
+                        max_policy_lag=10,
+                        cost_per_second_usd=1000.0,
+                    )
+                ).run(
+                    scenarios=[Scenario(id="ring-wait")],
+                    initial_policy=CountingPolicy(level=1),
+                    trainer=SlowCostedTrainer(),
+                    workflow=fast_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=2.0,
+            )
+            return summary.metrics
+
+        metrics = asyncio.run(run())
+
+        admission_wait = metrics["costs/train_ring_admission_wait_dollar_seconds"]
+        scheduler_extra_train_cost = (
+            metrics["scheduler/costs/train_dollar_seconds"]
+            - metrics["costs/trainer_dollar_seconds"]
+            - metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertGreater(metrics["train_queue/backpressure_events"], 0.0)
+        self.assertGreater(admission_wait, 0.0)
+        self.assertGreater(scheduler_extra_train_cost, 0.0)
+        self.assertLessEqual(
+            scheduler_extra_train_cost,
+            admission_wait + max(0.001, admission_wait * 0.05),
         )
 
     def test_runtime_stamps_rollout_cost_before_enqueue(self):
