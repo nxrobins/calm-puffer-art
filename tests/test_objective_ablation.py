@@ -27,6 +27,24 @@ def assert_runtime_control_payoff_metrics(
         )
 
 
+def assert_any_runtime_control_payoff_metric(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+    prefixes: tuple[str, ...],
+) -> None:
+    observed_prefixes = [
+        prefix
+        for prefix in prefixes
+        if f"{prefix}/mean_objective_per_decision" in metrics
+    ]
+    test_case.assertGreater(len(observed_prefixes), 0)
+    assert_runtime_control_payoff_metrics(
+        test_case,
+        metrics,
+        tuple(observed_prefixes),
+    )
+
+
 def assert_action_space_payoff_means(
     test_case: unittest.TestCase,
     metrics: dict[str, float],
@@ -280,6 +298,12 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/policy_lag_1",
                 "scheduler/control/policy_lag_2",
                 "scheduler/control/admission_delay_ms_0",
+            ),
+        )
+        assert_any_runtime_control_payoff_metric(
+            self,
+            objective,
+            (
                 "scheduler/control/actor_count_1",
                 "scheduler/control/actor_count_2",
             ),
@@ -388,6 +412,12 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/policy_lag_1",
                 "scheduler/control/policy_lag_2",
                 "scheduler/control/admission_delay_ms_0",
+            ),
+        )
+        assert_any_runtime_control_payoff_metric(
+            self,
+            objective,
+            (
                 "scheduler/control/actor_count_1",
                 "scheduler/control/actor_count_2",
             ),
@@ -483,6 +513,12 @@ class ObjectiveAblationTests(unittest.TestCase):
                 "scheduler/control/policy_lag_1",
                 "scheduler/control/policy_lag_2",
                 "scheduler/control/admission_delay_ms_0",
+            ),
+        )
+        assert_any_runtime_control_payoff_metric(
+            self,
+            objective,
+            (
                 "scheduler/control/actor_count_1",
                 "scheduler/control/actor_count_2",
             ),

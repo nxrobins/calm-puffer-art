@@ -2029,6 +2029,126 @@ class ObjectiveSchedulerTests(unittest.TestCase):
             metrics["scheduler/control/cadence_4/score"],
         )
 
+    def test_control_selection_prefers_matching_action_space_context(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.0,
+            rollout_cadence_lag_control_weight=1.0,
+        )
+
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="space-a",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=10.0,
+                metadata={
+                    "scheduler/arm_id": "space-a|token",
+                    "scheduler/active_target_train_batch_groups": 4,
+                    "scheduler/action_space_key": "space-a",
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="space-b",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "space-b|token",
+                    "scheduler/active_target_train_batch_groups": 2,
+                    "scheduler/action_space_key": "space-b",
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="space-b-low",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+                metadata={
+                    "scheduler/arm_id": "space-b-low|token",
+                    "scheduler/active_target_train_batch_groups": 4,
+                    "scheduler/action_space_key": "space-b",
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+
+        selected_a = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+            action_space_key="space-a",
+        )
+        selected_b = scheduler.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=1,
+            action_space_key="space-b",
+        )
+        metrics = scheduler.metrics()
+        restored = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=4,
+            exploration_bonus=0.0,
+            control_exploration_bonus=0.0,
+            rollout_cadence_lag_control_weight=1.0,
+        )
+        restored.load_state_dict(scheduler.state_dict())
+        restored_selected_b = restored.target_train_batch_groups(
+            configured=3,
+            pending_groups=0,
+            train_queue_pressure=0.0,
+            policy_step=2,
+            action_space_key="space-b",
+        )
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(selected_a, 4)
+        self.assertEqual(selected_b, 2)
+        self.assertEqual(restored_selected_b, 2)
+        self.assertGreater(
+            metrics["scheduler/control/cadence_4/score"],
+            metrics["scheduler/control/cadence_2/score"],
+        )
+        self.assertEqual(metrics["scheduler/control_context/keys"], 3.0)
+        self.assertEqual(
+            metrics[
+                "scheduler/control_context/"
+                "cadence_4_action_space_space_a/rollout_updates"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[
+                "scheduler/control_context/"
+                "cadence_2_action_space_space_b/rollout_updates"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            restored_metrics[
+                "scheduler/control_context/"
+                "cadence_2_action_space_space_b/rollout_updates"
+            ],
+            1.0,
+        )
+
     def test_rollout_feedback_credits_and_reuses_cadence_and_lag_controls(self):
         scheduler = ObjectiveScheduler(
             min_train_batch_groups=1,

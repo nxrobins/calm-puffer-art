@@ -1832,6 +1832,7 @@ class ControlPlane:
                         self._cancel_actor_count_decision(
                             scheduler,
                             active_actor_count,
+                            action_space_key=current_action_space_key,
                         )
                     stop.set()
                     break
@@ -2484,12 +2485,13 @@ class ControlPlane:
     def _cancel_actor_count_decision(
         scheduler: AdaptiveScheduler | None,
         active_actor_count: int,
+        action_space_key: str | None = None,
     ) -> None:
         if scheduler is None:
             return
         cancel = getattr(scheduler, "cancel_actor_count_decision", None)
         if cancel is not None:
-            cancel(active_actor_count)
+            cancel(active_actor_count, action_space_key=action_space_key)
 
     def _trajectory_dollar_seconds(self, trajectory: Trajectory) -> float:
         explicit_total = _first_nonnegative_float(

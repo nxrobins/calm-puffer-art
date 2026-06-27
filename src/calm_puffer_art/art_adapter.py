@@ -524,7 +524,10 @@ class AsyncArtBackend:
             "scheduler/admitted": actor_id < active_count,
         }
         if actor_id >= active_count:
-            self._cancel_actor_count_decision(active_count)
+            self._cancel_actor_count_decision(
+                active_count,
+                action_space_key=action_space_key,
+            )
             return ArtRolloutAdmission(
                 actor_id=actor_id,
                 active_actor_count=active_count,
@@ -609,7 +612,10 @@ class AsyncArtBackend:
             trajectory_queue_pressure=trajectory_queue_pressure,
             action_space_key=action_space_signature(self.action_space),
         ):
-            self._cancel_actor_count_decision(admission.active_actor_count)
+            self._cancel_actor_count_decision(
+                admission.active_actor_count,
+                action_space_key=action_space_signature(self.action_space),
+            )
             self._stopped_admissions += 1
             metadata = {
                 **admission.metadata,
@@ -1543,12 +1549,16 @@ class AsyncArtBackend:
                 )
             cancel(decision)
 
-    def _cancel_actor_count_decision(self, active_actor_count: int) -> None:
+    def _cancel_actor_count_decision(
+        self,
+        active_actor_count: int,
+        action_space_key: str | None = None,
+    ) -> None:
         if self.scheduler is None:
             return
         cancel = getattr(self.scheduler, "cancel_actor_count_decision", None)
         if cancel is not None:
-            cancel(active_actor_count)
+            cancel(active_actor_count, action_space_key=action_space_key)
 
     def _accounted_dollar_seconds(
         self,

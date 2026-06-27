@@ -125,7 +125,11 @@ class AdaptiveScheduler(Protocol):
     ) -> int:
         ...
 
-    def cancel_actor_count_decision(self, active_actor_count: int) -> None:
+    def cancel_actor_count_decision(
+        self,
+        active_actor_count: int,
+        action_space_key: str | None = None,
+    ) -> None:
         ...
 
     def observe_rollout_admission_delay(
@@ -591,6 +595,10 @@ class ObjectiveScheduler:
         self._lag_controls: dict[int, ControlStats] = {}
         self._admission_controls: dict[int, ControlStats] = {}
         self._actor_count_controls: dict[int, ControlStats] = {}
+        self._runtime_control_contexts: dict[
+            str,
+            dict[str, dict[int, ControlStats]],
+        ] = {}
         self._joint_action_controls: dict[str, ControlStats] = {}
         self._train_selection_controls: dict[str, ControlStats] = {}
         self._continuation_controls: dict[str, ControlStats] = {}
@@ -820,6 +828,7 @@ class ObjectiveScheduler:
         """Cancel a selected rollout before any rollout work was produced."""
 
         metadata = _mapping_state(decision.metadata)
+        action_space_key = _control_action_space_key_from_metadata(metadata)
         stats = self._arms.get(decision.arm_id)
         if stats is not None:
             reserved_cost = _decision_reserved_rollout_dollar_seconds(decision)
@@ -855,17 +864,29 @@ class ObjectiveScheduler:
                 timing_response_key,
             )
 
-        self._cancel_control_decision(
+        self._cancel_runtime_control_decision(
+            "cadence",
             self._cadence_controls,
             decision.target_train_batch_groups,
+            action_space_key=action_space_key,
         )
-        self._cancel_control_decision(self._lag_controls, decision.max_policy_lag)
+        self._cancel_runtime_control_decision(
+            "policy_lag",
+            self._lag_controls,
+            decision.max_policy_lag,
+            action_space_key=action_space_key,
+        )
         actor_count = _first_int_metadata(
             metadata,
             ("scheduler/active_actor_count", "active_actor_count"),
         )
         if actor_count is not None and actor_count > 0:
-            self._cancel_control_decision(self._actor_count_controls, actor_count)
+            self._cancel_runtime_control_decision(
+                "actor_count",
+                self._actor_count_controls,
+                actor_count,
+                action_space_key=action_space_key,
+            )
         admission_delay_ms = _first_int_metadata(
             metadata,
             (
@@ -877,9 +898,11 @@ class ObjectiveScheduler:
             admission_delay_ms is not None
             and not _state_bool(metadata.get("scheduler/admission_observed"), False)
         ):
-            self._cancel_control_decision(
+            self._cancel_runtime_control_decision(
+                "admission_delay_ms",
                 self._admission_controls,
                 admission_delay_ms,
+                action_space_key=action_space_key,
             )
             self._rollout_admission_decisions = max(
                 0,
@@ -971,6 +994,8 @@ class ObjectiveScheduler:
                 candidates,
                 preferred=preferred,
                 joint_scores=joint_scores,
+                family="cadence",
+                action_space_key=action_space_key,
             )
         self._record_timing_response_decision(
             knob="cadence",
@@ -980,7 +1005,12 @@ class ObjectiveScheduler:
             pending_groups=pending_groups,
             action_space_key=action_space_key,
         )
-        return self._record_control_decision(self._cadence_controls, selected)
+        return self._record_runtime_control_decision(
+            "cadence",
+            self._cadence_controls,
+            selected,
+            action_space_key=action_space_key,
+        )
 
     def max_policy_lag(
         self,
@@ -1046,6 +1076,8 @@ class ObjectiveScheduler:
                 candidates,
                 preferred=preferred,
                 joint_scores=joint_scores,
+                family="policy_lag",
+                action_space_key=action_space_key,
             )
         self._record_timing_response_decision(
             knob="policy_lag",
@@ -1055,7 +1087,12 @@ class ObjectiveScheduler:
             pending_groups=0,
             action_space_key=action_space_key,
         )
-        return self._record_control_decision(self._lag_controls, selected)
+        return self._record_runtime_control_decision(
+            "policy_lag",
+            self._lag_controls,
+            selected,
+            action_space_key=action_space_key,
+        )
 
     def active_actor_count(
         self,
@@ -1105,27 +1142,42 @@ class ObjectiveScheduler:
             )
             and not joint_scores
         ):
-            return self._record_control_decision(
+            return self._record_runtime_control_decision(
+                "actor_count",
                 self._actor_count_controls,
                 preferred,
+                action_space_key=action_space_key,
             )
-        return self._record_control_decision(
+        return self._record_runtime_control_decision(
+            "actor_count",
             self._actor_count_controls,
             self._select_control_value(
                 self._actor_count_controls,
                 candidates,
                 preferred=preferred,
                 joint_scores=joint_scores,
+                family="actor_count",
+                action_space_key=action_space_key,
             ),
+            action_space_key=action_space_key,
         )
 
-    def cancel_actor_count_decision(self, active_actor_count: int) -> None:
+    def cancel_actor_count_decision(
+        self,
+        active_actor_count: int,
+        action_space_key: str | None = None,
+    ) -> None:
         """Cancel an actor-count control choice that admitted no rollout work."""
 
         active_count = max(0, int(active_actor_count))
         if active_count <= 0:
             return
-        self._cancel_control_decision(self._actor_count_controls, active_count)
+        self._cancel_runtime_control_decision(
+            "actor_count",
+            self._actor_count_controls,
+            active_count,
+            action_space_key=action_space_key,
+        )
 
     def timing_response_metadata(self) -> dict[str, str]:
         """Return metadata keys for the most recent cadence/lag responses."""
@@ -1385,7 +1437,12 @@ class ObjectiveScheduler:
             or pressure <= self.rollout_admission_pressure_threshold
         ):
             self._last_rollout_admission_delay_s = 0.0
-            self._record_control_decision(self._admission_controls, 0)
+            self._record_runtime_control_decision(
+                "admission_delay_ms",
+                self._admission_controls,
+                0,
+                action_space_key=action_space_key,
+            )
             return 0.0
 
         span = max(1e-12, 1.0 - self.rollout_admission_pressure_threshold)
@@ -1417,8 +1474,15 @@ class ObjectiveScheduler:
             candidates,
             preferred=preferred_ms,
             joint_scores=joint_scores,
+            family="admission_delay_ms",
+            action_space_key=action_space_key,
         )
-        self._record_control_decision(self._admission_controls, selected_ms)
+        self._record_runtime_control_decision(
+            "admission_delay_ms",
+            self._admission_controls,
+            selected_ms,
+            action_space_key=action_space_key,
+        )
         delay = selected_ms / 1000.0
         self._last_rollout_admission_delay_s = delay
         return delay
@@ -2084,6 +2148,16 @@ class ObjectiveScheduler:
                 str(value): _dataclass_state(stats)
                 for value, stats in self._actor_count_controls.items()
             },
+            "runtime_control_contexts": {
+                action_space_key: {
+                    family: {
+                        str(value): _dataclass_state(stats)
+                        for value, stats in controls.items()
+                    }
+                    for family, controls in families.items()
+                }
+                for action_space_key, families in self._runtime_control_contexts.items()
+            },
             "joint_action_controls": {
                 key: _dataclass_state(stats)
                 for key, stats in self._joint_action_controls.items()
@@ -2359,6 +2433,9 @@ class ObjectiveScheduler:
         )
         self._actor_count_controls = _control_family_from_state(
             state.get("actor_count_controls")
+        )
+        self._runtime_control_contexts = _runtime_control_contexts_from_state(
+            state.get("runtime_control_contexts")
         )
         self._joint_action_controls = _string_control_family_from_state(
             state.get("joint_action_controls")
@@ -3489,6 +3566,106 @@ class ObjectiveScheduler:
                     self._actor_count_controls,
                     stats,
                 )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        context_stats = [
+            (action_space_key, family, value, stats, controls)
+            for action_space_key, families in sorted(
+                self._runtime_control_contexts.items()
+            )
+            for family, controls in sorted(families.items())
+            for value, stats in sorted(controls.items())
+        ]
+        context_feedback_updates = {
+            (action_space_key, family, value): _control_feedback_updates(stats)
+            for action_space_key, family, value, stats, _ in context_stats
+        }
+        context_decisions = sum(
+            stats.decisions for _, _, _, stats, _ in context_stats
+        )
+        context_rollout_updates = sum(
+            stats.rollout_updates for _, _, _, stats, _ in context_stats
+        )
+        context_train_updates = sum(
+            stats.train_updates for _, _, _, stats, _ in context_stats
+        )
+        context_stale_updates = sum(
+            stats.stale_updates for _, _, _, stats, _ in context_stats
+        )
+        context_feedback_total = sum(context_feedback_updates.values())
+        context_total_objective = sum(
+            stats.total_objective for _, _, _, stats, _ in context_stats
+        )
+        metrics["scheduler/control_context/keys"] = float(len(context_stats))
+        metrics["scheduler/control_context/decisions"] = float(context_decisions)
+        metrics["scheduler/control_context/rollout_updates"] = float(
+            context_rollout_updates
+        )
+        metrics["scheduler/control_context/train_updates"] = float(
+            context_train_updates
+        )
+        metrics["scheduler/control_context/stale_updates"] = float(
+            context_stale_updates
+        )
+        metrics["scheduler/control_context/feedback_updates"] = float(
+            context_feedback_total
+        )
+        metrics["scheduler/control_context/total_objective"] = (
+            context_total_objective
+        )
+        metrics["scheduler/control_context/mean_objective_per_decision"] = (
+            context_total_objective / context_decisions
+            if context_decisions
+            else 0.0
+        )
+        metrics[
+            "scheduler/control_context/mean_objective_per_feedback_update"
+        ] = (
+            context_total_objective / context_feedback_total
+            if context_feedback_total
+            else 0.0
+        )
+        for (
+            action_space_key,
+            family,
+            value,
+            stats,
+            controls,
+        ) in context_stats:
+            prefix = (
+                "scheduler/control_context/"
+                f"{_safe_metric_key(family)}_{value}_action_space_"
+                f"{_safe_metric_key(action_space_key)}"
+            )
+            feedback_updates = context_feedback_updates[
+                (action_space_key, family, value)
+            ]
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                controls,
+                value,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(controls, stats)
             )
             metrics[f"{prefix}/total_objective"] = stats.total_objective
             metrics[f"{prefix}/total_stale_penalty_objective"] = (
@@ -4632,6 +4809,7 @@ class ObjectiveScheduler:
                 for arm_id, value in arm_objectives.items()
             }
         self._credit_train_objective_to_control_family(
+            "cadence",
             self._cadence_controls,
             groups,
             arm_objectives=arm_objectives,
@@ -4642,6 +4820,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_train_objective_to_control_family(
+            "policy_lag",
             self._lag_controls,
             groups,
             arm_objectives=arm_objectives,
@@ -4652,6 +4831,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_train_objective_to_control_family(
+            "admission_delay_ms",
             self._admission_controls,
             groups,
             arm_objectives=arm_objectives,
@@ -4662,6 +4842,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_train_objective_to_control_family(
+            "actor_count",
             self._actor_count_controls,
             groups,
             arm_objectives=arm_objectives,
@@ -4689,6 +4870,7 @@ class ObjectiveScheduler:
 
     def _credit_train_objective_to_control_family(
         self,
+        family: str,
         controls: dict[int, ControlStats],
         groups: Sequence[TrajectoryGroup],
         *,
@@ -4697,6 +4879,7 @@ class ObjectiveScheduler:
         keys: Sequence[str],
     ) -> None:
         value_credit: dict[int, float] = {}
+        scoped_value_credit: dict[tuple[str, int], float] = {}
         for group in groups:
             for trajectory in group.trajectories:
                 value = _first_int_metadata(trajectory.metadata, keys)
@@ -4715,9 +4898,33 @@ class ObjectiveScheduler:
                     / total_arm_weight
                 )
                 value_credit[value] = value_credit.get(value, 0.0) + credit
+                action_space_key = _control_action_space_key_from_metadata(
+                    trajectory.metadata
+                )
+                if action_space_key is not None:
+                    scoped_key = (action_space_key, value)
+                    scoped_value_credit[scoped_key] = (
+                        scoped_value_credit.get(scoped_key, 0.0) + credit
+                    )
 
         for value, credit in value_credit.items():
             stats = controls.setdefault(value, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+        for (action_space_key, value), credit in scoped_value_credit.items():
+            scoped_controls = self._runtime_control_context_family(
+                family,
+                action_space_key,
+                create=True,
+            )
+            if scoped_controls is None:
+                continue
+            stats = scoped_controls.setdefault(value, ControlStats())
             stats.train_updates += 1
             stats.total_objective += credit
             stats.objective_ema = self._ema(
@@ -4989,6 +5196,7 @@ class ObjectiveScheduler:
         stale_experience: float = 0.0,
     ) -> None:
         self._credit_objective_to_control_family(
+            "cadence",
             self._cadence_controls,
             groups,
             objective,
@@ -5000,6 +5208,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_objective_to_control_family(
+            "policy_lag",
             self._lag_controls,
             groups,
             objective,
@@ -5011,6 +5220,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_objective_to_control_family(
+            "admission_delay_ms",
             self._admission_controls,
             groups,
             objective,
@@ -5022,6 +5232,7 @@ class ObjectiveScheduler:
             ),
         )
         self._credit_objective_to_control_family(
+            "actor_count",
             self._actor_count_controls,
             groups,
             objective,
@@ -5187,6 +5398,7 @@ class ObjectiveScheduler:
         objective: float,
     ) -> None:
         self._credit_rollout_objective_to_control_family(
+            "admission_delay_ms",
             self._admission_controls,
             trajectory,
             objective,
@@ -5202,6 +5414,7 @@ class ObjectiveScheduler:
         objective: float,
     ) -> None:
         self._credit_rollout_objective_to_control_family(
+            "actor_count",
             self._actor_count_controls,
             trajectory,
             objective,
@@ -5272,6 +5485,7 @@ class ObjectiveScheduler:
         objective: float,
     ) -> None:
         self._credit_rollout_objective_to_control_family(
+            "cadence",
             self._cadence_controls,
             trajectory,
             objective,
@@ -5287,6 +5501,7 @@ class ObjectiveScheduler:
         objective: float,
     ) -> None:
         self._credit_rollout_objective_to_control_family(
+            "policy_lag",
             self._lag_controls,
             trajectory,
             objective,
@@ -5298,6 +5513,7 @@ class ObjectiveScheduler:
 
     def _credit_rollout_objective_to_control_family(
         self,
+        family: str,
         controls: dict[int, ControlStats],
         trajectory: Trajectory,
         objective: float,
@@ -5318,9 +5534,27 @@ class ObjectiveScheduler:
             objective,
             _control_feedback_updates(stats),
         )
+        action_space_key = _control_action_space_key_from_metadata(
+            trajectory.metadata
+        )
+        scoped_controls = self._runtime_control_context_family(
+            family,
+            action_space_key,
+            create=True,
+        )
+        if scoped_controls is not None:
+            scoped_stats = scoped_controls.setdefault(value, ControlStats())
+            scoped_stats.rollout_updates += 1
+            scoped_stats.total_objective += objective
+            scoped_stats.objective_ema = self._ema(
+                scoped_stats.objective_ema,
+                objective,
+                _control_feedback_updates(scoped_stats),
+            )
 
     def _credit_objective_to_control_family(
         self,
+        family: str,
         controls: dict[int, ControlStats],
         groups: Sequence[TrajectoryGroup],
         objective: float,
@@ -5330,6 +5564,7 @@ class ObjectiveScheduler:
         keys: Sequence[str],
     ) -> None:
         value_weights: dict[int, float] = {}
+        scoped_value_weights: dict[tuple[str, int], float] = {}
         for group in groups:
             for trajectory in group.trajectories:
                 value = _first_int_metadata(trajectory.metadata, keys)
@@ -5341,11 +5576,50 @@ class ObjectiveScheduler:
                 else:
                     weight = max(0.0, trajectory.reward * quality) or quality
                 value_weights[value] = value_weights.get(value, 0.0) + weight
+                action_space_key = _control_action_space_key_from_metadata(
+                    trajectory.metadata
+                )
+                if action_space_key is not None:
+                    scoped_key = (action_space_key, value)
+                    scoped_value_weights[scoped_key] = (
+                        scoped_value_weights.get(scoped_key, 0.0) + weight
+                    )
 
         total_weight = sum(value_weights.values())
         for value, weight in value_weights.items():
             stats = controls.setdefault(value, ControlStats())
             credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
+            stale_credit = (
+                stale_experience * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
+            if stale_feedback:
+                stats.stale_updates += 1
+                stats.stale_experience += stale_credit
+                stats.total_stale_penalty_objective += credit
+            else:
+                stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+        for (action_space_key, value), weight in scoped_value_weights.items():
+            scoped_controls = self._runtime_control_context_family(
+                family,
+                action_space_key,
+                create=True,
+            )
+            if scoped_controls is None:
+                continue
+            stats = scoped_controls.setdefault(value, ControlStats())
+            credit = (
+                objective * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
             stale_credit = (
                 stale_experience * weight / total_weight
                 if total_weight > 0.0
@@ -5491,6 +5765,17 @@ class ObjectiveScheduler:
             if value in controls
         )
 
+    @staticmethod
+    def _control_family_feedback_value_count(
+        controls: Mapping[int, ControlStats],
+        candidates: Sequence[int],
+    ) -> int:
+        return sum(
+            1
+            for value in candidates
+            if value in controls and _control_feedback_updates(controls[value]) > 0
+        )
+
     def _select_control_value(
         self,
         controls: dict[int, ControlStats],
@@ -5498,6 +5783,8 @@ class ObjectiveScheduler:
         *,
         preferred: int,
         joint_scores: Mapping[int, float] | None = None,
+        family: str | None = None,
+        action_space_key: str | None = None,
     ) -> int:
         if not candidates:
             return preferred
@@ -5509,11 +5796,30 @@ class ObjectiveScheduler:
             for value, score in (joint_scores or {}).items()
             if value in candidate_values and math.isfinite(float(score))
         }
+        scoped_controls = (
+            self._runtime_control_context_family(
+                family,
+                action_space_key,
+                create=False,
+            )
+            if family is not None
+            else None
+        )
+        scoring_controls = (
+            scoped_controls
+            if scoped_controls is not None
+            and self._control_family_feedback_value_count(
+                scoped_controls,
+                candidate_values,
+            )
+            >= 2
+            else controls
+        )
         if all(
-            controls.get(value) is None
+            scoring_controls.get(value) is None
             or (
-                controls[value].decisions == 0
-                and _control_feedback_updates(controls[value]) == 0
+                scoring_controls[value].decisions == 0
+                and _control_feedback_updates(scoring_controls[value]) == 0
             )
             for value in candidate_values
         ) and not normalized_joint_scores:
@@ -5521,13 +5827,35 @@ class ObjectiveScheduler:
         return max(
             candidate_values,
             key=lambda value: (
-                self._score_control_value(controls, value)
+                self._score_control_value(scoring_controls, value)
                 + normalized_joint_scores.get(value, 0.0),
                 1 if value == preferred else 0,
                 -abs(value - preferred),
                 -value,
             ),
         )
+
+    def _runtime_control_context_family(
+        self,
+        family: str | None,
+        action_space_key: str | None,
+        *,
+        create: bool,
+    ) -> dict[int, ControlStats] | None:
+        if family is None:
+            return None
+        normalized_action_space_key = _normalize_key_component(action_space_key)
+        if normalized_action_space_key is None:
+            return None
+        if create:
+            return self._runtime_control_contexts.setdefault(
+                normalized_action_space_key,
+                {},
+            ).setdefault(family, {})
+        families = self._runtime_control_contexts.get(normalized_action_space_key)
+        if families is None:
+            return None
+        return families.get(family)
 
     def _score_control_value(
         self,
@@ -5573,6 +5901,24 @@ class ObjectiveScheduler:
         controls.setdefault(value, ControlStats()).decisions += 1
         return value
 
+    def _record_runtime_control_decision(
+        self,
+        family: str,
+        controls: dict[int, ControlStats],
+        value: int,
+        *,
+        action_space_key: str | None = None,
+    ) -> int:
+        self._record_control_decision(controls, value)
+        scoped_controls = self._runtime_control_context_family(
+            family,
+            action_space_key,
+            create=True,
+        )
+        if scoped_controls is not None:
+            self._record_control_decision(scoped_controls, value)
+        return value
+
     def _cancel_control_decision(
         self,
         controls: dict[Any, ControlStats],
@@ -5590,6 +5936,23 @@ class ObjectiveScheduler:
             and stats.stale_experience == 0.0
         ):
             controls.pop(value, None)
+
+    def _cancel_runtime_control_decision(
+        self,
+        family: str,
+        controls: dict[int, ControlStats],
+        value: int,
+        *,
+        action_space_key: str | None = None,
+    ) -> None:
+        self._cancel_control_decision(controls, value)
+        scoped_controls = self._runtime_control_context_family(
+            family,
+            action_space_key,
+            create=False,
+        )
+        if scoped_controls is not None:
+            self._cancel_control_decision(scoped_controls, value)
 
     def _record_arm_decision(
         self,
@@ -6113,6 +6476,18 @@ def _first_text_metadata(
     return None
 
 
+def _control_action_space_key_from_metadata(
+    metadata: Mapping[str, Any],
+) -> str | None:
+    return _first_text_metadata(
+        metadata,
+        (
+            "scheduler/action_space_key",
+            "action_space_key",
+        ),
+    )
+
+
 def _normalize_key_component(value: Any | None) -> str | None:
     if value is None or isinstance(value, bool):
         return None
@@ -6520,6 +6895,27 @@ def _string_control_family_from_state(value: Any) -> dict[str, ControlStats]:
         if key:
             controls[key] = _control_stats_from_state(raw_stats)
     return controls
+
+
+def _runtime_control_contexts_from_state(
+    value: Any,
+) -> dict[str, dict[str, dict[int, ControlStats]]]:
+    contexts: dict[str, dict[str, dict[int, ControlStats]]] = {}
+    for raw_action_space_key, raw_families in _mapping_state(value).items():
+        action_space_key = _normalize_key_component(raw_action_space_key)
+        if action_space_key is None:
+            continue
+        families: dict[str, dict[int, ControlStats]] = {}
+        for raw_family, raw_controls in _mapping_state(raw_families).items():
+            family = _normalize_key_component(raw_family)
+            if family is None:
+                continue
+            controls = _control_family_from_state(raw_controls)
+            if controls:
+                families[family] = controls
+        if families:
+            contexts[action_space_key] = families
+    return contexts
 
 
 def _actor_stats_from_state(value: Any) -> ActorStats:
