@@ -467,6 +467,8 @@ class AdaptiveActionSpace:
     demotion_min_new_logprob_coverage: float = 0.0
     demotion_min_reference_logprob_coverage: float = 0.0
     demotion_min_pulls: int = 2
+    demotion_decision_payoff_threshold: float = 0.0
+    demotion_decision_min_observations: int = 2
     demote_on_stale_feedback: bool = False
     promote_latent_patches: bool = False
     latent_patch_latent_size: int = 8
@@ -476,6 +478,7 @@ class AdaptiveActionSpace:
     _disabled_codec_keys: set[str] = field(default_factory=set, init=False)
     _promotions: int = field(default=0, init=False)
     _demotions: int = field(default=0, init=False)
+    _decision_payoff_demotions: int = field(default=0, init=False)
     _decision_stats: dict[str, "_ActionSpaceDecisionStats"] = field(
         default_factory=dict,
         init=False,
@@ -532,6 +535,10 @@ class AdaptiveActionSpace:
             raise ValueError("demotion_max_reconstruction_drift must be non-negative")
         if self.demotion_min_pulls < 0:
             raise ValueError("demotion_min_pulls must be non-negative")
+        if self.demotion_decision_min_observations <= 0:
+            raise ValueError(
+                "demotion_decision_min_observations must be positive"
+            )
         if self.latent_patch_latent_size <= 0:
             raise ValueError("latent_patch_latent_size must be positive")
         if self.include_token:
@@ -559,11 +566,11 @@ class AdaptiveActionSpace:
         allow_promotions: bool = True,
         allow_demotions: bool = True,
     ) -> None:
+        self._refresh_decision_payoffs(metrics)
         disabled_this_update = (
             self._demote_from_metrics(metrics) if allow_demotions else set()
         )
         if not allow_promotions:
-            self._refresh_decision_payoffs(metrics)
             return
         for codec in tuple(self._codecs):
             if not isinstance(codec, ChunkActionCodec):
@@ -688,7 +695,12 @@ class AdaptiveActionSpace:
             signal = self._codec_signal(codec, metrics)
             if signal.pulls < self.demotion_min_pulls:
                 continue
-            if not self._should_demote(codec, signal, metrics):
+            heuristic_demotion = self._should_demote(codec, signal, metrics)
+            decision_payoff_demotion = self._should_demote_from_decision_payoff(
+                codec,
+                metrics,
+            )
+            if not (heuristic_demotion or decision_payoff_demotion):
                 continue
             for candidate in tuple(self._codecs):
                 if self._should_disable_with(codec, candidate):
@@ -705,6 +717,8 @@ class AdaptiveActionSpace:
                     self._disabled_codec_keys.add(key)
                     disabled.add(key)
                     self._demotions += 1
+                    if decision_payoff_demotion and not heuristic_demotion:
+                        self._decision_payoff_demotions += 1
         return disabled
 
     def _should_demote(
@@ -733,6 +747,31 @@ class AdaptiveActionSpace:
         if self._parent_outperforms(codec, signal, metrics):
             return True
         return signal.objective <= self.demotion_objective_threshold
+
+    def _should_demote_from_decision_payoff(
+        self,
+        codec: ActionCodec,
+        metrics: Mapping[str, float],
+    ) -> bool:
+        parent = self._parent_codec(codec)
+        decision_key = _action_space_decision_key(
+            kind="promotion",
+            codec_key=action_codec_key(codec),
+            parent_key=action_codec_key(parent) if parent is not None else None,
+        )
+        stats = self._decision_stats.get(decision_key)
+        if stats is None or stats.kind != "promotion":
+            return False
+        self._update_decision_payoff(stats, metrics)
+        if (
+            stats.post_decision_observations
+            < self.demotion_decision_min_observations
+        ):
+            return False
+        return (
+            stats.realized_objective_payoff
+            <= self.demotion_decision_payoff_threshold
+        )
 
     def _parent_outperforms(
         self,
@@ -986,6 +1025,12 @@ class AdaptiveActionSpace:
                     self.demotion_min_reference_logprob_coverage
                 ),
                 "demotion_min_pulls": self.demotion_min_pulls,
+                "demotion_decision_payoff_threshold": (
+                    self.demotion_decision_payoff_threshold
+                ),
+                "demotion_decision_min_observations": (
+                    self.demotion_decision_min_observations
+                ),
                 "demote_on_stale_feedback": self.demote_on_stale_feedback,
                 "promote_latent_patches": self.promote_latent_patches,
                 "latent_patch_latent_size": self.latent_patch_latent_size,
@@ -996,6 +1041,7 @@ class AdaptiveActionSpace:
             "learning_state": {
                 "promotions": self._promotions,
                 "demotions": self._demotions,
+                "decision_payoff_demotions": self._decision_payoff_demotions,
             },
             "decision_stats": {
                 key: _action_space_decision_stats_state(stats)
@@ -1104,6 +1150,14 @@ class AdaptiveActionSpace:
             config.get("demotion_min_pulls"),
             self.demotion_min_pulls,
         )
+        self.demotion_decision_payoff_threshold = _state_float(
+            config.get("demotion_decision_payoff_threshold"),
+            self.demotion_decision_payoff_threshold,
+        )
+        self.demotion_decision_min_observations = _state_int(
+            config.get("demotion_decision_min_observations"),
+            self.demotion_decision_min_observations,
+        )
         self.demote_on_stale_feedback = _state_bool(
             config.get("demote_on_stale_feedback"),
             self.demote_on_stale_feedback,
@@ -1167,6 +1221,11 @@ class AdaptiveActionSpace:
         self.demotion_min_reference_logprob_coverage = _clamp_fraction(
             self.demotion_min_reference_logprob_coverage
         )
+        self.demotion_min_pulls = max(0, self.demotion_min_pulls)
+        self.demotion_decision_min_observations = max(
+            1,
+            self.demotion_decision_min_observations,
+        )
         self.latent_patch_latent_size = max(1, self.latent_patch_latent_size)
 
         active_codec_states = state.get("active_codecs")
@@ -1202,6 +1261,10 @@ class AdaptiveActionSpace:
             learning_state.get("demotions"),
             self._demotions,
         )
+        self._decision_payoff_demotions = _state_int(
+            learning_state.get("decision_payoff_demotions"),
+            self._decision_payoff_demotions,
+        )
         self._decision_stats = _action_space_decision_stats_from_state(
             state.get("decision_stats")
         )
@@ -1224,6 +1287,9 @@ class AdaptiveActionSpace:
             "action_space/active_codecs": float(len(self._codecs)),
             "action_space/promotions": float(self._promotions),
             "action_space/demotions": float(self._demotions),
+            "action_space/decision_payoff_demotions": float(
+                self._decision_payoff_demotions
+            ),
             "action_space/disabled_codecs": float(len(self._disabled_codec_keys)),
             "action_space/max_chunk_size": float(self._active_max_chunk_size()),
             "action_space/promotion_min_old_logprob_coverage": (
@@ -1249,6 +1315,12 @@ class AdaptiveActionSpace:
             ),
             "action_space/demotion_parent_source_token_throughput_margin": (
                 self.demotion_parent_source_token_throughput_margin
+            ),
+            "action_space/demotion_decision_payoff_threshold": (
+                self.demotion_decision_payoff_threshold
+            ),
+            "action_space/demotion_decision_min_observations": float(
+                self.demotion_decision_min_observations
             ),
             "action_space/demote_on_stale_feedback": (
                 1.0 if self.demote_on_stale_feedback else 0.0

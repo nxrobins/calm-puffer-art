@@ -967,6 +967,84 @@ class ActionCodecTests(unittest.TestCase):
             4.0,
         )
 
+    def test_adaptive_action_space_demotes_negative_promotion_decision_payoff(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            demotion_objective_threshold=-100.0,
+            demotion_parent_margin=10.0,
+            demotion_decision_min_observations=2,
+        )
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+            }
+        )
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+            }
+        )
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 5.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+            }
+        )
+
+        metrics = action_space.metrics()
+        prefix = (
+            "action_space/decision/"
+            "promotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(metrics["action_space/demotions"], 1.0)
+        self.assertEqual(metrics["action_space/decision_payoff_demotions"], 1.0)
+        self.assertEqual(metrics["action_space/codec/chunk_chunk_size_4/disabled"], 1.0)
+        self.assertEqual(
+            metrics["action_space/demotion_decision_min_observations"],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}/realized_objective_payoff"],
+            -2.0,
+        )
+
     def test_adaptive_action_space_demotes_bad_latent_patch_candidate(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -1117,6 +1195,8 @@ class ActionCodecTests(unittest.TestCase):
             promotion_min_pulls=2,
             promotion_max_reconstruction_drift=0.03,
             demotion_max_reconstruction_drift=0.08,
+            demotion_decision_payoff_threshold=-0.5,
+            demotion_decision_min_observations=3,
             demote_on_stale_feedback=True,
         )
         action_space.update_from_metrics(
@@ -1174,6 +1254,16 @@ class ActionCodecTests(unittest.TestCase):
             0.75,
         )
         self.assertEqual(restored.demotion_max_reconstruction_drift, 0.08)
+        self.assertEqual(restored.demotion_decision_payoff_threshold, -0.5)
+        self.assertEqual(restored.demotion_decision_min_observations, 3)
+        self.assertEqual(
+            metrics["action_space/demotion_decision_payoff_threshold"],
+            -0.5,
+        )
+        self.assertEqual(
+            metrics["action_space/demotion_decision_min_observations"],
+            3.0,
+        )
         self.assertTrue(restored.demote_on_stale_feedback)
         self.assertEqual(metrics["action_space/demote_on_stale_feedback"], 1.0)
         self.assertTrue(restored.promote_latent_patches)
