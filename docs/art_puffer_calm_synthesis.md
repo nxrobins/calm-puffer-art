@@ -71,6 +71,7 @@ The current `ObjectiveScheduler` is the first closed-loop controller:
 - It can resume local runs from a `PolicySnapshot` carrying checkpoint metadata, restoring scheduler/action-space/promotion control state before actor rollout begins and preserving the resumed policy step for staleness checks.
 - The ART bridge can also restore scheduler/action-space control state and the bridge policy step from a saved `PolicySnapshot`, `Checkpoint`, or checkpoint metadata before external rollout producers restart, so the async substrate does not relearn scheduler memory or action-bandwidth promotions after process resume.
 - The ART bridge exposes train-ring stats, wall-clock throughput, submitted train-group cadence, scheduler metrics, and action-space metrics through one `stats()` call, so external ART producers can audit the objective loop without depending on private scheduler state.
+- The ART bridge also reports accepted action units, source tokens, and semantic bandwidth without requiring an attached scheduler, so static ART producer baselines and scheduler-controlled producer pools can be compared on action granularity.
 - The ART bridge stale-checks scheduler-cadenced pending groups before they reach the train ring, so partial ART batches that become too old still fail callers, count sample spend, record rejected rollout feedback when already stale on submit, stamp active cadence/lag controls before rejection or buffering, debit stale feedback, and can run an opt-in demotion-only action-space refresh instead of hiding outside the backpressured queue.
 - The ART bridge synchronous fallback still calls the supplied backend inline with original ART groups, but it now applies the same rollout/sample accounting, active-lag stale rejection, train feedback, action-space refresh, checkpoint metadata, and published-policy telemetry around that direct call.
 - It accepts explicit trainer dollar-second metrics, so train-objective credit can reflect reported GPU/API spend instead of only wall-clock duration times a flat rate.
@@ -171,7 +172,7 @@ Phase 3: CALM action layer
 
 Phase 4: Measurement
 
-- Keep the deterministic static-vs-objective ablations green as local proof that scheduler control, adaptive action-space control, and the combined closed-loop controller improve the north-star on controlled workloads, including learned actor-count, cadence, lag, chunk-granularity, joint-action payoff, and realized action-space payoff together.
+- Keep the deterministic static-vs-objective ablations green as local proof that scheduler control, adaptive action-space control, the combined local closed-loop controller, and the ART-bridge external-producer path improve the north-star on controlled workloads, including learned actor-count, cadence, lag, chunk-granularity, joint-action payoff, and realized action-space payoff together.
 - Benchmark stock ART, ART plus async runtime, and ART plus async runtime plus semantic actions.
 - Report reward-improving experience per dollar-second, not only throughput.
 - Report throughput and utilization next to the objective so rollouts/sec gains are distinguishable from reward-improving experience gains.

@@ -323,6 +323,8 @@ class AsyncArtBackend:
         self._actor_admission_dollar_seconds = 0.0
         self._sample_dollar_seconds = 0.0
         self._failed_rollouts = 0
+        self._action_units = 0
+        self._source_tokens = 0
         self._published_policy_updates = 0
         self._published_policy_improvement = 0.0
         self._published_policy_reward_improving_experience = 0.0
@@ -1129,6 +1131,15 @@ class AsyncArtBackend:
         )
         stats["art_backend/sample_dollar_seconds"] = self._sample_dollar_seconds
         stats["art_backend/failed_rollouts"] = float(self._failed_rollouts)
+        stats["art_backend/action_units"] = float(self._action_units)
+        stats["art_backend/source_tokens"] = float(self._source_tokens)
+        stats["art_backend/action_units_per_s"] = self._action_units / wall_s
+        stats["art_backend/source_tokens_per_s"] = self._source_tokens / wall_s
+        stats["actions/semantic_bandwidth_tokens_per_decision"] = (
+            self._source_tokens / self._action_units
+            if self._action_units
+            else 0.0
+        )
         stats["art_backend/pending_groups"] = float(len(self._pending_groups))
         stats["art_backend/submitted_batches_per_s"] = (
             self._submitted_batches / wall_s
@@ -1379,6 +1390,11 @@ class AsyncArtBackend:
         allow_action_space_promotions: bool = True,
     ) -> None:
         self._sample_dollar_seconds += _groups_sample_dollar_seconds(groups)
+        for group in groups:
+            for trajectory in group.trajectories:
+                if accepted and trajectory.exception is None:
+                    self._action_units += trajectory.action_units
+                    self._source_tokens += trajectory.token_count
         if self.scheduler is None:
             return
         observe_rollout = getattr(self.scheduler, "observe_rollout", None)

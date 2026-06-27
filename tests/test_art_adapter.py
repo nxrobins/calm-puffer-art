@@ -337,6 +337,41 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(credited_lag_updates, [1.0])
         self.assertTrue(backend.closed)
 
+    def test_async_art_backend_reports_semantic_bandwidth_without_scheduler(self):
+        async def run():
+            async_backend = AsyncArtBackend(
+                backend=FakeArtBackend(),
+                config=AsyncArtBackendConfig(synchronous_fallback=True),
+            )
+            art_group = FakeArtGroup(
+                trajectories=[
+                    FakeArtTrajectory(
+                        messages_and_choices=[
+                            FakeChoice(FakeMessage("assistant", "alpha beta")),
+                            FakeChoice(FakeMessage("assistant", "gamma delta")),
+                        ],
+                        reward=1.0,
+                        initial_policy_version=0,
+                        metadata={"scenario_id": "art-task"},
+                    )
+                ],
+                metadata={"scenario_id": "art-task"},
+            )
+
+            await async_backend.train("art-model", [art_group])
+            stats = async_backend.stats()
+            await async_backend.close()
+            return stats
+
+        stats = asyncio.run(run())
+
+        self.assertEqual(stats["art_backend/action_units"], 2.0)
+        self.assertEqual(stats["art_backend/source_tokens"], 4.0)
+        self.assertEqual(
+            stats["actions/semantic_bandwidth_tokens_per_decision"],
+            2.0,
+        )
+
     def test_async_art_backend_snapshots_action_space_state_after_train_feedback(self):
         async def run():
             backend = FakeArtBackend()

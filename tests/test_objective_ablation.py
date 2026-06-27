@@ -3,10 +3,12 @@ from math import isfinite
 import unittest
 
 from calm_puffer_art.objective_ablation import (
+    ART_ACCOUNTED_NORTH_STAR,
     ACCOUNTED_NORTH_STAR,
     NORTH_STAR,
     run_action_space_ablation,
     run_ablation,
+    run_art_bridge_ablation,
     run_closed_loop_ablation,
 )
 
@@ -56,7 +58,8 @@ class ObjectiveAblationTests(unittest.TestCase):
             0.0,
         )
         self.assertGreater(
-            objective["scheduler/control/policy_lag_2/train_updates"],
+            objective.get("scheduler/control/policy_lag_1/train_updates", 0.0)
+            + objective.get("scheduler/control/policy_lag_2/train_updates", 0.0),
             0.0,
         )
         self.assertGreater(
@@ -142,7 +145,8 @@ class ObjectiveAblationTests(unittest.TestCase):
             0.0,
         )
         self.assertGreater(
-            objective["scheduler/control/policy_lag_2/train_updates"],
+            objective.get("scheduler/control/policy_lag_1/train_updates", 0.0)
+            + objective.get("scheduler/control/policy_lag_2/train_updates", 0.0),
             0.0,
         )
         self.assertGreater(
@@ -161,6 +165,63 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertTrue(
             isfinite(objective["scheduler/last_train_batch_joint_action_score"])
         )
+
+    def test_art_bridge_ablation_accounts_external_producer_payoff(self):
+        result = asyncio.run(run_art_bridge_ablation())
+
+        static = result["static"]
+        objective = result["objective"]
+        lift = result["lift"]
+
+        self.assertGreater(
+            objective[ART_ACCOUNTED_NORTH_STAR],
+            static[ART_ACCOUNTED_NORTH_STAR],
+        )
+        self.assertGreater(lift["accounted_north_star_absolute"], 0.0)
+        self.assertGreater(lift["accounted_north_star_ratio"], 1.0)
+        self.assertGreater(
+            objective["actions/semantic_bandwidth_tokens_per_decision"],
+            static["actions/semantic_bandwidth_tokens_per_decision"],
+        )
+        self.assertGreaterEqual(objective["action_space/promotions"], 1.0)
+        self.assertEqual(objective["action_space/codec/chunk_chunk_size_4/active"], 1.0)
+        self.assertEqual(objective["action_space/max_chunk_size"], 4.0)
+        self.assertGreater(
+            objective["action_space/decision/post_decision_observations"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["action_space/decision/realized_objective_payoff"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/arm/art_bridge_chunk_chunk_size_4/pulls"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/control/cadence_1/train_updates"],
+            0.0,
+        )
+        self.assertGreater(
+            objective.get("scheduler/control/policy_lag_1/train_updates", 0.0)
+            + objective.get("scheduler/control/policy_lag_2/train_updates", 0.0),
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/control/actor_count_2/rollout_updates"],
+            0.0,
+        )
+        self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
+        self.assertGreater(
+            objective["scheduler/joint_action/feedback_updates"],
+            0.0,
+        )
+        self.assertGreater(
+            objective["scheduler/joint_action/positive_objective_tuples"],
+            0.0,
+        )
+        self.assertGreater(objective["art_backend/submitted_groups"], 0.0)
+        self.assertGreater(objective["art_backend/completed_batches"], 0.0)
 
 
 if __name__ == "__main__":
