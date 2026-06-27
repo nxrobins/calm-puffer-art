@@ -1,0 +1,3051 @@
+import asyncio
+import time
+import unittest
+from dataclasses import dataclass, replace
+from statistics import fmean
+from typing import Sequence
+
+from calm_puffer_art import (
+    ACTION_SPACE_STATE_KEY,
+    ActionCodec,
+    ActionUnit,
+    AdaptiveActionSpace,
+    ChunkActionCodec,
+    ControlPlane,
+    ControlPlaneConfig,
+    MetricPromotionEvaluator,
+    Message,
+    ObjectiveScheduler,
+    PolicySnapshot,
+    PROMOTION_STATE_KEY,
+    PromotionDecision,
+    RolloutContext,
+    RolloutPromotionEvaluator,
+    SCHEDULER_STATE_KEY,
+    Scenario,
+    TokenActionCodec,
+    TrainResult,
+    Trajectory,
+    TrajectoryGroup,
+    TrajectoryRingBuffer,
+    VersionedTrajectoryBatch,
+    WeightBroadcastChannel,
+    action_space_checkpoint_metadata,
+    action_space_signature,
+    promotion_checkpoint_metadata,
+    restore_control_state,
+    scheduler_checkpoint_metadata,
+    scheduling_action_key,
+    train_result_dollar_seconds,
+)
+from calm_puffer_art.actions import action_codec_key
+from calm_puffer_art.runtime import (
+    PolicyRegistry,
+    RuntimeTelemetry,
+    ScenarioSampler,
+    TrajectoryGrouper,
+    _ActorCapLease,
+)
+
+
+@dataclass(frozen=True)
+class CountingPolicy:
+    level: int
+
+    async def act(
+        self,
+        messages: Sequence[Message],
+        *,
+        scenario: Scenario,
+        codec: ActionCodec,
+    ):
+        target = int(scenario.payload["target"])
+        return codec.encode(f"answer {min(self.level, target)}")
+
+
+class CountingTrainer:
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        rewards = [trajectory.reward for group in groups for trajectory in group.trajectories]
+        next_policy = CountingPolicy(level=current.policy.level + 1)
+        return TrainResult(
+            policy=next_policy,
+            checkpoint_id=f"level-{next_policy.level}",
+            metrics={"train/reward": fmean(rewards), "policy/level": float(next_policy.level)},
+        )
+
+
+class NoopTrainer:
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        rewards = [trajectory.reward for group in groups for trajectory in group.trajectories]
+        return TrainResult(
+            policy=current.policy,
+            checkpoint_id=f"step-{current.step + 1}",
+            metrics={"train/reward": fmean(rewards)},
+        )
+
+
+class CostedTrainer:
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        rewards = [trajectory.reward for group in groups for trajectory in group.trajectories]
+        return TrainResult(
+            policy=current.policy,
+            checkpoint_id=f"step-{current.step + 1}",
+            metrics={
+                "train/reward": fmean(rewards),
+                "train/dollar_seconds": 42.0,
+            },
+        )
+
+
+class FixedCostTrainer:
+    def __init__(self, *, score: float, dollar_seconds: float) -> None:
+        self.score = score
+        self.dollar_seconds = dollar_seconds
+
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        return TrainResult(
+            policy=current.policy,
+            checkpoint_id=f"step-{current.step + 1}",
+            metrics={
+                "train/reward": self.score,
+                "train/dollar_seconds": self.dollar_seconds,
+            },
+        )
+
+
+class SequencedMetricTrainer:
+    def __init__(self, scores: Sequence[float]) -> None:
+        self.scores = tuple(scores)
+        self.calls = 0
+
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        score = self.scores[min(self.calls, len(self.scores) - 1)]
+        self.calls += 1
+        return TrainResult(
+            policy=CountingPolicy(level=current.policy.level + self.calls),
+            checkpoint_id=f"candidate-{self.calls}",
+            metrics={
+                "train/reward": score,
+                "eval/reward": score,
+            },
+        )
+
+
+class FixedCostPromotionEvaluator:
+    def __init__(self, *, score: float, dollar_seconds: float) -> None:
+        self.score = score
+        self.dollar_seconds = dollar_seconds
+
+    async def __call__(
+        self,
+        *,
+        current: PolicySnapshot,
+        result: TrainResult,
+        groups: Sequence[TrajectoryGroup],
+    ) -> PromotionDecision:
+        return PromotionDecision(
+            promoted=True,
+            score=self.score,
+            baseline_score=0.0,
+            improvement=self.score,
+            dollar_seconds=self.dollar_seconds,
+            reason="fixed_cost_eval",
+        )
+
+
+class ActorCapScheduler:
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.calls = []
+
+    def active_actor_count(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.cap
+
+
+class StopImmediatelyScheduler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def should_continue_training(self, **kwargs):
+        self.calls.append(kwargs)
+        return False
+
+
+async def counting_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    messages = [Message(role="user", content=f"target={scenario.payload['target']}")]
+    actions = await policy.act(messages, scenario=scenario, codec=context.action_codec)
+    guess = int(context.action_codec.decode(actions).split()[-1])
+    target = int(scenario.payload["target"])
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=messages,
+        actions=actions,
+        reward=guess / target,
+    )
+
+
+async def costed_counting_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    trajectory = await counting_rollout(policy, scenario, context)
+    trajectory.metrics["eval/dollar_seconds"] = 2.0
+    return trajectory
+
+
+async def adaptive_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    messages = [Message(role="user", content=f"scenario={scenario.id}")]
+    actions = context.action_codec.encode(f"{scenario.id} {context.action_codec.name}")
+    reward = float(scenario.payload.get(context.action_codec.name, 0.0))
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=messages,
+        actions=actions,
+        reward=reward,
+    )
+
+
+async def flat_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    actions = context.action_codec.encode("flat")
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=[Message(role="user", content="flat")],
+        actions=actions,
+        reward=0.0,
+    )
+
+
+async def budget_exhausting_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    trajectory = await flat_rollout(policy, scenario, context)
+    trajectory.metrics["rollout/dollar_seconds"] = 2.0
+    return trajectory
+
+
+async def adaptive_chunk_size_rollout(
+    policy: CountingPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    chunk_size = int(getattr(context.action_codec, "chunk_size", 1))
+    actions = context.action_codec.encode("alpha beta gamma delta")
+    reward = {1: 0.1, 2: 1.0, 4: 1.2}.get(chunk_size, 0.0)
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=[Message(role="user", content="adapt chunks")],
+        actions=actions,
+        reward=reward,
+    )
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_runtime_stamps_joint_scheduling_action_key_on_rollouts(self):
+        scheduler = ObjectiveScheduler(
+            max_policy_lag=3,
+            max_train_batch_groups=2,
+            min_actor_count=1,
+            max_actor_count=2,
+            exploration_bonus=0.0,
+        )
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=2,
+            configured_max_policy_lag=3,
+            active_actor_count=2,
+            rollout_admission_delay_ms=25,
+            action_space_key="runtime-space",
+        )
+        decision = replace(
+            decision,
+            metadata={
+                **decision.metadata,
+                "coverage_control_key": "forced|arm=task_token",
+            },
+        )
+        trajectory = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+        )
+
+        ControlPlane(ControlPlaneConfig())._tag_rollout_control_metadata(
+            trajectory,
+            actor_id=0,
+            decision=decision,
+            active_actor_count=2,
+            admission_delay_s=0.025,
+        )
+
+        self.assertEqual(
+            trajectory.metadata["scheduler/joint_action_key"],
+            scheduling_action_key(
+                arm_id=decision.arm_id,
+                target_train_batch_groups=decision.target_train_batch_groups,
+                max_policy_lag=decision.max_policy_lag,
+                active_actor_count=2,
+                admission_delay_ms=25,
+                action_space_key="runtime-space",
+            ),
+        )
+        self.assertEqual(
+            trajectory.metadata["scheduler/action_space_key"],
+            "runtime_space",
+        )
+        self.assertEqual(
+            trajectory.metadata["scheduler/coverage_control_key"],
+            "forced|arm=task_token",
+        )
+        self.assertIn("scheduler/cadence_response_key", trajectory.metadata)
+        self.assertIn("scheduler/policy_lag_response_key", trajectory.metadata)
+
+    def test_control_plane_passes_action_space_signature_to_scheduler(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                max_train_batch_groups=1,
+                max_policy_lag=1,
+                control_exploration_bonus=0.0,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
+            captured_metadata = []
+
+            async def workflow(policy, scenario, context):
+                captured_metadata.append(dict(context.decision_metadata))
+                return await counting_rollout(policy, scenario, context)
+
+            await ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    max_policy_lag=1,
+                )
+            ).run(
+                scenarios=[Scenario(id="task", payload={"target": 1})],
+                initial_policy=CountingPolicy(level=1),
+                trainer=CountingTrainer(),
+                workflow=workflow,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+            return captured_metadata, expected_signature
+
+        captured_metadata, expected_signature = asyncio.run(run())
+
+        self.assertGreaterEqual(len(captured_metadata), 1)
+        self.assertEqual(captured_metadata[0]["action_space_key"], expected_signature)
+        self.assertIn(
+            f"|action_space={expected_signature}",
+            captured_metadata[0]["joint_action_key"],
+        )
+
+    def test_actor_cap_lease_shares_one_control_decision_per_pool_sweep(self):
+        async def run():
+            lease = _ActorCapLease()
+            calls = 0
+
+            def active_count_factory() -> int:
+                nonlocal calls
+                calls += 1
+                return 2
+
+            first = [
+                await lease.admit(
+                    actor_id=actor_id,
+                    active_count_factory=active_count_factory,
+                )
+                for actor_id in range(4)
+            ]
+            await lease.spend(first[0])
+            second = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            return first, second, calls
+
+        first, second, calls = asyncio.run(run())
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([admission.active_count for admission in first], [2] * 4)
+        self.assertEqual(
+            [admission.admitted for admission in first],
+            [True, True, False, False],
+        )
+        self.assertTrue(second.admitted)
+        self.assertNotEqual(second.lease_id, first[0].lease_id)
+
+    def test_actor_cap_lease_cancels_only_when_no_admitted_work_was_spent(self):
+        async def run():
+            lease = _ActorCapLease()
+
+            def active_count_factory() -> int:
+                return 2
+
+            first = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            second = await lease.admit(
+                actor_id=1,
+                active_count_factory=active_count_factory,
+            )
+            first_cancelled = await lease.release_unspent(first)
+            second_cancelled = await lease.release_unspent(second)
+            replacement = await lease.admit(
+                actor_id=0,
+                active_count_factory=active_count_factory,
+            )
+            return first, replacement, first_cancelled, second_cancelled
+
+        first, replacement, first_cancelled, second_cancelled = asyncio.run(run())
+
+        self.assertFalse(first_cancelled)
+        self.assertTrue(second_cancelled)
+        self.assertNotEqual(replacement.lease_id, first.lease_id)
+
+    def test_control_plane_trains_continuously_and_improves_reward(self):
+        async def run():
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=4,
+                    group_size=2,
+                    train_batch_groups=2,
+                    max_train_steps=4,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[
+                    Scenario(id="a", payload={"target": 4}),
+                    Scenario(id="b", payload={"target": 4}),
+                ],
+                initial_policy=CountingPolicy(level=0),
+                trainer=CountingTrainer(),
+                workflow=counting_rollout,
+                action_codec=ChunkActionCodec(chunk_size=2),
+                weight_channel=channel,
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 4)
+        self.assertEqual(len(summary.checkpoints), 5)
+        self.assertEqual([update.step for update in emitted], [1, 2, 3, 4])
+        self.assertGreater(summary.metrics["reward/delta"], 0.0)
+        self.assertGreater(
+            summary.metrics["north_star/reward_improving_experience_per_dollar_second"],
+            0.0,
+        )
+        self.assertEqual(summary.metrics["data/groups_trained"], 8.0)
+        self.assertEqual(summary.metrics["train_queue/consumed_batches"], 4.0)
+        self.assertEqual(summary.metrics["weights/broadcasts"], 4.0)
+
+    def test_control_plane_wires_objective_scheduler_into_rollouts(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=2,
+                min_policy_lag=1,
+                max_policy_lag=3,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=2,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=3,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[
+                    Scenario(id="easy", payload={"token": 0.1, "chunk": 1.0}),
+                    Scenario(id="hard", payload={"token": 0.0, "chunk": 0.2}),
+                ],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=adaptive_rollout,
+                action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
+                scheduler=scheduler,
+                weight_channel=channel,
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+        arm_metric = "scheduler/arm/easy_chunk_chunk_size_2/pulls"
+
+        self.assertEqual(summary.latest_step, 5)
+        self.assertIn("scheduler/global_marginal_objective_ema", summary.metrics)
+        self.assertIn(arm_metric, summary.metrics)
+        self.assertGreater(summary.metrics[arm_metric], 1.0)
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/last_target_train_batch_groups"],
+            1.0,
+        )
+        self.assertLessEqual(
+            summary.metrics["scheduler/last_target_train_batch_groups"],
+            2.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/last_max_policy_lag"],
+            1.0,
+        )
+        self.assertLessEqual(
+            summary.metrics["scheduler/last_max_policy_lag"],
+            3.0,
+        )
+        cadence_credit = [
+            value
+            for key, value in summary.metrics.items()
+            if key.startswith("scheduler/control/cadence_")
+            and key.endswith("/train_updates")
+        ]
+        lag_credit = [
+            value
+            for key, value in summary.metrics.items()
+            if key.startswith("scheduler/control/policy_lag_")
+            and key.endswith("/train_updates")
+        ]
+        actor_count_credit = [
+            value
+            for key, value in summary.metrics.items()
+            if key.startswith("scheduler/control/actor_count_")
+            and key.endswith("/rollout_updates")
+        ]
+        self.assertTrue(any(value > 0.0 for value in cadence_credit))
+        self.assertTrue(any(value > 0.0 for value in lag_credit))
+        self.assertTrue(any(value > 0.0 for value in actor_count_credit))
+        scheduler_state = summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY]
+        self.assertEqual(scheduler_state["version"], 1)
+        self.assertIn("easy|chunk(chunk_size=2)", scheduler_state["arms"])
+        self.assertGreater(
+            scheduler_state["learning_state"]["train_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            emitted[-1].metadata[SCHEDULER_STATE_KEY]["learning_state"][
+                "total_pulls"
+            ],
+            scheduler_state["learning_state"]["total_pulls"],
+        )
+
+    def test_control_plane_promotion_gate_rejects_unimproved_candidate(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            trainer = SequencedMetricTrainer([0.1, 1.0])
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=trainer,
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                weight_channel=channel,
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(summary.metrics["data/train_steps"], 2.0)
+        self.assertEqual(summary.metrics["data/checkpoints_promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(summary.metrics["promotion/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/rejected"], 1.0)
+        self.assertEqual(summary.metrics["promotion/published_policy_updates"], 1.0)
+        self.assertEqual(
+            summary.metrics["promotion/published_policy_improvement"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/published_policy_reward_improving_experience"
+            ],
+            1.0,
+        )
+        self.assertEqual(summary.metrics["promotion/decision/keys"], 2.0)
+        self.assertEqual(summary.metrics["promotion/decision/decisions"], 2.0)
+        self.assertEqual(summary.metrics["promotion/decision/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/decision/rejected"], 1.0)
+        self.assertEqual(
+            summary.metrics["promotion/decision/positive_reward_improving_keys"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["promotion/decision/total_candidate_improvement"],
+            1.1,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/total_published_policy_improvement"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/realized_reward_improving_experience"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/"
+                "mean_realized_reward_improving_experience_per_decision"
+            ],
+            0.5,
+        )
+        reject_prefix = (
+            "promotion/decision/"
+            "action_reject_reason_metric_below_promotion_threshold"
+        )
+        promote_prefix = (
+            "promotion/decision/action_promote_reason_metric_improved"
+        )
+        self.assertEqual(summary.metrics[f"{reject_prefix}/decisions"], 1.0)
+        self.assertEqual(summary.metrics[f"{reject_prefix}/rejected"], 1.0)
+        self.assertAlmostEqual(
+            summary.metrics[f"{reject_prefix}/total_candidate_improvement"],
+            0.1,
+        )
+        self.assertEqual(
+            summary.metrics[f"{reject_prefix}/realized_reward_improving_experience"],
+            0.0,
+        )
+        self.assertEqual(summary.metrics[f"{promote_prefix}/decisions"], 1.0)
+        self.assertEqual(summary.metrics[f"{promote_prefix}/promoted"], 1.0)
+        self.assertEqual(
+            summary.metrics[f"{promote_prefix}/realized_reward_improving_experience"],
+            1.0,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "north_star/published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+        self.assertEqual(summary.metrics["weights/broadcasts"], 1.0)
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(len(summary.checkpoints), 2)
+        self.assertEqual([update.step for update in emitted], [1])
+        self.assertEqual(summary.checkpoints[-1].checkpoint_id, "candidate-2")
+        self.assertTrue(summary.checkpoints[-1].metadata["promotion/promoted"])
+        self.assertEqual(
+            summary.checkpoints[-1].metadata["promotion/reason"],
+            "metric_improved",
+        )
+        decision_state = summary.checkpoints[-1].metadata[PROMOTION_STATE_KEY][
+            "decision_stats"
+        ]
+        self.assertEqual(
+            decision_state[
+                "action=reject|reason=metric_below_promotion_threshold"
+            ]["decisions"],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=reject|reason=metric_below_promotion_threshold"][
+                "rejected"
+            ],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=promote|reason=metric_improved"]["decisions"],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=promote|reason=metric_improved"][
+                "total_reward_improving_experience"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/train_last_reward_improvement"],
+            1.0,
+        )
+
+    def test_control_plane_resumes_promotion_evaluator_state(self):
+        async def first_run():
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=SequencedMetricTrainer([1.0]),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+
+        async def second_run(snapshot):
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=snapshot,
+                trainer=SequencedMetricTrainer([1.2]),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                weight_channel=channel,
+                promotion_evaluator=MetricPromotionEvaluator(
+                    metric_key="eval/reward",
+                    min_delta=0.5,
+                    initial_score=0.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        first = asyncio.run(first_run())
+        promotion_state = first.checkpoints[-1].metadata[PROMOTION_STATE_KEY]
+        snapshot = PolicySnapshot(
+            step=first.latest_step,
+            policy=CountingPolicy(level=1),
+            checkpoint_id=first.checkpoints[-1].checkpoint_id,
+            created_at=first.checkpoints[-1].created_at,
+            metadata=first.checkpoints[-1].metadata,
+        )
+        second, emitted = asyncio.run(second_run(snapshot))
+
+        self.assertEqual(promotion_state["learning_state"]["best_score"], 1.0)
+        self.assertEqual(second.latest_step, 1)
+        self.assertEqual(len(second.checkpoints), 1)
+        self.assertEqual(emitted, [])
+        self.assertEqual(second.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(second.metrics["promotion/rejected"], 2.0)
+        self.assertEqual(second.metrics["promotion/promoted"], 0.0)
+        self.assertEqual(second.metrics["promotion/published_policy_updates"], 0.0)
+        self.assertEqual(
+            second.metrics["promotion/published_policy_reward_improving_experience"],
+            0.0,
+        )
+        self.assertEqual(
+            second.metrics[
+                "north_star/published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+        self.assertEqual(second.metrics["promotion/latest_baseline_score"], 1.0)
+        self.assertEqual(second.metrics["promotion/latest_score"], 1.2)
+
+    def test_control_plane_rollout_promotion_evaluator_scores_heldout_workflow(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            trainer = SequencedMetricTrainer([0.0, 0.0])
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=2,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="train-flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=trainer,
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                weight_channel=channel,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldout", payload={"target": 2})],
+                    workflow=costed_counting_rollout,
+                    action_codec=TokenActionCodec(),
+                    min_delta=0.75,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(summary.metrics["data/train_steps"], 2.0)
+        self.assertEqual(summary.metrics["data/checkpoints_promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/evaluations"], 2.0)
+        self.assertEqual(summary.metrics["promotion/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/rejected"], 1.0)
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(len(summary.checkpoints), 2)
+        self.assertEqual([update.step for update in emitted], [1])
+        self.assertEqual(summary.checkpoints[-1].checkpoint_id, "candidate-2")
+        self.assertEqual(
+            summary.checkpoints[-1].metrics["promotion/eval/reward_mean"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.checkpoints[-1].metadata["promotion/reason"],
+            "eval_improved",
+        )
+        self.assertGreater(
+            summary.metrics["costs/promotion_eval_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 4.0)
+        self.assertEqual(summary.metrics["scheduler/arm/heldout_token/pulls"], 2.0)
+        self.assertEqual(summary.metrics["scheduler/arm/heldout_token/accepted"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldout_token/rollout_dollar_seconds"],
+            4.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/train_last_reward_improvement"],
+            1.0,
+        )
+
+    def test_promotion_rollout_feedback_can_promote_action_space(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=0,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                promotion_min_pulls=1,
+                demotion_min_pulls=999,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+
+            summary = await runtime.run(
+                scenarios=[Scenario(id="train-flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=flat_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldout-adapt")],
+                    workflow=adaptive_chunk_size_rollout,
+                    action_codec=ChunkActionCodec(chunk_size=2),
+                    min_delta=0.0,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldout_adapt_chunk_chunk_size_2/pulls"],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertEqual(summary.metrics["action_space/promotions"], 1.0)
+
+    def test_control_plane_promotes_adaptive_action_space_codecs(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=999,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=8,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            channel = WeightBroadcastChannel()
+            updates = channel.subscribe()
+            summary = await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=adaptive_chunk_size_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+                weight_channel=channel,
+            )
+            emitted = []
+            while not updates.empty():
+                emitted.append(updates.get_nowait())
+            return summary, emitted
+
+        summary, emitted = asyncio.run(run())
+
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertGreaterEqual(summary.metrics["action_space/promotions"], 1.0)
+        promotion_prefix = (
+            "action_space/decision/"
+            "promotion_chunk_chunk_size_4_from_chunk_chunk_size_2"
+        )
+        self.assertIn(f"{promotion_prefix}/estimated_objective_payoff", summary.metrics)
+        self.assertIn("scheduler/arm/adapt_chunk_chunk_size_4/pulls", summary.metrics)
+        action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
+        self.assertEqual(action_space_state["version"], 1)
+        self.assertIn("decision_stats", action_space_state)
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [codec["key"] for codec in action_space_state["active_codecs"]],
+        )
+        self.assertEqual(
+            emitted[-1].metadata[ACTION_SPACE_STATE_KEY]["learning_state"][
+                "promotions"
+            ],
+            action_space_state["learning_state"]["promotions"],
+        )
+
+    def test_control_plane_promotes_action_codecs_from_rollout_feedback(self):
+        async def run():
+            saw_chunk4 = asyncio.Event()
+
+            class WaitingTrainer:
+                async def train(
+                    self,
+                    current: PolicySnapshot,
+                    groups: Sequence[TrajectoryGroup],
+                ) -> TrainResult:
+                    try:
+                        await asyncio.wait_for(saw_chunk4.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    rewards = [
+                        trajectory.reward
+                        for group in groups
+                        for trajectory in group.trajectories
+                    ]
+                    return TrainResult(
+                        policy=current.policy,
+                        checkpoint_id=f"step-{current.step + 1}",
+                        metrics={"train/reward": fmean(rewards)},
+                    )
+
+            async def rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                chunk_size = int(getattr(context.action_codec, "chunk_size", 1))
+                if chunk_size == 4:
+                    saw_chunk4.set()
+                actions = context.action_codec.encode("alpha beta gamma delta")
+                reward = {1: 0.1, 2: 1.0, 4: 1.2}.get(chunk_size, 0.0)
+                return Trajectory(
+                    scenario_id=scenario.id,
+                    policy_step=context.policy_step,
+                    messages=[Message(role="user", content="adapt chunks")],
+                    actions=actions,
+                    reward=reward,
+                )
+
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=999,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=3,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=WaitingTrainer(),
+                workflow=rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+            return saw_chunk4.is_set(), summary
+
+        saw_chunk4, summary = asyncio.run(run())
+
+        self.assertTrue(saw_chunk4)
+        self.assertIn("scheduler/arm/adapt_chunk_chunk_size_4/pulls", summary.metrics)
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+
+    def test_control_plane_demotes_promoted_chunk_when_parent_has_better_objective(self):
+        async def low_value_promoted_chunk_rollout(
+            policy: CountingPolicy,
+            scenario: Scenario,
+            context: RolloutContext,
+        ) -> Trajectory:
+            chunk_size = int(getattr(context.action_codec, "chunk_size", 1))
+            actions = context.action_codec.encode("alpha beta gamma delta")
+            reward = {1: 0.1, 2: 1.0, 4: 0.6}.get(chunk_size, 0.0)
+            return Trajectory(
+                scenario_id=scenario.id,
+                policy_step=context.policy_step,
+                messages=[Message(role="user", content="adapt chunks")],
+                actions=actions,
+                reward=reward,
+            )
+
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_parent_margin=0.0,
+                demotion_min_pulls=1,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=14,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=low_value_promoted_chunk_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            summary.metrics,
+        )
+        self.assertGreaterEqual(summary.metrics["action_space/promotions"], 1.0)
+        self.assertEqual(summary.metrics["action_space/demotions"], 1.0)
+        action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            action_space_state["disabled_codec_keys"],
+        )
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [codec["key"] for codec in action_space_state["active_codecs"]],
+        )
+
+    def test_control_plane_promotes_and_demotes_latent_patch_candidate(self):
+        async def low_value_latent_rollout(
+            policy: CountingPolicy,
+            scenario: Scenario,
+            context: RolloutContext,
+        ) -> Trajectory:
+            name = getattr(context.action_codec, "name", "")
+            reward = 0.2 if name == "latent_patch" else 1.0 if name == "chunk" else 0.1
+            return Trajectory(
+                scenario_id=scenario.id,
+                policy_step=context.policy_step,
+                messages=[Message(role="user", content="adapt latent patches")],
+                actions=context.action_codec.encode("alpha beta gamma delta"),
+                reward=reward,
+            )
+
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=2,
+                exploration_bonus=0.0,
+            )
+            action_space = AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=2,
+                promote_latent_patches=True,
+                latent_patch_latent_size=3,
+                demotion_parent_margin=0.0,
+                demotion_min_pulls=1,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=14,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=NoopTrainer(),
+                workflow=low_value_latent_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        latent_metric_key = "latent_patch_latent_size_3_patch_size_2"
+        self.assertEqual(summary.metrics["action_space/promotions"], 1.0)
+        self.assertEqual(summary.metrics["action_space/demotions"], 1.0)
+        self.assertEqual(
+            summary.metrics[f"action_space/codec/{latent_metric_key}/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            f"action_space/codec/{latent_metric_key}/active",
+            summary.metrics,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            summary.metrics,
+        )
+        self.assertGreater(
+            summary.metrics[
+                "scheduler/arm/adapt_latent_patch_latent_size_3_patch_size_2/pulls"
+            ],
+            0.0,
+        )
+        action_space_state = summary.checkpoints[-1].metadata[ACTION_SPACE_STATE_KEY]
+        self.assertIn(
+            "latent_patch(latent_size=3,patch_size=2)",
+            action_space_state["disabled_codec_keys"],
+        )
+
+    def test_restore_control_state_loads_scheduler_and_action_space_metadata(self):
+        source_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        source_scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="resume",
+                policy_step=3,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={"scheduler/arm_id": "resume|chunk(chunk_size=4)"},
+            ),
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        source_action_space = AdaptiveActionSpace(
+            min_chunk_size=4,
+            max_chunk_size=4,
+            include_token=False,
+        )
+        source_promotion = MetricPromotionEvaluator(
+            metric_key="eval/reward",
+            min_delta=0.5,
+            initial_score=0.0,
+        )
+        source_promotion.best_score = 2.0
+        metadata = {
+            **scheduler_checkpoint_metadata(source_scheduler),
+            **action_space_checkpoint_metadata(source_action_space),
+            **promotion_checkpoint_metadata(
+                source_promotion,
+                decision_stats={
+                    "action=promote|reason=metric_improved": {
+                        "decisions": 2,
+                    },
+                },
+            ),
+        }
+        restored_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        restored_action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+        restored_promotion = MetricPromotionEvaluator(
+            metric_key="train/reward",
+            min_delta=0.0,
+            initial_score=0.0,
+        )
+
+        restored = restore_control_state(
+            {"metadata": metadata},
+            scheduler=restored_scheduler,
+            action_space=restored_action_space,
+            promotion_evaluator=restored_promotion,
+        )
+
+        self.assertEqual(
+            restored,
+            {"scheduler": True, "action_space": True, "promotion": True},
+        )
+        self.assertEqual(
+            restored_scheduler.metrics()["scheduler/total_rollout_observations"],
+            1.0,
+        )
+        self.assertEqual(restored_action_space.min_chunk_size, 4)
+        self.assertEqual(
+            [action_codec_key(codec) for codec in restored_action_space.codecs],
+            ["chunk(chunk_size=4)"],
+        )
+        self.assertEqual(restored_promotion.metric_key, "eval/reward")
+        self.assertEqual(restored_promotion.min_delta, 0.5)
+        self.assertEqual(restored_promotion.best_score, 2.0)
+        self.assertEqual(
+            metadata[PROMOTION_STATE_KEY]["decision_stats"][
+                "action=promote|reason=metric_improved"
+            ]["decisions"],
+            2,
+        )
+
+    def test_control_plane_resumes_from_policy_snapshot_control_state(self):
+        async def run():
+            source_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            source_scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="adapt",
+                    policy_step=7,
+                    messages=[],
+                    actions=[],
+                    reward=1.2,
+                    metadata={"scheduler/arm_id": "adapt|chunk(chunk_size=4)"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            source_action_space = AdaptiveActionSpace(
+                min_chunk_size=4,
+                max_chunk_size=4,
+                include_token=False,
+            )
+            metadata = {
+                **scheduler_checkpoint_metadata(source_scheduler),
+                **action_space_checkpoint_metadata(source_action_space),
+            }
+            scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            snapshot = PolicySnapshot(
+                step=7,
+                policy=CountingPolicy(level=1),
+                checkpoint_id="resume-7",
+                created_at=1.0,
+                metadata=metadata,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=8,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=2,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="adapt")],
+                initial_policy=snapshot,
+                trainer=NoopTrainer(),
+                workflow=adaptive_chunk_size_rollout,
+                action_space=action_space,
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.checkpoints[0].step, 7)
+        self.assertEqual(summary.checkpoints[0].checkpoint_id, "resume-7")
+        self.assertEqual(summary.latest_step, 8)
+        self.assertEqual(
+            summary.metrics["action_space/codec/chunk_chunk_size_4/active"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_2/active",
+            summary.metrics,
+        )
+        self.assertGreater(
+            summary.metrics["scheduler/total_rollout_decisions"],
+            1.0,
+        )
+        self.assertIn(SCHEDULER_STATE_KEY, summary.checkpoints[-1].metadata)
+        self.assertIn(ACTION_SPACE_STATE_KEY, summary.checkpoints[-1].metadata)
+
+    def test_control_plane_stops_early_when_scheduler_roi_is_exhausted(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                min_train_steps=1,
+                roi_patience=1,
+                min_train_objective=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="flat")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertLess(summary.latest_step, 5)
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+
+    def test_control_plane_stops_when_scheduler_accounted_budget_is_exhausted(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=4.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await runtime.run(
+                scenarios=[Scenario(id="budgeted")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=FixedCostTrainer(score=0.0, dollar_seconds=5.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/max_accounted_dollar_seconds"],
+            4.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_exhausted"],
+            1.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            5.0,
+        )
+
+    def test_control_plane_cancels_selection_when_rollout_reservation_exceeds_budget(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=3.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budgeted",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budgeted|token"},
+                ),
+                accepted=True,
+                dollar_seconds=2.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            workflow_calls = 0
+
+            async def workflow(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                return await budget_exhausting_rollout(policy, scenario, context)
+
+            summary = await runtime.run(
+                scenarios=[Scenario(id="budgeted")],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=workflow,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+            return summary, workflow_calls
+
+        summary, workflow_calls = asyncio.run(run())
+
+        self.assertEqual(workflow_calls, 0)
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/total_rollout_decisions"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/total_inflight_rollouts"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "scheduler/budget/reserved_inflight_rollout_dollar_seconds"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/projected_accounted_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/cadence_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/policy_lag_1/decisions", 0.0),
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics.get("scheduler/control/actor_count_1/decisions", 0.0),
+            0.0,
+        )
+        self.assertEqual(summary.metrics["scheduler/admission/decisions"], 0.0)
+        self.assertEqual(
+            summary.metrics.get(
+                "scheduler/control/admission_delay_ms_0/decisions",
+                0.0,
+            ),
+            0.0,
+        )
+
+    def test_actor_loop_stops_before_rollout_when_scheduler_stops(self):
+        async def run():
+            scheduler = StopImmediatelyScheduler()
+            action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
+            expected_signature = action_space_signature(action_space)
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=1,
+                    train_queue_capacity=1,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            stop = asyncio.Event()
+            workflow_calls = 0
+
+            async def workflow(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                return await flat_rollout(policy, scenario, context)
+
+            await asyncio.wait_for(
+                runtime._actor_loop(
+                    actor_id=0,
+                    stop=stop,
+                    registry=PolicyRegistry(CountingPolicy(level=0)),
+                    sampler=ScenarioSampler([Scenario(id="stop")]),
+                    scenarios=(Scenario(id="stop"),),
+                    workflow=workflow,
+                    action_codecs=(TokenActionCodec(),),
+                    action_space=action_space,
+                    trajectory_queue=asyncio.Queue(maxsize=1),
+                    telemetry=RuntimeTelemetry(cost_per_second_usd=1.0),
+                    train_ring=TrajectoryRingBuffer(capacity=1, max_policy_lag=1),
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+            return stop.is_set(), workflow_calls, scheduler.calls, expected_signature
+
+        stopped, workflow_calls, calls, expected_signature = asyncio.run(run())
+
+        self.assertTrue(stopped)
+        self.assertEqual(workflow_calls, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["policy_step"], 0)
+        self.assertEqual(calls[0]["pending_train_batches"], 0)
+        self.assertEqual(calls[0]["action_space_key"], expected_signature)
+
+    def test_control_plane_stops_rollout_production_when_rollout_budget_is_exhausted(
+        self,
+    ):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=2,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            return await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="budgeted-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=budget_exhausting_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(summary.metrics["data/trajectories_seen"], 1.0)
+        self.assertEqual(summary.metrics["scheduler/stop_recommended"], 1.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_exhausted"],
+            1.0,
+        )
+        self.assertEqual(summary.pending_trajectories, 1)
+
+    def test_control_plane_counts_inflight_reservations_before_parallel_rollouts(
+        self,
+    ):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=3.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="budgeted-rollout",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "budgeted-rollout|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=4,
+                    group_size=3,
+                    train_batch_groups=1,
+                    max_train_steps=5,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            workflow_calls = 0
+
+            async def slow_budgeted_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal workflow_calls
+                workflow_calls += 1
+                await asyncio.sleep(0.01)
+                trajectory = await flat_rollout(policy, scenario, context)
+                trajectory.metrics["rollout/dollar_seconds"] = 1.0
+                return trajectory
+
+            summary = await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="budgeted-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=slow_budgeted_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+            return summary, workflow_calls
+
+        summary, workflow_calls = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 0)
+        self.assertEqual(workflow_calls, 2)
+        self.assertEqual(summary.metrics["data/trajectories_seen"], 2.0)
+        self.assertEqual(summary.metrics["scheduler/total_rollout_decisions"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/total_rollout_observations"],
+            3.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(summary.metrics["scheduler/budget/accounted_exhausted"], 1.0)
+        self.assertEqual(summary.pending_trajectories, 2)
+
+    def test_control_plane_accounts_cancelled_inflight_rollouts_on_shutdown(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_actor_count=2,
+                max_actor_count=2,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+                max_accounted_dollar_seconds=10.0,
+            )
+            scheduler.observe_rollout(
+                Trajectory(
+                    scenario_id="cancelled-rollout",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=1.0,
+                    metadata={"scheduler/arm_id": "cancelled-rollout|token"},
+                ),
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=2,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            slow_started = asyncio.Event()
+            never_finish = asyncio.Event()
+            fast_calls = 0
+
+            async def rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                nonlocal fast_calls
+                if context.actor_id == 1:
+                    slow_started.set()
+                    await never_finish.wait()
+                fast_calls += 1
+                if fast_calls > 1:
+                    await never_finish.wait()
+                await asyncio.wait_for(slow_started.wait(), timeout=0.5)
+                trajectory = await flat_rollout(policy, scenario, context)
+                trajectory.metrics["rollout/dollar_seconds"] = 1.0
+                return trajectory
+
+            return await asyncio.wait_for(
+                runtime.run(
+                    scenarios=[Scenario(id="cancelled-rollout")],
+                    initial_policy=CountingPolicy(level=0),
+                    trainer=NoopTrainer(),
+                    workflow=rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=1.0,
+            )
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertGreaterEqual(summary.metrics["data/trajectories_failed"], 1.0)
+        self.assertGreaterEqual(summary.metrics["scheduler/failure_rollouts"], 1.0)
+        self.assertEqual(summary.metrics["scheduler/total_inflight_rollouts"], 0.0)
+        self.assertEqual(
+            summary.metrics["scheduler/budget/reserved_inflight_rollout_dollar_seconds"],
+            0.0,
+        )
+        self.assertGreaterEqual(
+            summary.metrics["scheduler/budget/accounted_dollar_seconds"],
+            3.0,
+        )
+
+    def test_control_plane_uses_explicit_train_dollar_seconds(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1000.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="costed")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=CostedTrainer(),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 42.0)
+        expected_scheduler_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
+            summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY][
+                "learning_state"
+            ]["train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+
+    def test_scheduler_train_objective_includes_promotion_eval_cost(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="costed-promotion")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=FixedCostTrainer(score=1.0, dollar_seconds=2.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                promotion_evaluator=FixedCostPromotionEvaluator(
+                    score=1.0,
+                    dollar_seconds=8.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 8.0)
+        self.assertEqual(
+            summary.metrics["promotion/decision/total_dollar_seconds"],
+            8.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/"
+                "realized_reward_improving_experience_per_dollar_second"
+            ],
+            0.125,
+        )
+        expected_scheduler_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/promotion_eval_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/train_last_objective"],
+            1.0 / expected_scheduler_cost,
+        )
+        self.assertAlmostEqual(
+            summary.checkpoints[-1].metadata[SCHEDULER_STATE_KEY][
+                "learning_state"
+            ]["train_dollar_seconds"],
+            expected_scheduler_cost,
+        )
+
+    def test_scheduler_does_not_double_count_rollout_promotion_eval_cost(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=1,
+                max_policy_lag=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=1,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=4,
+                    train_queue_capacity=2,
+                    max_policy_lag=1,
+                    cost_per_second_usd=1.0,
+                )
+            )
+            summary = await runtime.run(
+                scenarios=[Scenario(id="rollout-promotion")],
+                initial_policy=CountingPolicy(level=1),
+                trainer=FixedCostTrainer(score=1.0, dollar_seconds=2.0),
+                workflow=flat_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+                promotion_evaluator=RolloutPromotionEvaluator(
+                    scenarios=[Scenario(id="heldoutcosted", payload={"target": 1})],
+                    workflow=costed_counting_rollout,
+                    action_codec=TokenActionCodec(),
+                    min_delta=0.0,
+                    initial_score=0.0,
+                    cost_per_second_usd=1.0,
+                ),
+            )
+            return summary
+
+        summary = asyncio.run(run())
+
+        self.assertEqual(summary.latest_step, 1)
+        self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
+        self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 2.0)
+        self.assertEqual(
+            summary.metrics["scheduler/arm/heldoutcosted_token/rollout_dollar_seconds"],
+            2.0,
+        )
+        expected_train_cost = (
+            summary.metrics["costs/trainer_dollar_seconds"]
+            + summary.metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/costs/train_dollar_seconds"],
+            expected_train_cost,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["scheduler/train_last_objective"],
+            1.0 / expected_train_cost,
+        )
+
+    def test_grouper_drops_trajectories_that_exceed_policy_lag(self):
+        grouper = TrajectoryGrouper(group_size=2)
+        stale = Trajectory(
+            scenario_id="s",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+        )
+        fresh = Trajectory(
+            scenario_id="s",
+            policy_step=3,
+            messages=[],
+            actions=[],
+            reward=1.0,
+        )
+
+        stale_result = grouper.add(stale, latest_step=3, max_policy_lag=1)
+        first_fresh = grouper.add(fresh, latest_step=3, max_policy_lag=1)
+        second_fresh = grouper.add(fresh, latest_step=3, max_policy_lag=1)
+
+        self.assertFalse(stale_result.accepted)
+        self.assertTrue(first_fresh.accepted)
+        self.assertEqual(grouper.stale_dropped, 1)
+        self.assertEqual(len(second_fresh.groups), 1)
+
+    def test_runtime_telemetry_uses_effective_reward_for_unsafe_actions(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=1.0)
+        telemetry.record_trajectory(
+            Trajectory(
+                scenario_id="unsafe",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=10.0,
+                metadata={"action/safe": False, "action/quality": 0.0},
+            ),
+            accepted=True,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["actions/quality_mean"], 0.0)
+        self.assertEqual(metrics["data/unsafe_trajectories"], 1.0)
+        self.assertEqual(metrics["reward/last_window_mean"], 0.0)
+
+    def test_runtime_telemetry_reports_action_logprob_contract(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=1.0)
+        telemetry.record_trajectory(
+            Trajectory(
+                scenario_id="prob",
+                policy_step=0,
+                messages=[],
+                actions=[
+                    ActionUnit(
+                        kind="latent_patch",
+                        payload=(0.1, 0.2),
+                        token_count=2,
+                        old_logprob=-2.0,
+                        new_logprob=-1.5,
+                        reference_logprob=-2.25,
+                    ),
+                    ActionUnit(kind="latent_patch", payload=(0.3, 0.4), token_count=2),
+                ],
+                reward=1.0,
+            ),
+            accepted=True,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["actions/old_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/new_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/reference_logprob_coverage"], 0.5)
+        self.assertEqual(metrics["actions/old_new_logprob_delta_mean"], 0.5)
+        self.assertEqual(metrics["actions/old_new_logprob_abs_delta_mean"], 0.5)
+        self.assertEqual(
+            metrics["actions/old_reference_logprob_delta_mean"],
+            0.25,
+        )
+        self.assertGreater(metrics["actions/importance_ratio_mean"], 1.0)
+
+    def test_runtime_telemetry_attributes_accounted_costs(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=2.0)
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=0.0,
+            duration_s=2.0,
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+
+        telemetry.record_actor_queue_wait(1.0)
+        telemetry.record_trajectory(trajectory, accepted=True)
+        telemetry.record_train(
+            [TrajectoryGroup(scenario_id="costed", trajectories=(trajectory,))],
+            TrainResult(metrics={"train/reward": 0.0}),
+            duration_s=3.0,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/rollout_s"], 2.0)
+        self.assertEqual(metrics["costs/rollout_dollar_seconds"], 4.0)
+        self.assertEqual(metrics["costs/trainer_dollar_seconds"], 6.0)
+        self.assertEqual(metrics["costs/actor_queue_wait_dollar_seconds"], 2.0)
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 12.0)
+        self.assertIn(
+            "north_star/accounted_reward_improving_experience_per_dollar_second",
+            metrics,
+        )
+
+    def test_control_plane_reconciles_accounted_summary_with_scheduler_total(self):
+        metrics = {
+            "time/wall_clock_s": 2.0,
+            "costs/accounted_dollar_seconds": 4.0,
+            "throughput/accounted_dollar_seconds_per_s": 2.0,
+            "reward/delta": 3.0,
+            "data/trajectories_accepted": 4.0,
+            "promotion/published_policy_reward_improving_experience": 5.0,
+            "north_star/accounted_reward_improving_experience_per_dollar_second": 3.0,
+            "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second": 1.25,
+        }
+
+        ControlPlane._merge_scheduler_accounted_metrics(
+            metrics,
+            {"scheduler/costs/total_dollar_seconds": 10.0},
+        )
+
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+        self.assertEqual(metrics["throughput/accounted_dollar_seconds_per_s"], 5.0)
+        self.assertEqual(
+            metrics[
+                "north_star/accounted_reward_improving_experience_per_dollar_second"
+            ],
+            1.2,
+        )
+        self.assertEqual(
+            metrics[
+                "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.5,
+        )
+
+    def test_runtime_telemetry_reports_sample_production_rates(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=2.0)
+        telemetry.started_at = time.perf_counter() - 10.0
+        accepted = Trajectory(
+            scenario_id="rate",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=4.0,
+        )
+        failed = Trajectory(
+            scenario_id="rate",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=0.0,
+            duration_s=1.0,
+            exception="boom",
+        )
+
+        telemetry.record_actor_admission_delay(0.5)
+        telemetry.record_actor_queue_wait(1.0)
+        telemetry.record_train_wait(2.0)
+        telemetry.record_trajectory(accepted, accepted=True)
+        telemetry.record_trajectory(failed, accepted=False)
+        telemetry.record_train(
+            [TrajectoryGroup(scenario_id="rate", trajectories=(accepted,))],
+            TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=3.0,
+        )
+
+        metrics = telemetry.metrics(stale_dropped=1)
+        wall_s = metrics["time/wall_clock_s"]
+
+        self.assertEqual(metrics["data/trajectory_acceptance_rate"], 0.5)
+        self.assertEqual(metrics["data/trajectory_failure_rate"], 0.5)
+        self.assertEqual(metrics["data/stale_drop_rate"], 0.5)
+        self.assertEqual(metrics["data/train_groups_per_step"], 1.0)
+        self.assertAlmostEqual(
+            metrics["throughput/trajectories_seen_per_s"],
+            2.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/accepted_trajectories_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/failed_trajectories_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/stale_trajectories_dropped_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/groups_trained_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/train_steps_per_s"],
+            1.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/rollout_dollar_seconds_per_s"],
+            10.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/trainer_dollar_seconds_per_s"],
+            6.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["throughput/accounted_dollar_seconds_per_s"],
+            23.0 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["utilization/rollout_parallelism"],
+            5.0 / wall_s,
+        )
+        self.assertAlmostEqual(metrics["utilization/trainer"], 3.0 / wall_s)
+        self.assertAlmostEqual(metrics["utilization/trainer_wait"], 2.0 / wall_s)
+        self.assertAlmostEqual(
+            metrics["utilization/actor_admission_delay_parallelism"],
+            0.5 / wall_s,
+        )
+        self.assertAlmostEqual(
+            metrics["utilization/actor_queue_wait_parallelism"],
+            1.0 / wall_s,
+        )
+
+    def test_runtime_telemetry_attributes_trainer_wait_cost(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=5.0)
+
+        telemetry.record_train_wait(2.0)
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/trainer_wait_s"], 2.0)
+        self.assertEqual(metrics["costs/trainer_wait_dollar_seconds"], 10.0)
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+
+    def test_runtime_telemetry_attributes_train_ring_admission_wait_cost(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=5.0)
+
+        telemetry.record_train_ring_admission_wait(2.0)
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/train_ring_admission_wait_s"], 2.0)
+        self.assertEqual(
+            metrics["costs/train_ring_admission_wait_dollar_seconds"],
+            10.0,
+        )
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+
+    def test_runtime_telemetry_accepts_explicit_rollout_dollar_seconds(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=2.0,
+        )
+
+        telemetry.record_trajectory(
+            trajectory,
+            accepted=True,
+            dollar_seconds=0.5,
+        )
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/rollout_s"], 2.0)
+        self.assertEqual(metrics["costs/rollout_dollar_seconds"], 0.5)
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 0.5)
+
+    def test_runtime_stamps_actor_queue_wait_cost_before_enqueue(self):
+        async def run():
+            runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
+            queue: asyncio.Queue[Trajectory] = asyncio.Queue(maxsize=1)
+            await queue.put(
+                Trajectory(
+                    scenario_id="blocking",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                )
+            )
+            trajectory = Trajectory(
+                scenario_id="costed",
+                policy_step=0,
+                messages=[],
+                actions=TokenActionCodec().encode("answer"),
+                reward=1.0,
+            )
+
+            task = asyncio.create_task(
+                runtime._put_trajectory_with_queue_cost(
+                    queue,
+                    trajectory,
+                    started_at=time.perf_counter(),
+                )
+            )
+            await asyncio.sleep(0.001)
+            queue.get_nowait()
+            wait_s = await asyncio.wait_for(task, timeout=1.0)
+            queued = queue.get_nowait()
+            return wait_s, trajectory, queued
+
+        wait_s, trajectory, queued = asyncio.run(run())
+
+        self.assertGreater(wait_s, 0.0)
+        self.assertIs(queued, trajectory)
+        self.assertGreater(
+            queued.metrics["cost/actor_queue_wait_dollar_seconds"],
+            0.0,
+        )
+
+    def test_control_plane_charges_train_ring_admission_wait_to_scheduler(self):
+        async def run():
+            class SlowCostedTrainer:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def train(
+                    self,
+                    current: PolicySnapshot,
+                    groups: Sequence[TrajectoryGroup],
+                ) -> TrainResult:
+                    self.calls += 1
+                    if self.calls == 1:
+                        await asyncio.sleep(0.05)
+                    return TrainResult(
+                        policy=current.policy,
+                        checkpoint_id=f"step-{current.step + 1}",
+                        metrics={
+                            "train/reward": float(self.calls),
+                            "train/dollar_seconds": 17.0,
+                        },
+                    )
+
+            async def fast_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                return Trajectory(
+                    scenario_id=scenario.id,
+                    policy_step=context.policy_step,
+                    messages=[Message(role="user", content="fast")],
+                    actions=context.action_codec.encode("fast"),
+                    reward=1.0,
+                    duration_s=0.0,
+                    metrics={"rollout/dollar_seconds": 0.0},
+                )
+
+            scheduler = ObjectiveScheduler(
+                min_train_batch_groups=1,
+                max_train_batch_groups=1,
+                min_policy_lag=10,
+                max_policy_lag=10,
+                exploration_bonus=0.0,
+                control_exploration_bonus=0.0,
+            )
+            summary = await asyncio.wait_for(
+                ControlPlane(
+                    ControlPlaneConfig(
+                        num_actors=4,
+                        group_size=1,
+                        train_batch_groups=1,
+                        max_train_steps=3,
+                        queue_max_trajectories=20,
+                        train_queue_capacity=1,
+                        max_policy_lag=10,
+                        cost_per_second_usd=1000.0,
+                    )
+                ).run(
+                    scenarios=[Scenario(id="ring-wait")],
+                    initial_policy=CountingPolicy(level=1),
+                    trainer=SlowCostedTrainer(),
+                    workflow=fast_rollout,
+                    action_codecs=[TokenActionCodec()],
+                    scheduler=scheduler,
+                ),
+                timeout=2.0,
+            )
+            return summary.metrics
+
+        metrics = asyncio.run(run())
+
+        admission_wait = metrics["costs/train_ring_admission_wait_dollar_seconds"]
+        scheduler_extra_train_cost = (
+            metrics["scheduler/costs/train_dollar_seconds"]
+            - metrics["costs/trainer_dollar_seconds"]
+            - metrics["costs/trainer_wait_dollar_seconds"]
+        )
+        self.assertGreater(metrics["train_queue/backpressure_events"], 0.0)
+        self.assertGreater(admission_wait, 0.0)
+        self.assertGreater(scheduler_extra_train_cost, 0.0)
+        self.assertLessEqual(
+            scheduler_extra_train_cost,
+            admission_wait + max(0.001, admission_wait * 0.05),
+        )
+
+    def test_runtime_stale_callback_charges_train_ring_admission_wait(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=1000.0))
+        scheduler = ObjectiveScheduler(
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="stale-overhead",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("stale"),
+            reward=4.0,
+            metrics={"cost/dollar_seconds": 2.0},
+            metadata={
+                "scheduler/arm_id": "stale-overhead|token",
+                "scheduler/active_target_train_batch_groups": 1,
+                "scheduler/active_max_policy_lag": 1,
+            },
+        )
+        group = TrajectoryGroup(
+            scenario_id="stale-overhead",
+            trajectories=(trajectory,),
+        )
+        train_ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=1)
+        train_ring.current_policy_step = 3
+        batch = VersionedTrajectoryBatch(
+            groups=(group,),
+            assembled_at_step=0,
+            metadata={"queue/train_ring_admission_wait_s": 0.003},
+        )
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=2.0,
+        )
+        callback = runtime._stale_batch_callback(
+            scheduler=scheduler,
+            action_space=None,
+            train_ring=train_ring,
+            reason="runtime_train_ring_stale",
+            cost_per_second_usd=1000.0,
+        )
+        self.assertIsNotNone(callback)
+        callback(batch)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/stale_additional_dollar_seconds"], 3.0)
+        self.assertEqual(
+            metrics["scheduler/stale_last_additional_dollar_seconds"],
+            3.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/budget/accounted_dollar_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/stale_last_policy_step"],
+            3.0,
+        )
+
+    def test_runtime_stamps_rollout_cost_before_enqueue(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=0.25,
+        )
+        explicit = Trajectory(
+            scenario_id="explicit",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            duration_s=0.25,
+            metrics={"cost/dollar_seconds": 9.0},
+        )
+
+        runtime._stamp_rollout_dollar_seconds(trajectory)
+        runtime._stamp_rollout_dollar_seconds(explicit)
+
+        self.assertEqual(trajectory.metrics["rollout/dollar_seconds"], 2.5)
+        self.assertEqual(runtime._trajectory_dollar_seconds(trajectory), 2.5)
+        self.assertNotIn("rollout/dollar_seconds", explicit.metrics)
+        self.assertEqual(runtime._trajectory_dollar_seconds(explicit), 9.0)
+
+    def test_runtime_dedupes_total_sample_cost_from_wait_costs(self):
+        runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=100.0))
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+            duration_s=9.0,
+            metrics={
+                "cost/dollar_seconds": 10.0,
+                "cost/actor_queue_wait_dollar_seconds": 3.0,
+                "cost/actor_admission_dollar_seconds": 2.0,
+            },
+            metadata={"scheduler/arm_id": "costed|token"},
+        )
+
+        rollout_cost = runtime._trajectory_dollar_seconds(trajectory)
+        queue_cost = runtime._trajectory_queue_wait_dollar_seconds(trajectory)
+        admission_cost = runtime._trajectory_admission_dollar_seconds(trajectory)
+
+        self.assertEqual(rollout_cost, 5.0)
+        self.assertEqual(queue_cost, 3.0)
+        self.assertEqual(admission_cost, 2.0)
+
+        scheduler = ObjectiveScheduler(exploration_bonus=0.0)
+        scheduler.observe_rollout_admission_delay(
+            seconds=0.02,
+            dollar_seconds=admission_cost,
+        )
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=rollout_cost,
+            queue_wait_dollar_seconds=queue_cost,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics["scheduler/costs/rollout_dollar_seconds"], 5.0)
+        self.assertEqual(metrics["scheduler/costs/queue_wait_dollar_seconds"], 3.0)
+        self.assertEqual(
+            metrics["scheduler/costs/rollout_admission_dollar_seconds"],
+            2.0,
+        )
+        self.assertEqual(metrics["scheduler/budget/accounted_dollar_seconds"], 10.0)
+        self.assertEqual(
+            metrics["scheduler/arm/costed_token/mean_sample_dollar_seconds"],
+            10.0,
+        )
+
+    def test_runtime_applies_scheduler_rollout_admission_delay_before_work(self):
+        async def run():
+            runtime = ControlPlane(ControlPlaneConfig(cost_per_second_usd=10.0))
+            scheduler = ObjectiveScheduler(
+                max_rollout_admission_delay_s=0.001,
+                rollout_admission_pressure_threshold=0.0,
+                exploration_bonus=0.0,
+            )
+            queue: asyncio.Queue[Trajectory] = asyncio.Queue(maxsize=1)
+            await queue.put(
+                Trajectory(
+                    scenario_id="blocking",
+                    policy_step=0,
+                    messages=[],
+                    actions=[],
+                    reward=0.0,
+                )
+            )
+            train_ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=1)
+            telemetry = RuntimeTelemetry(cost_per_second_usd=10.0)
+
+            elapsed = await runtime._apply_rollout_admission_delay(
+                scheduler=scheduler,
+                trajectory_queue=queue,
+                train_ring=train_ring,
+                telemetry=telemetry,
+                policy_step=0,
+            )
+            return elapsed, telemetry.metrics(stale_dropped=0), scheduler.metrics()
+
+        elapsed, telemetry_metrics, scheduler_metrics = asyncio.run(run())
+
+        self.assertGreater(elapsed, 0.0)
+        self.assertGreater(
+            telemetry_metrics["time/actor_admission_delay_s"],
+            0.0,
+        )
+        self.assertGreater(
+            telemetry_metrics["costs/actor_admission_delay_dollar_seconds"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            telemetry_metrics["costs/accounted_dollar_seconds"],
+            telemetry_metrics["costs/actor_admission_delay_dollar_seconds"],
+        )
+        self.assertEqual(scheduler_metrics["scheduler/admission/decisions"], 1.0)
+        self.assertGreater(
+            scheduler_metrics["scheduler/admission/total_delay_s"],
+            0.0,
+        )
+        self.assertGreater(
+            scheduler_metrics[
+                "scheduler/costs/rollout_admission_dollar_seconds"
+            ],
+            0.0,
+        )
+
+    def test_runtime_clamps_scheduler_active_actor_count(self):
+        runtime = ControlPlane(ControlPlaneConfig(num_actors=4))
+        trajectory_queue: asyncio.Queue[Trajectory] = asyncio.Queue(maxsize=2)
+        trajectory_queue.put_nowait(
+            Trajectory(
+                scenario_id="queued",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=0.0,
+            )
+        )
+        train_ring = TrajectoryRingBuffer(capacity=2, max_policy_lag=1)
+
+        low_scheduler = ActorCapScheduler(cap=0)
+        high_scheduler = ActorCapScheduler(cap=99)
+
+        low_count = runtime._active_actor_count(
+            scheduler=low_scheduler,
+            trajectory_queue=trajectory_queue,
+            train_ring=train_ring,
+            policy_step=3,
+        )
+        high_count = runtime._active_actor_count(
+            scheduler=high_scheduler,
+            trajectory_queue=trajectory_queue,
+            train_ring=train_ring,
+            policy_step=4,
+        )
+
+        self.assertEqual(low_count, 1)
+        self.assertEqual(high_count, 4)
+        self.assertEqual(low_scheduler.calls[0]["configured"], 4)
+        self.assertEqual(low_scheduler.calls[0]["policy_step"], 3)
+        self.assertGreater(low_scheduler.calls[0]["trajectory_queue_pressure"], 0.0)
+
+    def test_runtime_cancels_actor_count_decisions_for_capped_actor_slots(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                min_actor_count=1,
+                max_actor_count=1,
+                exploration_bonus=0.0,
+            )
+            runtime = ControlPlane(
+                ControlPlaneConfig(
+                    num_actors=2,
+                    group_size=1,
+                    train_batch_groups=1,
+                    max_train_steps=1,
+                    queue_max_trajectories=2,
+                    train_queue_capacity=2,
+                )
+            )
+
+            async def slow_rollout(
+                policy: CountingPolicy,
+                scenario: Scenario,
+                context: RolloutContext,
+            ) -> Trajectory:
+                await asyncio.sleep(0.01)
+                return await counting_rollout(policy, scenario, context)
+
+            return await runtime.run(
+                scenarios=[Scenario(id="cap", payload={"target": 1})],
+                initial_policy=CountingPolicy(level=0),
+                trainer=NoopTrainer(),
+                workflow=slow_rollout,
+                action_codecs=[TokenActionCodec()],
+                scheduler=scheduler,
+            )
+
+        summary = asyncio.run(run())
+        total_decisions = summary.metrics["scheduler/total_rollout_decisions"]
+
+        self.assertGreater(total_decisions, 0.0)
+        self.assertEqual(
+            summary.metrics["scheduler/control/actor_count_1/decisions"],
+            total_decisions,
+        )
+
+    def test_runtime_telemetry_accepts_explicit_train_dollar_seconds(self):
+        telemetry = RuntimeTelemetry(cost_per_second_usd=100.0)
+        trajectory = Trajectory(
+            scenario_id="costed",
+            policy_step=0,
+            messages=[],
+            actions=TokenActionCodec().encode("answer"),
+            reward=1.0,
+        )
+
+        telemetry.record_train(
+            [TrajectoryGroup(scenario_id="costed", trajectories=(trajectory,))],
+            TrainResult(metrics={"train/reward": 1.0}),
+            duration_s=2.0,
+            dollar_seconds=3.5,
+        )
+        metrics = telemetry.metrics(stale_dropped=0)
+
+        self.assertEqual(metrics["time/trainer_s"], 2.0)
+        self.assertEqual(metrics["costs/trainer_dollar_seconds"], 3.5)
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 3.5)
+
+    def test_train_result_dollar_seconds_prefers_explicit_cost_metrics(self):
+        result = TrainResult(
+            metrics={"train/dollar_seconds": 7.0},
+            metadata={"trainer/dollar_seconds": 9.0},
+        )
+
+        self.assertEqual(
+            train_result_dollar_seconds(
+                result,
+                duration_s=2.0,
+                cost_per_second_usd=100.0,
+            ),
+            7.0,
+        )
+
+    def test_ring_buffer_discards_stale_batch_and_unblocks_producer(self):
+        async def run():
+            ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=1)
+            discarded = []
+            fresh = make_batch(policy_step=3, scenario_id="s")
+            stale = make_batch(
+                policy_step=0,
+                scenario_id="s",
+                on_discard=discarded.append,
+            )
+
+            await ring.put(stale)
+            put_fresh = asyncio.create_task(ring.put(fresh))
+            await asyncio.sleep(0)
+            self.assertFalse(put_fresh.done())
+
+            received = await asyncio.wait_for(
+                ring.get(current_policy_step=3),
+                timeout=1.0,
+            )
+            await asyncio.wait_for(put_fresh, timeout=1.0)
+            return ring, received, discarded, stale
+
+        ring, received, discarded, stale = asyncio.run(run())
+
+        self.assertEqual(received.min_policy_step, 3)
+        self.assertEqual(ring.total_discarded, 1)
+        self.assertEqual(ring.total_consumed, 1)
+        self.assertEqual(ring.backpressure_events, 1)
+        self.assertEqual(len(discarded), 1)
+        self.assertIs(discarded[0], stale)
+        self.assertEqual(discarded[0].min_policy_step, 0)
+
+    def test_stale_batch_feedback_can_demote_action_space(self):
+        scheduler = ObjectiveScheduler(
+            exploration_bonus=0.0,
+            rollout_objective_weight=0.0,
+        )
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            demotion_min_pulls=2,
+            demote_on_stale_feedback=True,
+        )
+        chunk4 = ChunkActionCodec(chunk_size=4)
+        action_space.add_codec(chunk4)
+        trajectories = tuple(
+            Trajectory(
+                scenario_id="stale-action",
+                policy_step=0,
+                messages=[],
+                actions=chunk4.encode("alpha beta gamma delta"),
+                reward=1.0,
+                metrics={"cost/dollar_seconds": 1.0},
+                metadata={
+                    "scheduler/arm_id": "stale-action|chunk(chunk_size=4)",
+                },
+            )
+            for _ in range(2)
+        )
+        group = TrajectoryGroup(
+            scenario_id="stale-action",
+            trajectories=trajectories,
+        )
+        for trajectory in trajectories:
+            scheduler.observe_rollout(
+                trajectory,
+                accepted=True,
+                dollar_seconds=1.0,
+            )
+        ring = TrajectoryRingBuffer(capacity=1, max_policy_lag=0)
+        ring.current_policy_step = 2
+        on_discard = ControlPlane._stale_batch_callback(
+            scheduler=scheduler,
+            action_space=action_space,
+            train_ring=ring,
+            reason="test_stale_action_space",
+        )
+
+        self.assertIsNotNone(on_discard)
+        on_discard(
+            VersionedTrajectoryBatch(
+                groups=(group,),
+                assembled_at_step=0,
+            )
+        )
+        metrics = action_space.metrics()
+
+        self.assertEqual(metrics["action_space/demotions"], 1.0)
+        self.assertEqual(
+            metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            1.0,
+        )
+        self.assertNotIn(
+            "action_space/codec/chunk_chunk_size_4/active",
+            metrics,
+        )
+        self.assertLess(
+            scheduler.metrics()[
+                "scheduler/arm/stale_action_chunk_chunk_size_4/objective_score"
+            ],
+            0.0,
+        )
+
+    def test_ring_buffer_consumes_highest_priority_ready_batch(self):
+        async def run():
+            ring = TrajectoryRingBuffer(capacity=3, max_policy_lag=10)
+            low = make_batch(policy_step=0, scenario_id="low", priority_score=0.1)
+            high = make_batch(policy_step=0, scenario_id="high", priority_score=10.0)
+
+            await ring.put(low)
+            await ring.put(high)
+            received = await ring.get(current_policy_step=0)
+            return ring, received
+
+        ring, received = asyncio.run(run())
+
+        self.assertEqual(received.groups[0].scenario_id, "high")
+        self.assertEqual(ring.priority_consumptions, 1)
+        self.assertEqual(ring.pending_batches, 1)
+
+    def test_ring_buffer_rescores_priority_at_consume_time(self):
+        async def run():
+            scheduler = ObjectiveScheduler(
+                exploration_bonus=0.0,
+                staleness_priority_weight=1.0,
+            )
+            ring = TrajectoryRingBuffer(capacity=3, max_policy_lag=10)
+            fresh = make_batch(
+                policy_step=4,
+                scenario_id="fresh",
+                priority_score=10.0,
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "fresh|token",
+                    "scheduler/active_max_policy_lag": 4,
+                },
+            )
+            near_stale = make_batch(
+                policy_step=0,
+                scenario_id="near-stale",
+                priority_score=1.0,
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": "near-stale|token",
+                    "scheduler/active_max_policy_lag": 4,
+                },
+            )
+
+            await ring.put(fresh)
+            await ring.put(near_stale)
+            received = await ring.get(
+                current_policy_step=4,
+                priority_scorer=lambda batch, policy_step: (
+                    scheduler.score_train_groups(
+                        batch.groups,
+                        policy_step=policy_step,
+                    )
+                ),
+            )
+            return ring, received
+
+        ring, received = asyncio.run(run())
+
+        self.assertEqual(received.groups[0].scenario_id, "near-stale")
+        self.assertEqual(ring.priority_consumptions, 1)
+        self.assertEqual(ring.consumed_priority_total, 2.0)
+
+    def test_weight_broadcast_channel_replays_latest_and_waits(self):
+        async def run():
+            channel = WeightBroadcastChannel()
+            first_subscriber = channel.subscribe()
+            first = await channel.publish(
+                PolicySnapshot(
+                    step=1,
+                    policy=CountingPolicy(level=1),
+                    checkpoint_id="level-1",
+                    created_at=1.0,
+                )
+            )
+            late_subscriber = channel.subscribe()
+            waited = await channel.wait_for_step(1)
+            return (
+                first,
+                waited,
+                first_subscriber.get_nowait(),
+                late_subscriber.get_nowait(),
+                channel.broadcast_count,
+            )
+
+        first, waited, first_received, late_received, broadcasts = asyncio.run(run())
+
+        self.assertEqual(first.step, 1)
+        self.assertEqual(waited, first)
+        self.assertEqual(first_received, first)
+        self.assertEqual(late_received, first)
+        self.assertEqual(broadcasts, 1)
+
+
+def make_batch(
+    *,
+    policy_step: int,
+    scenario_id: str,
+    priority_score: float = 0.0,
+    reward: float | None = None,
+    metadata: dict | None = None,
+    on_discard=None,
+) -> VersionedTrajectoryBatch:
+    trajectory = Trajectory(
+        scenario_id=scenario_id,
+        policy_step=policy_step,
+        messages=[],
+        actions=[],
+        reward=float(policy_step) if reward is None else reward,
+        metadata=dict(metadata or {}),
+    )
+    group = TrajectoryGroup(scenario_id=scenario_id, trajectories=(trajectory,))
+    return VersionedTrajectoryBatch(
+        groups=(group,),
+        assembled_at_step=policy_step,
+        priority_score=priority_score,
+        on_discard=on_discard,
+    )
+
+
+if __name__ == "__main__":
+    unittest.main()

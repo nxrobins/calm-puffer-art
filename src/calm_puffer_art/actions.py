@@ -1,0 +1,1965 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping as MappingABC
+from collections.abc import Sequence as SequenceABC
+from dataclasses import dataclass, field
+from math import exp, isfinite
+from typing import Any, Mapping, Protocol, Sequence
+
+from .types import ActionUnit
+
+
+ACTION_SPACE_STATE_KEY = "action_space/state"
+
+
+class ActionCodec(Protocol):
+    """Encodes text or structured outputs into higher-level policy decisions."""
+
+    name: str
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        ...
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        ...
+
+
+def semantic_bandwidth(actions: Sequence[ActionUnit]) -> float:
+    """Average source-token payload per policy decision."""
+
+    if not actions:
+        return 0.0
+    return sum(max(0, action.token_count) for action in actions) / len(actions)
+
+
+@dataclass(frozen=True)
+class ActionLogprobStats:
+    """Aggregated policy-probability evidence for action-unit training."""
+
+    action_units: int = 0
+    old_logprob_units: int = 0
+    new_logprob_units: int = 0
+    reference_logprob_units: int = 0
+    old_logprob_sum: float = 0.0
+    new_logprob_sum: float = 0.0
+    reference_logprob_sum: float = 0.0
+    old_new_pairs: int = 0
+    old_reference_pairs: int = 0
+    old_new_logprob_delta_sum: float = 0.0
+    old_new_logprob_abs_delta_sum: float = 0.0
+    old_reference_logprob_delta_sum: float = 0.0
+    importance_ratio_sum: float = 0.0
+
+    @property
+    def old_logprob_coverage(self) -> float:
+        return self.old_logprob_units / self.action_units if self.action_units else 0.0
+
+    @property
+    def new_logprob_coverage(self) -> float:
+        return self.new_logprob_units / self.action_units if self.action_units else 0.0
+
+    @property
+    def reference_logprob_coverage(self) -> float:
+        return (
+            self.reference_logprob_units / self.action_units
+            if self.action_units
+            else 0.0
+        )
+
+    @property
+    def old_new_logprob_delta_mean(self) -> float:
+        return (
+            self.old_new_logprob_delta_sum / self.old_new_pairs
+            if self.old_new_pairs
+            else 0.0
+        )
+
+    @property
+    def old_new_logprob_abs_delta_mean(self) -> float:
+        return (
+            self.old_new_logprob_abs_delta_sum / self.old_new_pairs
+            if self.old_new_pairs
+            else 0.0
+        )
+
+    @property
+    def old_reference_logprob_delta_mean(self) -> float:
+        return (
+            self.old_reference_logprob_delta_sum / self.old_reference_pairs
+            if self.old_reference_pairs
+            else 0.0
+        )
+
+    @property
+    def importance_ratio_mean(self) -> float:
+        return self.importance_ratio_sum / self.old_new_pairs if self.old_new_pairs else 0.0
+
+
+def action_logprob_stats(actions: Sequence[ActionUnit]) -> ActionLogprobStats:
+    """Summarize old/new/reference logprobs carried by action units.
+
+    The typed fields are preferred. Metadata keys are accepted so ART adapters
+    can preserve backend-specific logprob payloads without schema rewriting.
+    """
+
+    old_units = 0
+    new_units = 0
+    reference_units = 0
+    old_sum = 0.0
+    new_sum = 0.0
+    reference_sum = 0.0
+    old_new_pairs = 0
+    old_reference_pairs = 0
+    old_new_delta_sum = 0.0
+    old_new_abs_delta_sum = 0.0
+    old_reference_delta_sum = 0.0
+    ratio_sum = 0.0
+    for action in actions:
+        old = _action_logprob(
+            action,
+            "old_logprob",
+            (
+                "old_logprob",
+                "policy/old_logprob",
+                "behavior/logprob",
+                "sampling/logprob",
+                "logprob",
+            ),
+        )
+        new = _action_logprob(
+            action,
+            "new_logprob",
+            ("new_logprob", "policy/new_logprob", "train/logprob"),
+        )
+        reference = _action_logprob(
+            action,
+            "reference_logprob",
+            (
+                "reference_logprob",
+                "ref_logprob",
+                "reference/logprob",
+                "ref/logprob",
+            ),
+        )
+        if old is not None:
+            old_units += 1
+            old_sum += old
+        if new is not None:
+            new_units += 1
+            new_sum += new
+        if reference is not None:
+            reference_units += 1
+            reference_sum += reference
+        if old is not None and new is not None:
+            delta = new - old
+            old_new_pairs += 1
+            old_new_delta_sum += delta
+            old_new_abs_delta_sum += abs(delta)
+            ratio_sum += exp(max(-60.0, min(60.0, delta)))
+        if old is not None and reference is not None:
+            old_reference_pairs += 1
+            old_reference_delta_sum += old - reference
+    return ActionLogprobStats(
+        action_units=len(actions),
+        old_logprob_units=old_units,
+        new_logprob_units=new_units,
+        reference_logprob_units=reference_units,
+        old_logprob_sum=old_sum,
+        new_logprob_sum=new_sum,
+        reference_logprob_sum=reference_sum,
+        old_new_pairs=old_new_pairs,
+        old_reference_pairs=old_reference_pairs,
+        old_new_logprob_delta_sum=old_new_delta_sum,
+        old_new_logprob_abs_delta_sum=old_new_abs_delta_sum,
+        old_reference_logprob_delta_sum=old_reference_delta_sum,
+        importance_ratio_sum=ratio_sum,
+    )
+
+
+def _action_logprob(
+    action: ActionUnit,
+    attribute: str,
+    metadata_keys: Sequence[str],
+) -> float | None:
+    value = getattr(action, attribute, None)
+    parsed = _finite_float(value)
+    if parsed is not None:
+        return parsed
+    for key in metadata_keys:
+        parsed = _finite_float(action.metadata.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def action_codec_key(codec: ActionCodec) -> str:
+    """Stable key used for scheduler arms and action-space telemetry."""
+
+    name = getattr(codec, "name", codec.__class__.__name__)
+    values = getattr(codec, "__dict__", {})
+    public_values = {
+        key: value
+        for key, value in values.items()
+        if not key.startswith("_") and key != "name"
+    }
+    if not public_values:
+        return str(name)
+    suffix = ",".join(f"{key}={public_values[key]}" for key in sorted(public_values))
+    return f"{name}({suffix})"
+
+
+def safe_metric_key(value: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in value).strip("_")
+
+
+def action_space_signature(action_space: Any | None) -> str | None:
+    """Stable, metric-safe summary of the active action-space ladder."""
+
+    if action_space is None:
+        return None
+    active_keys: list[str] = []
+    disabled_keys: list[str] = []
+    state_dict = getattr(action_space, "state_dict", None)
+    if state_dict is not None:
+        state = state_dict()
+        if isinstance(state, MappingABC):
+            active = state.get("active_codecs")
+            if isinstance(active, SequenceABC) and not isinstance(
+                active, (str, bytes, bytearray)
+            ):
+                for codec_state in active:
+                    if not isinstance(codec_state, MappingABC):
+                        continue
+                    key = codec_state.get("key")
+                    if key is not None and not isinstance(key, bool):
+                        active_keys.append(str(key))
+            disabled = state.get("disabled_codec_keys")
+            if isinstance(disabled, SequenceABC) and not isinstance(
+                disabled, (str, bytes, bytearray)
+            ):
+                disabled_keys = [
+                    str(key)
+                    for key in disabled
+                    if key is not None and not isinstance(key, bool)
+                ]
+    if not active_keys:
+        codecs = getattr(action_space, "codecs", ())
+        if isinstance(codecs, SequenceABC) and not isinstance(
+            codecs, (str, bytes, bytearray)
+        ):
+            active_keys = [action_codec_key(codec) for codec in codecs]
+    if not active_keys and not disabled_keys:
+        return None
+    active = "_".join(safe_metric_key(key) for key in sorted(active_keys))
+    disabled = "_".join(safe_metric_key(key) for key in sorted(disabled_keys))
+    active = active or "none"
+    disabled = disabled or "none"
+    return f"v1_active_{active}__disabled_{disabled}"
+
+
+def _tokens(text: str) -> list[str]:
+    return text.split()
+
+
+def _chunked(items: Sequence[str], chunk_size: int) -> list[list[str]]:
+    return [list(items[i : i + chunk_size]) for i in range(0, len(items), chunk_size)]
+
+
+@dataclass(frozen=True)
+class TokenActionCodec:
+    """Baseline token-ish codec for comparing semantic bandwidth."""
+
+    name: str = "token"
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        return [
+            ActionUnit(kind="token", payload=token, token_count=1, text=token)
+            for token in _tokens(value)
+        ]
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        return " ".join(str(action.payload) for action in actions)
+
+
+@dataclass(frozen=True)
+class ChunkActionCodec:
+    """Groups K tokens into one decision unit."""
+
+    chunk_size: int = 4
+    name: str = "chunk"
+
+    def __post_init__(self) -> None:
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        actions: list[ActionUnit] = []
+        for index, chunk in enumerate(_chunked(_tokens(value), self.chunk_size)):
+            text = " ".join(chunk)
+            actions.append(
+                ActionUnit(
+                    kind="chunk",
+                    payload=tuple(chunk),
+                    token_count=len(chunk),
+                    text=text,
+                    metadata={"chunk_index": index, "chunk_size": self.chunk_size},
+                )
+            )
+        return actions
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        tokens: list[str] = []
+        for action in actions:
+            if isinstance(action.payload, (list, tuple)):
+                tokens.extend(str(token) for token in action.payload)
+            else:
+                tokens.extend(_tokens(action.text or str(action.payload)))
+        return " ".join(tokens)
+
+
+@dataclass(frozen=True)
+class LatentPatchActionCodec:
+    """Inspectable stand-in for CALM-style chunk embeddings.
+
+    The vector is deterministic and non-learned. The original text is retained
+    so examples and tests can round-trip without implementing a neural decoder.
+    """
+
+    patch_size: int = 4
+    latent_size: int = 8
+    name: str = "latent_patch"
+
+    def __post_init__(self) -> None:
+        if self.patch_size <= 0:
+            raise ValueError("patch_size must be positive")
+        if self.latent_size <= 0:
+            raise ValueError("latent_size must be positive")
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        actions: list[ActionUnit] = []
+        for index, chunk in enumerate(_chunked(_tokens(value), self.patch_size)):
+            text = " ".join(chunk)
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            vector = tuple(round(byte / 255.0, 6) for byte in digest[: self.latent_size])
+            actions.append(
+                ActionUnit(
+                    kind="latent_patch",
+                    payload=vector,
+                    token_count=len(chunk),
+                    text=text,
+                    metadata={
+                        "patch_index": index,
+                        "patch_size": self.patch_size,
+                        "latent_size": self.latent_size,
+                        "reconstruction_text": text,
+                    },
+                )
+            )
+        return actions
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        return " ".join(
+            str(action.metadata.get("reconstruction_text", action.text))
+            for action in actions
+        ).strip()
+
+
+@dataclass(frozen=True)
+class CommandActionCodec:
+    """Represents tool calls or workflow commands as single decisions."""
+
+    name: str = "command"
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        parsed = self._parse(value)
+        commands = parsed if isinstance(parsed, list) else [parsed]
+        actions: list[ActionUnit] = []
+        for index, command in enumerate(commands):
+            text = json.dumps(command, sort_keys=True, separators=(",", ":"))
+            actions.append(
+                ActionUnit(
+                    kind="command",
+                    payload=command,
+                    token_count=max(1, len(_tokens(text))),
+                    text=text,
+                    metadata={"command_index": index},
+                )
+            )
+        return actions
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        return "\n".join(
+            json.dumps(action.payload, sort_keys=True, separators=(",", ":"))
+            for action in actions
+        )
+
+    @staticmethod
+    def _parse(value: str) -> Any:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"name": "say", "args": {"text": value}}
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+            return parsed
+        return {"name": "emit", "args": {"value": parsed}}
+
+
+@dataclass(frozen=True)
+class ReasoningStepCodec:
+    """Compresses one line of reasoning or planning into one action unit."""
+
+    name: str = "reasoning_step"
+
+    def encode(self, value: str) -> list[ActionUnit]:
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        if not lines and value.strip():
+            lines = [value.strip()]
+        return [
+            ActionUnit(
+                kind="reasoning_step",
+                payload=line,
+                token_count=max(1, len(_tokens(line))),
+                text=line,
+                metadata={"step_index": index},
+            )
+            for index, line in enumerate(lines)
+        ]
+
+    def decode(self, actions: Sequence[ActionUnit]) -> str:
+        return "\n".join(str(action.payload) for action in actions)
+
+
+@dataclass
+class AdaptiveActionSpace:
+    """Promotes higher-bandwidth action codecs from objective feedback.
+
+    This is intentionally conservative: the baseline token codec remains active,
+    larger chunk codecs are added only after the current chunk size has positive
+    objective signal, strong action quality, and an acceptable unsafe rate in
+    scheduler metrics. Opt-in latent-patch candidates use the same evidence
+    gate and can be retired from their own objective feedback.
+    """
+
+    min_chunk_size: int = 2
+    max_chunk_size: int = 8
+    promotion_objective_threshold: float = 0.0
+    promotion_parent_margin: float = 0.0
+    promotion_quality_threshold: float = 0.95
+    promotion_semantic_bandwidth_threshold: float = 1.0
+    promotion_parent_source_token_throughput_margin: float = 0.0
+    promotion_max_reconstruction_drift: float = 0.05
+    promotion_min_old_logprob_coverage: float = 0.0
+    promotion_min_new_logprob_coverage: float = 0.0
+    promotion_min_reference_logprob_coverage: float = 0.0
+    promotion_min_pulls: int = 1
+    unsafe_rate_threshold: float = 0.0
+    demotion_objective_threshold: float = 0.0
+    demotion_parent_margin: float = 0.0
+    demotion_quality_threshold: float = 0.5
+    demotion_semantic_bandwidth_threshold: float = 1.0
+    demotion_parent_source_token_throughput_margin: float = 0.0
+    demotion_max_reconstruction_drift: float = 0.05
+    demotion_min_old_logprob_coverage: float = 0.0
+    demotion_min_new_logprob_coverage: float = 0.0
+    demotion_min_reference_logprob_coverage: float = 0.0
+    demotion_min_pulls: int = 2
+    demotion_decision_payoff_threshold: float = 0.0
+    demotion_decision_source_token_throughput_payoff_threshold: float | None = None
+    demotion_decision_min_observations: int = 2
+    demote_on_stale_feedback: bool = False
+    promote_latent_patches: bool = False
+    latent_patch_latent_size: int = 8
+    include_token: bool = True
+    seed_codecs: Sequence[ActionCodec] = field(default_factory=tuple)
+    _codecs: list[ActionCodec] = field(default_factory=list, init=False)
+    _disabled_codec_keys: set[str] = field(default_factory=set, init=False)
+    _promotions: int = field(default=0, init=False)
+    _demotions: int = field(default=0, init=False)
+    _decision_payoff_demotions: int = field(default=0, init=False)
+    _source_token_throughput_payoff_demotions: int = field(default=0, init=False)
+    _decision_stats: dict[str, "_ActionSpaceDecisionStats"] = field(
+        default_factory=dict,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.min_chunk_size <= 0:
+            raise ValueError("min_chunk_size must be positive")
+        if self.max_chunk_size < self.min_chunk_size:
+            raise ValueError("max_chunk_size must be >= min_chunk_size")
+        if self.promotion_quality_threshold < 0:
+            raise ValueError("promotion_quality_threshold must be non-negative")
+        if self.promotion_parent_margin < 0:
+            raise ValueError("promotion_parent_margin must be non-negative")
+        if self.promotion_semantic_bandwidth_threshold < 0:
+            raise ValueError(
+                "promotion_semantic_bandwidth_threshold must be non-negative"
+            )
+        if self.promotion_parent_source_token_throughput_margin < 0:
+            raise ValueError(
+                "promotion_parent_source_token_throughput_margin must be "
+                "non-negative"
+            )
+        if self.promotion_max_reconstruction_drift < 0:
+            raise ValueError("promotion_max_reconstruction_drift must be non-negative")
+        for name in (
+            "promotion_min_old_logprob_coverage",
+            "promotion_min_new_logprob_coverage",
+            "promotion_min_reference_logprob_coverage",
+            "demotion_min_old_logprob_coverage",
+            "demotion_min_new_logprob_coverage",
+            "demotion_min_reference_logprob_coverage",
+        ):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.promotion_min_pulls < 0:
+            raise ValueError("promotion_min_pulls must be non-negative")
+        if self.unsafe_rate_threshold < 0:
+            raise ValueError("unsafe_rate_threshold must be non-negative")
+        if self.demotion_quality_threshold < 0:
+            raise ValueError("demotion_quality_threshold must be non-negative")
+        if self.demotion_parent_margin < 0:
+            raise ValueError("demotion_parent_margin must be non-negative")
+        if self.demotion_semantic_bandwidth_threshold < 0:
+            raise ValueError(
+                "demotion_semantic_bandwidth_threshold must be non-negative"
+            )
+        if self.demotion_parent_source_token_throughput_margin < 0:
+            raise ValueError(
+                "demotion_parent_source_token_throughput_margin must be "
+                "non-negative"
+            )
+        if self.demotion_max_reconstruction_drift < 0:
+            raise ValueError("demotion_max_reconstruction_drift must be non-negative")
+        if self.demotion_min_pulls < 0:
+            raise ValueError("demotion_min_pulls must be non-negative")
+        if self.demotion_decision_min_observations <= 0:
+            raise ValueError(
+                "demotion_decision_min_observations must be positive"
+            )
+        source_token_payoff_threshold = _finite_float(
+            self.demotion_decision_source_token_throughput_payoff_threshold
+        )
+        if (
+            self.demotion_decision_source_token_throughput_payoff_threshold
+            is not None
+        ):
+            if source_token_payoff_threshold is None:
+                raise ValueError(
+                    "demotion_decision_source_token_throughput_payoff_threshold "
+                    "must be finite or None"
+                )
+            self.demotion_decision_source_token_throughput_payoff_threshold = (
+                source_token_payoff_threshold
+            )
+        if self.latent_patch_latent_size <= 0:
+            raise ValueError("latent_patch_latent_size must be positive")
+        if self.include_token:
+            self.add_codec(TokenActionCodec())
+        self.add_codec(ChunkActionCodec(chunk_size=self.min_chunk_size))
+        for codec in self.seed_codecs:
+            self.add_codec(codec)
+
+    @property
+    def codecs(self) -> tuple[ActionCodec, ...]:
+        return tuple(self._codecs)
+
+    def add_codec(self, codec: ActionCodec) -> bool:
+        key = action_codec_key(codec)
+        if any(action_codec_key(existing) == key for existing in self._codecs):
+            return False
+        self._disabled_codec_keys.discard(key)
+        self._codecs.append(codec)
+        return True
+
+    def update_from_metrics(
+        self,
+        metrics: Mapping[str, float],
+        *,
+        allow_promotions: bool = True,
+        allow_demotions: bool = True,
+    ) -> None:
+        self._refresh_decision_payoffs(metrics)
+        disabled_this_update = (
+            self._demote_from_metrics(metrics) if allow_demotions else set()
+        )
+        if not allow_promotions:
+            return
+        for codec in tuple(self._codecs):
+            if not isinstance(codec, ChunkActionCodec):
+                continue
+            signal = self._codec_signal(codec, metrics)
+            if signal.pulls < self.promotion_min_pulls:
+                continue
+            if signal.objective <= self.promotion_objective_threshold:
+                continue
+            if signal.quality < self.promotion_quality_threshold:
+                continue
+            if (
+                signal.semantic_bandwidth
+                < self.promotion_semantic_bandwidth_threshold
+            ):
+                continue
+            if signal.reconstruction_drift > self.promotion_max_reconstruction_drift:
+                continue
+            if (
+                signal.old_logprob_coverage
+                < self.promotion_min_old_logprob_coverage
+            ):
+                continue
+            if (
+                signal.new_logprob_coverage
+                < self.promotion_min_new_logprob_coverage
+            ):
+                continue
+            if (
+                signal.reference_logprob_coverage
+                < self.promotion_min_reference_logprob_coverage
+            ):
+                continue
+            if signal.unsafe_rate > self.unsafe_rate_threshold:
+                continue
+            if not self._parent_allows_promotion(codec, signal, metrics):
+                continue
+            if codec.chunk_size < self.max_chunk_size:
+                next_size = min(self.max_chunk_size, codec.chunk_size * 2)
+                candidate = ChunkActionCodec(chunk_size=next_size)
+                candidate_key = action_codec_key(candidate)
+                if (
+                    candidate_key in self._disabled_codec_keys
+                    or candidate_key in disabled_this_update
+                ):
+                    pass
+                elif self.add_codec(candidate):
+                    self._promotions += 1
+                    self._record_action_space_decision(
+                        kind="promotion",
+                        codec=candidate,
+                        parent=self._parent_codec(candidate),
+                        source=codec,
+                        metrics=metrics,
+                    )
+            if self.promote_latent_patches:
+                latent_candidate = LatentPatchActionCodec(
+                    patch_size=codec.chunk_size,
+                    latent_size=self.latent_patch_latent_size,
+                )
+                latent_key = action_codec_key(latent_candidate)
+                if (
+                    latent_key in self._disabled_codec_keys
+                    or latent_key in disabled_this_update
+                ):
+                    continue
+                if self.add_codec(latent_candidate):
+                    self._promotions += 1
+                    self._record_action_space_decision(
+                        kind="promotion",
+                        codec=latent_candidate,
+                        parent=self._parent_codec(latent_candidate),
+                        source=codec,
+                        metrics=metrics,
+                    )
+        self._refresh_decision_payoffs(metrics)
+
+    def _parent_allows_promotion(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
+        parent = self._parent_codec(codec)
+        if parent is None:
+            return True
+        parent_signal = self._codec_signal(parent, metrics)
+        if parent_signal.pulls <= 0.0:
+            return self.promotion_parent_source_token_throughput_margin <= 0.0
+        if parent_signal.unsafe_rate > self.unsafe_rate_threshold:
+            return True
+        if not self._parent_source_token_throughput_allows_promotion(
+            signal,
+            parent_signal,
+        ):
+            return False
+        return signal.objective > (
+            parent_signal.objective + self.promotion_parent_margin
+        )
+
+    def _parent_source_token_throughput_allows_promotion(
+        self,
+        signal: "_CodecSignal",
+        parent_signal: "_CodecSignal",
+    ) -> bool:
+        margin = self.promotion_parent_source_token_throughput_margin
+        if margin <= 0.0:
+            return True
+        if parent_signal.pulls <= 0.0:
+            return False
+        if parent_signal.source_tokens_per_dollar_second <= 0.0:
+            return False
+        return signal.source_tokens_per_dollar_second > (
+            parent_signal.source_tokens_per_dollar_second + margin
+        )
+
+    def _demote_from_metrics(self, metrics: Mapping[str, float]) -> set[str]:
+        disabled: set[str] = set()
+        for codec in tuple(self._codecs):
+            if self._is_protected_codec(codec):
+                continue
+            signal = self._codec_signal(codec, metrics)
+            if signal.pulls < self.demotion_min_pulls:
+                continue
+            heuristic_demotion = self._should_demote(codec, signal, metrics)
+            decision_payoff_causes = self._decision_payoff_demotion_causes(
+                codec,
+                metrics,
+            )
+            decision_payoff_demotion = bool(decision_payoff_causes)
+            if not (heuristic_demotion or decision_payoff_demotion):
+                continue
+            for candidate in tuple(self._codecs):
+                if self._should_disable_with(codec, candidate):
+                    parent = self._parent_codec(candidate) or codec
+                    key = action_codec_key(candidate)
+                    self._record_action_space_decision(
+                        kind="demotion",
+                        codec=candidate,
+                        parent=parent,
+                        source=codec,
+                        metrics=metrics,
+                    )
+                    self._codecs.remove(candidate)
+                    self._disabled_codec_keys.add(key)
+                    disabled.add(key)
+                    self._demotions += 1
+                    if decision_payoff_demotion and not heuristic_demotion:
+                        self._decision_payoff_demotions += 1
+                        if "source_token_throughput" in decision_payoff_causes:
+                            self._source_token_throughput_payoff_demotions += 1
+        return disabled
+
+    def _should_demote(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
+        if signal.unsafe_rate > self.unsafe_rate_threshold:
+            return True
+        if signal.quality < self.demotion_quality_threshold:
+            return True
+        if signal.semantic_bandwidth < self.demotion_semantic_bandwidth_threshold:
+            return True
+        if signal.reconstruction_drift > self.demotion_max_reconstruction_drift:
+            return True
+        if signal.old_logprob_coverage < self.demotion_min_old_logprob_coverage:
+            return True
+        if signal.new_logprob_coverage < self.demotion_min_new_logprob_coverage:
+            return True
+        if (
+            signal.reference_logprob_coverage
+            < self.demotion_min_reference_logprob_coverage
+        ):
+            return True
+        if self._parent_outperforms(codec, signal, metrics):
+            return True
+        return signal.objective <= self.demotion_objective_threshold
+
+    def _decision_payoff_demotion_causes(
+        self,
+        codec: ActionCodec,
+        metrics: Mapping[str, float],
+    ) -> set[str]:
+        parent = self._parent_codec(codec)
+        decision_key = _action_space_decision_key(
+            kind="promotion",
+            codec_key=action_codec_key(codec),
+            parent_key=action_codec_key(parent) if parent is not None else None,
+        )
+        stats = self._decision_stats.get(decision_key)
+        if stats is None or stats.kind != "promotion":
+            return set()
+        self._update_decision_payoff(stats, metrics)
+        if (
+            stats.post_decision_observations
+            < self.demotion_decision_min_observations
+        ):
+            return set()
+        causes: set[str] = set()
+        if (
+            stats.realized_objective_payoff
+            <= self.demotion_decision_payoff_threshold
+        ):
+            causes.add("objective")
+        source_token_threshold = (
+            self.demotion_decision_source_token_throughput_payoff_threshold
+        )
+        if (
+            source_token_threshold is not None
+            and self._has_source_token_throughput_payoff_evidence(stats)
+            and stats.realized_source_token_throughput_payoff
+            <= source_token_threshold
+        ):
+            causes.add("source_token_throughput")
+        return causes
+
+    @staticmethod
+    def _has_source_token_throughput_payoff_evidence(
+        stats: "_ActionSpaceDecisionStats",
+    ) -> bool:
+        return (
+            stats.target_source_tokens_per_dollar_second > 0.0
+            or stats.parent_source_tokens_per_dollar_second > 0.0
+        )
+
+    def _parent_outperforms(
+        self,
+        codec: ActionCodec,
+        signal: "_CodecSignal",
+        metrics: Mapping[str, float],
+    ) -> bool:
+        parent = self._parent_codec(codec)
+        if parent is None:
+            return False
+        parent_signal = self._codec_signal(parent, metrics)
+        if parent_signal.pulls < self.demotion_min_pulls:
+            return False
+        if parent_signal.unsafe_rate > self.unsafe_rate_threshold:
+            return False
+        if parent_signal.quality < self.demotion_quality_threshold:
+            return False
+        margin = self.demotion_parent_source_token_throughput_margin
+        if (
+            margin > 0.0
+            and parent_signal.source_tokens_per_dollar_second > 0.0
+            and parent_signal.source_tokens_per_dollar_second
+            > signal.source_tokens_per_dollar_second + margin
+        ):
+            return True
+        return parent_signal.objective > (
+            signal.objective + self.demotion_parent_margin
+        )
+
+    def _is_protected_codec(self, codec: ActionCodec) -> bool:
+        if isinstance(codec, TokenActionCodec):
+            return True
+        return (
+            isinstance(codec, ChunkActionCodec)
+            and codec.chunk_size <= self.min_chunk_size
+        )
+
+    def _should_disable_with(
+        self,
+        demoted_codec: ActionCodec,
+        candidate: ActionCodec,
+    ) -> bool:
+        if self._is_protected_codec(candidate):
+            return False
+        if action_codec_key(candidate) == action_codec_key(demoted_codec):
+            return True
+        if not isinstance(demoted_codec, ChunkActionCodec):
+            return False
+        if isinstance(candidate, ChunkActionCodec):
+            return candidate.chunk_size >= demoted_codec.chunk_size
+        return (
+            isinstance(candidate, LatentPatchActionCodec)
+            and candidate.patch_size >= demoted_codec.chunk_size
+        )
+
+    def _parent_codec(self, codec: ActionCodec) -> ActionCodec | None:
+        if isinstance(codec, ChunkActionCodec):
+            return self._nearest_smaller_chunk(codec) or self._token_codec()
+        if isinstance(codec, LatentPatchActionCodec):
+            chunks = [
+                candidate
+                for candidate in self._codecs
+                if (
+                    isinstance(candidate, ChunkActionCodec)
+                    and candidate.chunk_size <= codec.patch_size
+                )
+            ]
+            if not chunks:
+                return None
+            return max(chunks, key=lambda candidate: candidate.chunk_size)
+        return None
+
+    def _token_codec(self) -> TokenActionCodec | None:
+        for codec in self._codecs:
+            if isinstance(codec, TokenActionCodec):
+                return codec
+        return None
+
+    def _nearest_smaller_chunk(
+        self,
+        codec: ChunkActionCodec,
+    ) -> ChunkActionCodec | None:
+        smaller = [
+            candidate
+            for candidate in self._codecs
+            if (
+                isinstance(candidate, ChunkActionCodec)
+                and candidate.chunk_size < codec.chunk_size
+            )
+        ]
+        if not smaller:
+            return None
+        return max(smaller, key=lambda candidate: candidate.chunk_size)
+
+    def _record_action_space_decision(
+        self,
+        *,
+        kind: str,
+        codec: ActionCodec,
+        parent: ActionCodec | None,
+        source: ActionCodec | None,
+        metrics: Mapping[str, float],
+    ) -> None:
+        codec_key = action_codec_key(codec)
+        parent_key = action_codec_key(parent) if parent is not None else None
+        source_key = action_codec_key(source) if source is not None else None
+        decision_key = _action_space_decision_key(
+            kind=kind,
+            codec_key=codec_key,
+            parent_key=parent_key,
+        )
+        stats = self._decision_stats.get(decision_key)
+        if stats is None:
+            stats = _ActionSpaceDecisionStats(
+                kind=kind,
+                codec_key=codec_key,
+                parent_codec_key=parent_key,
+                source_codec_key=source_key,
+            )
+            self._decision_stats[decision_key] = stats
+        stats.decisions += 1
+        stats.source_codec_key = source_key
+        self._update_decision_payoff(stats, metrics, record_baseline=True)
+
+    def _refresh_decision_payoffs(self, metrics: Mapping[str, float]) -> None:
+        for stats in self._decision_stats.values():
+            self._update_decision_payoff(stats, metrics)
+
+    def _update_decision_payoff(
+        self,
+        stats: "_ActionSpaceDecisionStats",
+        metrics: Mapping[str, float],
+        *,
+        record_baseline: bool = False,
+    ) -> None:
+        target_signal = self._codec_signal_for_key(stats.codec_key, metrics)
+        parent_signal = (
+            self._codec_signal_for_key(stats.parent_codec_key, metrics)
+            if stats.parent_codec_key is not None
+            else _CodecSignal.empty()
+        )
+        if record_baseline and not stats.has_decision_baseline:
+            stats.decision_target_pulls = target_signal.pulls
+            stats.decision_parent_pulls = parent_signal.pulls
+            stats.has_decision_baseline = True
+        stats.target_pulls = target_signal.pulls
+        stats.parent_pulls = parent_signal.pulls
+        stats.target_objective = target_signal.objective
+        stats.parent_objective = parent_signal.objective
+        stats.objective_delta_vs_parent = (
+            target_signal.objective - parent_signal.objective
+        )
+        stats.target_source_tokens_per_dollar_second = (
+            target_signal.source_tokens_per_dollar_second
+        )
+        stats.parent_source_tokens_per_dollar_second = (
+            parent_signal.source_tokens_per_dollar_second
+        )
+        stats.source_token_throughput_delta_vs_parent = (
+            target_signal.source_tokens_per_dollar_second
+            - parent_signal.source_tokens_per_dollar_second
+        )
+        if stats.kind == "demotion":
+            stats.estimated_objective_payoff = (
+                parent_signal.objective - target_signal.objective
+            )
+        else:
+            stats.estimated_objective_payoff = (
+                target_signal.objective - parent_signal.objective
+            )
+        stats.post_decision_target_pulls = max(
+            0.0,
+            target_signal.pulls - stats.decision_target_pulls,
+        )
+        stats.post_decision_parent_pulls = max(
+            0.0,
+            parent_signal.pulls - stats.decision_parent_pulls,
+        )
+        if stats.kind == "demotion":
+            post_decision_observations = stats.post_decision_parent_pulls
+            source_token_payoff = (
+                parent_signal.source_tokens_per_dollar_second
+                - target_signal.source_tokens_per_dollar_second
+            )
+        else:
+            post_decision_observations = stats.post_decision_target_pulls
+            source_token_payoff = (
+                target_signal.source_tokens_per_dollar_second
+                - parent_signal.source_tokens_per_dollar_second
+            )
+        stats.post_decision_observations = post_decision_observations
+        stats.realized_objective_payoff = (
+            stats.estimated_objective_payoff * post_decision_observations
+        )
+        stats.realized_source_token_throughput_payoff = (
+            source_token_payoff * post_decision_observations
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return JSON-friendly action-space state for checkpoint/resume."""
+
+        return {
+            "version": 1,
+            "config": {
+                "min_chunk_size": self.min_chunk_size,
+                "max_chunk_size": self.max_chunk_size,
+                "promotion_objective_threshold": (
+                    self.promotion_objective_threshold
+                ),
+                "promotion_parent_margin": self.promotion_parent_margin,
+                "promotion_quality_threshold": self.promotion_quality_threshold,
+                "promotion_semantic_bandwidth_threshold": (
+                    self.promotion_semantic_bandwidth_threshold
+                ),
+                "promotion_parent_source_token_throughput_margin": (
+                    self.promotion_parent_source_token_throughput_margin
+                ),
+                "promotion_max_reconstruction_drift": (
+                    self.promotion_max_reconstruction_drift
+                ),
+                "promotion_min_old_logprob_coverage": (
+                    self.promotion_min_old_logprob_coverage
+                ),
+                "promotion_min_new_logprob_coverage": (
+                    self.promotion_min_new_logprob_coverage
+                ),
+                "promotion_min_reference_logprob_coverage": (
+                    self.promotion_min_reference_logprob_coverage
+                ),
+                "promotion_min_pulls": self.promotion_min_pulls,
+                "unsafe_rate_threshold": self.unsafe_rate_threshold,
+                "demotion_objective_threshold": self.demotion_objective_threshold,
+                "demotion_parent_margin": self.demotion_parent_margin,
+                "demotion_quality_threshold": self.demotion_quality_threshold,
+                "demotion_semantic_bandwidth_threshold": (
+                    self.demotion_semantic_bandwidth_threshold
+                ),
+                "demotion_parent_source_token_throughput_margin": (
+                    self.demotion_parent_source_token_throughput_margin
+                ),
+                "demotion_max_reconstruction_drift": (
+                    self.demotion_max_reconstruction_drift
+                ),
+                "demotion_min_old_logprob_coverage": (
+                    self.demotion_min_old_logprob_coverage
+                ),
+                "demotion_min_new_logprob_coverage": (
+                    self.demotion_min_new_logprob_coverage
+                ),
+                "demotion_min_reference_logprob_coverage": (
+                    self.demotion_min_reference_logprob_coverage
+                ),
+                "demotion_min_pulls": self.demotion_min_pulls,
+                "demotion_decision_payoff_threshold": (
+                    self.demotion_decision_payoff_threshold
+                ),
+                "demotion_decision_source_token_throughput_payoff_threshold": (
+                    self.demotion_decision_source_token_throughput_payoff_threshold
+                ),
+                "demotion_decision_min_observations": (
+                    self.demotion_decision_min_observations
+                ),
+                "demote_on_stale_feedback": self.demote_on_stale_feedback,
+                "promote_latent_patches": self.promote_latent_patches,
+                "latent_patch_latent_size": self.latent_patch_latent_size,
+                "include_token": self.include_token,
+            },
+            "active_codecs": [_codec_to_state(codec) for codec in self._codecs],
+            "disabled_codec_keys": sorted(self._disabled_codec_keys),
+            "learning_state": {
+                "promotions": self._promotions,
+                "demotions": self._demotions,
+                "decision_payoff_demotions": self._decision_payoff_demotions,
+                "source_token_throughput_payoff_demotions": (
+                    self._source_token_throughput_payoff_demotions
+                ),
+            },
+            "decision_stats": {
+                key: _action_space_decision_stats_state(stats)
+                for key, stats in sorted(self._decision_stats.items())
+            },
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Load state produced by :meth:`state_dict`.
+
+        Built-in codecs are reconstructed directly. Unknown custom codecs are
+        restored only if an equivalent codec is already present on this action
+        space, preserving the user-code ownership of arbitrary action units.
+        """
+
+        config = _mapping_state(state.get("config"))
+        self.min_chunk_size = _state_int(
+            config.get("min_chunk_size"),
+            self.min_chunk_size,
+        )
+        self.max_chunk_size = _state_int(
+            config.get("max_chunk_size"),
+            self.max_chunk_size,
+        )
+        self.promotion_objective_threshold = _state_float(
+            config.get("promotion_objective_threshold"),
+            self.promotion_objective_threshold,
+        )
+        self.promotion_parent_margin = _state_float(
+            config.get("promotion_parent_margin"),
+            self.promotion_parent_margin,
+        )
+        self.promotion_quality_threshold = _state_float(
+            config.get("promotion_quality_threshold"),
+            self.promotion_quality_threshold,
+        )
+        self.promotion_semantic_bandwidth_threshold = _state_float(
+            config.get("promotion_semantic_bandwidth_threshold"),
+            self.promotion_semantic_bandwidth_threshold,
+        )
+        self.promotion_parent_source_token_throughput_margin = _state_float(
+            config.get("promotion_parent_source_token_throughput_margin"),
+            self.promotion_parent_source_token_throughput_margin,
+        )
+        self.promotion_max_reconstruction_drift = _state_float(
+            config.get("promotion_max_reconstruction_drift"),
+            self.promotion_max_reconstruction_drift,
+        )
+        self.promotion_min_old_logprob_coverage = _state_float(
+            config.get("promotion_min_old_logprob_coverage"),
+            self.promotion_min_old_logprob_coverage,
+        )
+        self.promotion_min_new_logprob_coverage = _state_float(
+            config.get("promotion_min_new_logprob_coverage"),
+            self.promotion_min_new_logprob_coverage,
+        )
+        self.promotion_min_reference_logprob_coverage = _state_float(
+            config.get("promotion_min_reference_logprob_coverage"),
+            self.promotion_min_reference_logprob_coverage,
+        )
+        self.promotion_min_pulls = _state_int(
+            config.get("promotion_min_pulls"),
+            self.promotion_min_pulls,
+        )
+        self.unsafe_rate_threshold = _state_float(
+            config.get("unsafe_rate_threshold"),
+            self.unsafe_rate_threshold,
+        )
+        self.demotion_objective_threshold = _state_float(
+            config.get("demotion_objective_threshold"),
+            self.demotion_objective_threshold,
+        )
+        self.demotion_parent_margin = _state_float(
+            config.get("demotion_parent_margin"),
+            self.demotion_parent_margin,
+        )
+        self.demotion_quality_threshold = _state_float(
+            config.get("demotion_quality_threshold"),
+            self.demotion_quality_threshold,
+        )
+        self.demotion_semantic_bandwidth_threshold = _state_float(
+            config.get("demotion_semantic_bandwidth_threshold"),
+            self.demotion_semantic_bandwidth_threshold,
+        )
+        self.demotion_parent_source_token_throughput_margin = _state_float(
+            config.get("demotion_parent_source_token_throughput_margin"),
+            self.demotion_parent_source_token_throughput_margin,
+        )
+        self.demotion_max_reconstruction_drift = _state_float(
+            config.get("demotion_max_reconstruction_drift"),
+            self.demotion_max_reconstruction_drift,
+        )
+        self.demotion_min_old_logprob_coverage = _state_float(
+            config.get("demotion_min_old_logprob_coverage"),
+            self.demotion_min_old_logprob_coverage,
+        )
+        self.demotion_min_new_logprob_coverage = _state_float(
+            config.get("demotion_min_new_logprob_coverage"),
+            self.demotion_min_new_logprob_coverage,
+        )
+        self.demotion_min_reference_logprob_coverage = _state_float(
+            config.get("demotion_min_reference_logprob_coverage"),
+            self.demotion_min_reference_logprob_coverage,
+        )
+        self.demotion_min_pulls = _state_int(
+            config.get("demotion_min_pulls"),
+            self.demotion_min_pulls,
+        )
+        self.demotion_decision_payoff_threshold = _state_float(
+            config.get("demotion_decision_payoff_threshold"),
+            self.demotion_decision_payoff_threshold,
+        )
+        self.demotion_decision_source_token_throughput_payoff_threshold = (
+            _state_optional_float(
+                config.get(
+                    "demotion_decision_source_token_throughput_payoff_threshold"
+                ),
+                self.demotion_decision_source_token_throughput_payoff_threshold,
+            )
+        )
+        self.demotion_decision_min_observations = _state_int(
+            config.get("demotion_decision_min_observations"),
+            self.demotion_decision_min_observations,
+        )
+        self.demote_on_stale_feedback = _state_bool(
+            config.get("demote_on_stale_feedback"),
+            self.demote_on_stale_feedback,
+        )
+        self.promote_latent_patches = _state_bool(
+            config.get("promote_latent_patches"),
+            self.promote_latent_patches,
+        )
+        self.latent_patch_latent_size = _state_int(
+            config.get("latent_patch_latent_size"),
+            self.latent_patch_latent_size,
+        )
+        self.include_token = _state_bool(
+            config.get("include_token"),
+            self.include_token,
+        )
+        self.min_chunk_size = max(1, self.min_chunk_size)
+        self.max_chunk_size = max(self.min_chunk_size, self.max_chunk_size)
+        self.promotion_semantic_bandwidth_threshold = max(
+            0.0,
+            self.promotion_semantic_bandwidth_threshold,
+        )
+        self.promotion_parent_margin = max(0.0, self.promotion_parent_margin)
+        self.promotion_parent_source_token_throughput_margin = max(
+            0.0,
+            self.promotion_parent_source_token_throughput_margin,
+        )
+        self.promotion_max_reconstruction_drift = max(
+            0.0,
+            self.promotion_max_reconstruction_drift,
+        )
+        self.promotion_min_old_logprob_coverage = _clamp_fraction(
+            self.promotion_min_old_logprob_coverage
+        )
+        self.promotion_min_new_logprob_coverage = _clamp_fraction(
+            self.promotion_min_new_logprob_coverage
+        )
+        self.promotion_min_reference_logprob_coverage = _clamp_fraction(
+            self.promotion_min_reference_logprob_coverage
+        )
+        self.promotion_min_pulls = max(0, self.promotion_min_pulls)
+        self.demotion_semantic_bandwidth_threshold = max(
+            0.0,
+            self.demotion_semantic_bandwidth_threshold,
+        )
+        self.demotion_parent_margin = max(0.0, self.demotion_parent_margin)
+        self.demotion_parent_source_token_throughput_margin = max(
+            0.0,
+            self.demotion_parent_source_token_throughput_margin,
+        )
+        self.demotion_max_reconstruction_drift = max(
+            0.0,
+            self.demotion_max_reconstruction_drift,
+        )
+        self.demotion_min_old_logprob_coverage = _clamp_fraction(
+            self.demotion_min_old_logprob_coverage
+        )
+        self.demotion_min_new_logprob_coverage = _clamp_fraction(
+            self.demotion_min_new_logprob_coverage
+        )
+        self.demotion_min_reference_logprob_coverage = _clamp_fraction(
+            self.demotion_min_reference_logprob_coverage
+        )
+        self.demotion_min_pulls = max(0, self.demotion_min_pulls)
+        self.demotion_decision_min_observations = max(
+            1,
+            self.demotion_decision_min_observations,
+        )
+        self.latent_patch_latent_size = max(1, self.latent_patch_latent_size)
+
+        active_codec_states = state.get("active_codecs")
+        if isinstance(active_codec_states, (list, tuple)) and not isinstance(
+            active_codec_states,
+            (str, bytes),
+        ):
+            existing_by_key = {
+                action_codec_key(codec): codec for codec in self._codecs
+            }
+            restored_codecs: list[ActionCodec] = []
+            restored_keys: set[str] = set()
+            for codec_state in active_codec_states:
+                codec = _codec_from_state(codec_state, existing_by_key)
+                if codec is None:
+                    continue
+                key = action_codec_key(codec)
+                if key in restored_keys:
+                    continue
+                restored_codecs.append(codec)
+                restored_keys.add(key)
+            if restored_codecs:
+                self._codecs = restored_codecs
+                disabled = _string_set_state(state.get("disabled_codec_keys"))
+                self._disabled_codec_keys = disabled - restored_keys
+
+        learning_state = _mapping_state(state.get("learning_state"))
+        self._promotions = _state_int(
+            learning_state.get("promotions"),
+            self._promotions,
+        )
+        self._demotions = _state_int(
+            learning_state.get("demotions"),
+            self._demotions,
+        )
+        self._decision_payoff_demotions = _state_int(
+            learning_state.get("decision_payoff_demotions"),
+            self._decision_payoff_demotions,
+        )
+        self._source_token_throughput_payoff_demotions = _state_int(
+            learning_state.get("source_token_throughput_payoff_demotions"),
+            self._source_token_throughput_payoff_demotions,
+        )
+        self._decision_stats = _action_space_decision_stats_from_state(
+            state.get("decision_stats")
+        )
+
+    def metrics(self) -> dict[str, float]:
+        decision_count = sum(stats.decisions for stats in self._decision_stats.values())
+        decision_post_observations = sum(
+            stats.post_decision_observations
+            for stats in self._decision_stats.values()
+        )
+        realized_objective_payoff = sum(
+            stats.realized_objective_payoff
+            for stats in self._decision_stats.values()
+        )
+        realized_source_token_throughput_payoff = sum(
+            stats.realized_source_token_throughput_payoff
+            for stats in self._decision_stats.values()
+        )
+        values = {
+            "action_space/active_codecs": float(len(self._codecs)),
+            "action_space/promotions": float(self._promotions),
+            "action_space/demotions": float(self._demotions),
+            "action_space/decision_payoff_demotions": float(
+                self._decision_payoff_demotions
+            ),
+            "action_space/source_token_throughput_payoff_demotions": float(
+                self._source_token_throughput_payoff_demotions
+            ),
+            "action_space/disabled_codecs": float(len(self._disabled_codec_keys)),
+            "action_space/max_chunk_size": float(self._active_max_chunk_size()),
+            "action_space/promotion_min_old_logprob_coverage": (
+                self.promotion_min_old_logprob_coverage
+            ),
+            "action_space/promotion_min_new_logprob_coverage": (
+                self.promotion_min_new_logprob_coverage
+            ),
+            "action_space/promotion_min_reference_logprob_coverage": (
+                self.promotion_min_reference_logprob_coverage
+            ),
+            "action_space/promotion_parent_source_token_throughput_margin": (
+                self.promotion_parent_source_token_throughput_margin
+            ),
+            "action_space/demotion_min_old_logprob_coverage": (
+                self.demotion_min_old_logprob_coverage
+            ),
+            "action_space/demotion_min_new_logprob_coverage": (
+                self.demotion_min_new_logprob_coverage
+            ),
+            "action_space/demotion_min_reference_logprob_coverage": (
+                self.demotion_min_reference_logprob_coverage
+            ),
+            "action_space/demotion_parent_source_token_throughput_margin": (
+                self.demotion_parent_source_token_throughput_margin
+            ),
+            "action_space/demotion_decision_payoff_threshold": (
+                self.demotion_decision_payoff_threshold
+            ),
+            "action_space/demotion_decision_source_token_throughput_payoff_enabled": (
+                1.0
+                if self.demotion_decision_source_token_throughput_payoff_threshold
+                is not None
+                else 0.0
+            ),
+            "action_space/demotion_decision_source_token_throughput_payoff_threshold": (
+                self.demotion_decision_source_token_throughput_payoff_threshold
+                if self.demotion_decision_source_token_throughput_payoff_threshold
+                is not None
+                else 0.0
+            ),
+            "action_space/demotion_decision_min_observations": float(
+                self.demotion_decision_min_observations
+            ),
+            "action_space/demote_on_stale_feedback": (
+                1.0 if self.demote_on_stale_feedback else 0.0
+            ),
+            "action_space/decision/decisions": float(decision_count),
+            "action_space/decision/post_decision_observations": (
+                decision_post_observations
+            ),
+            "action_space/decision/realized_objective_payoff": (
+                realized_objective_payoff
+            ),
+            "action_space/decision/"
+            "mean_realized_objective_payoff_per_decision": (
+                realized_objective_payoff / decision_count
+                if decision_count
+                else 0.0
+            ),
+            "action_space/decision/"
+            "mean_realized_objective_payoff_per_post_decision_observation": (
+                realized_objective_payoff / decision_post_observations
+                if decision_post_observations
+                else 0.0
+            ),
+            "action_space/decision/realized_source_token_throughput_payoff": (
+                realized_source_token_throughput_payoff
+            ),
+            "action_space/decision/"
+            "mean_realized_source_token_throughput_payoff_per_decision": (
+                realized_source_token_throughput_payoff / decision_count
+                if decision_count
+                else 0.0
+            ),
+            "action_space/decision/"
+            "mean_realized_source_token_throughput_payoff_per_"
+            "post_decision_observation": (
+                realized_source_token_throughput_payoff
+                / decision_post_observations
+                if decision_post_observations
+                else 0.0
+            ),
+        }
+        for codec in self._codecs:
+            values[
+                f"action_space/codec/{safe_metric_key(action_codec_key(codec))}/active"
+            ] = 1.0
+        for key in self._disabled_codec_keys:
+            values[f"action_space/codec/{safe_metric_key(key)}/disabled"] = 1.0
+        for key, stats in sorted(self._decision_stats.items()):
+            prefix = f"action_space/decision/{safe_metric_key(key)}"
+            values[f"{prefix}/decisions"] = float(stats.decisions)
+            values[f"{prefix}/promotion"] = 1.0 if stats.kind == "promotion" else 0.0
+            values[f"{prefix}/demotion"] = 1.0 if stats.kind == "demotion" else 0.0
+            values[f"{prefix}/target_pulls"] = stats.target_pulls
+            values[f"{prefix}/parent_pulls"] = stats.parent_pulls
+            values[f"{prefix}/target_objective"] = stats.target_objective
+            values[f"{prefix}/parent_objective"] = stats.parent_objective
+            values[f"{prefix}/objective_delta_vs_parent"] = (
+                stats.objective_delta_vs_parent
+            )
+            values[f"{prefix}/estimated_objective_payoff"] = (
+                stats.estimated_objective_payoff
+            )
+            values[f"{prefix}/target_source_tokens_per_dollar_second"] = (
+                stats.target_source_tokens_per_dollar_second
+            )
+            values[f"{prefix}/parent_source_tokens_per_dollar_second"] = (
+                stats.parent_source_tokens_per_dollar_second
+            )
+            values[f"{prefix}/source_token_throughput_delta_vs_parent"] = (
+                stats.source_token_throughput_delta_vs_parent
+            )
+            values[f"{prefix}/decision_target_pulls"] = (
+                stats.decision_target_pulls
+            )
+            values[f"{prefix}/decision_parent_pulls"] = (
+                stats.decision_parent_pulls
+            )
+            values[f"{prefix}/post_decision_target_pulls"] = (
+                stats.post_decision_target_pulls
+            )
+            values[f"{prefix}/post_decision_parent_pulls"] = (
+                stats.post_decision_parent_pulls
+            )
+            values[f"{prefix}/post_decision_observations"] = (
+                stats.post_decision_observations
+            )
+            values[f"{prefix}/realized_objective_payoff"] = (
+                stats.realized_objective_payoff
+            )
+            values[f"{prefix}/mean_realized_objective_payoff_per_decision"] = (
+                stats.realized_objective_payoff / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_objective_payoff_per_post_decision_observation"
+            ] = (
+                stats.realized_objective_payoff / stats.post_decision_observations
+                if stats.post_decision_observations
+                else 0.0
+            )
+            values[f"{prefix}/realized_source_token_throughput_payoff"] = (
+                stats.realized_source_token_throughput_payoff
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_decision"
+            ] = (
+                stats.realized_source_token_throughput_payoff / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            values[
+                f"{prefix}/"
+                "mean_realized_source_token_throughput_payoff_per_"
+                "post_decision_observation"
+            ] = (
+                stats.realized_source_token_throughput_payoff
+                / stats.post_decision_observations
+                if stats.post_decision_observations
+                else 0.0
+            )
+        return values
+
+    def _active_max_chunk_size(self) -> int:
+        chunk_sizes = [
+            codec.chunk_size
+            for codec in self._codecs
+            if isinstance(codec, ChunkActionCodec)
+        ]
+        return max(chunk_sizes) if chunk_sizes else 0
+
+    def _codec_signal(
+        self,
+        codec: ActionCodec,
+        metrics: Mapping[str, float],
+    ) -> "_CodecSignal":
+        return self._codec_signal_for_key(action_codec_key(codec), metrics)
+
+    def _codec_signal_for_key(
+        self,
+        codec_key: str | None,
+        metrics: Mapping[str, float],
+    ) -> "_CodecSignal":
+        if codec_key is None:
+            return _CodecSignal.empty()
+        fragment = safe_metric_key(codec_key)
+        scored_objective_values: list[float] = []
+        fallback_objective_values: list[float] = []
+        quality_values: list[float] = []
+        unsafe_values: list[float] = []
+        failure_values: list[float] = []
+        pull_values: list[float] = []
+        semantic_bandwidth_values: list[float] = []
+        source_token_throughput_values: list[float] = []
+        reconstruction_drift_values: list[float] = []
+        old_logprob_coverage_values: list[float] = []
+        new_logprob_coverage_values: list[float] = []
+        reference_logprob_coverage_values: list[float] = []
+        for key, value in metrics.items():
+            if not key.startswith("scheduler/arm/") or f"_{fragment}/" not in key:
+                continue
+            if key.endswith("/policy_improvement_objective_ema"):
+                fallback_objective_values.append(float(value))
+            elif key.endswith("/objective_score"):
+                scored_objective_values.append(float(value))
+            elif key.endswith("/marginal_objective_ema"):
+                fallback_objective_values.append(float(value))
+            elif key.endswith("/action_quality_ema"):
+                quality_values.append(float(value))
+            elif key.endswith("/unsafe_rate"):
+                unsafe_values.append(float(value))
+            elif key.endswith("/failure_rate"):
+                failure_values.append(float(value))
+            elif key.endswith("/pulls"):
+                pull_values.append(float(value))
+            elif key.endswith("/semantic_bandwidth_tokens_per_decision"):
+                semantic_bandwidth_values.append(float(value))
+            elif key.endswith("/source_tokens_per_dollar_second"):
+                source_token_throughput_values.append(float(value))
+            elif key.endswith("/reconstruction_max_drift"):
+                reconstruction_drift_values.append(float(value))
+            elif key.endswith("/reconstruction_drift_ema"):
+                reconstruction_drift_values.append(float(value))
+            elif key.endswith("/old_logprob_coverage"):
+                old_logprob_coverage_values.append(float(value))
+            elif key.endswith("/new_logprob_coverage"):
+                new_logprob_coverage_values.append(float(value))
+            elif key.endswith("/reference_logprob_coverage"):
+                reference_logprob_coverage_values.append(float(value))
+        return _CodecSignal(
+            objective=self._codec_objective(
+                scored_objective_values,
+                fallback_objective_values,
+            ),
+            quality=min(quality_values) if quality_values else 0.0,
+            unsafe_rate=max(unsafe_values + failure_values)
+            if unsafe_values or failure_values
+            else 0.0,
+            pulls=sum(pull_values),
+            semantic_bandwidth=(
+                max(semantic_bandwidth_values)
+                if semantic_bandwidth_values
+                else 0.0
+            ),
+            source_tokens_per_dollar_second=(
+                max(source_token_throughput_values)
+                if source_token_throughput_values
+                else 0.0
+            ),
+            reconstruction_drift=(
+                max(reconstruction_drift_values)
+                if reconstruction_drift_values
+                else 0.0
+            ),
+            old_logprob_coverage=(
+                min(old_logprob_coverage_values)
+                if old_logprob_coverage_values
+                else 0.0
+            ),
+            new_logprob_coverage=(
+                min(new_logprob_coverage_values)
+                if new_logprob_coverage_values
+                else 0.0
+            ),
+            reference_logprob_coverage=(
+                min(reference_logprob_coverage_values)
+                if reference_logprob_coverage_values
+                else 0.0
+            ),
+        )
+
+    @staticmethod
+    def _codec_objective(
+        scored_values: Sequence[float],
+        fallback_values: Sequence[float],
+    ) -> float:
+        if scored_values:
+            return max(scored_values)
+        if fallback_values:
+            return max(fallback_values)
+        return 0.0
+
+
+@dataclass(frozen=True)
+class _CodecSignal:
+    objective: float
+    quality: float
+    unsafe_rate: float
+    pulls: float
+    semantic_bandwidth: float
+    source_tokens_per_dollar_second: float
+    reconstruction_drift: float
+    old_logprob_coverage: float
+    new_logprob_coverage: float
+    reference_logprob_coverage: float
+
+    @classmethod
+    def empty(cls) -> "_CodecSignal":
+        return cls(
+            objective=0.0,
+            quality=0.0,
+            unsafe_rate=0.0,
+            pulls=0.0,
+            semantic_bandwidth=0.0,
+            source_tokens_per_dollar_second=0.0,
+            reconstruction_drift=0.0,
+            old_logprob_coverage=0.0,
+            new_logprob_coverage=0.0,
+            reference_logprob_coverage=0.0,
+        )
+
+
+@dataclass
+class _ActionSpaceDecisionStats:
+    kind: str
+    codec_key: str
+    parent_codec_key: str | None = None
+    source_codec_key: str | None = None
+    decisions: int = 0
+    target_pulls: float = 0.0
+    parent_pulls: float = 0.0
+    target_objective: float = 0.0
+    parent_objective: float = 0.0
+    objective_delta_vs_parent: float = 0.0
+    estimated_objective_payoff: float = 0.0
+    target_source_tokens_per_dollar_second: float = 0.0
+    parent_source_tokens_per_dollar_second: float = 0.0
+    source_token_throughput_delta_vs_parent: float = 0.0
+    has_decision_baseline: bool = False
+    decision_target_pulls: float = 0.0
+    decision_parent_pulls: float = 0.0
+    post_decision_target_pulls: float = 0.0
+    post_decision_parent_pulls: float = 0.0
+    post_decision_observations: float = 0.0
+    realized_objective_payoff: float = 0.0
+    realized_source_token_throughput_payoff: float = 0.0
+
+
+def action_space_checkpoint_metadata(action_space: Any | None) -> dict[str, Any]:
+    """Return checkpoint metadata for action spaces with snapshot support."""
+
+    if action_space is None:
+        return {}
+    state_dict = getattr(action_space, "state_dict", None)
+    if state_dict is None:
+        return {}
+    state = state_dict()
+    if not isinstance(state, Mapping):
+        return {}
+    return {ACTION_SPACE_STATE_KEY: state}
+
+
+def _codec_to_state(codec: ActionCodec) -> dict[str, Any]:
+    key = action_codec_key(codec)
+    if isinstance(codec, TokenActionCodec):
+        return {"type": "token", "key": key}
+    if isinstance(codec, ChunkActionCodec):
+        return {
+            "type": "chunk",
+            "key": key,
+            "chunk_size": codec.chunk_size,
+        }
+    if isinstance(codec, LatentPatchActionCodec):
+        return {
+            "type": "latent_patch",
+            "key": key,
+            "patch_size": codec.patch_size,
+            "latent_size": codec.latent_size,
+        }
+    if isinstance(codec, CommandActionCodec):
+        return {"type": "command", "key": key}
+    if isinstance(codec, ReasoningStepCodec):
+        return {"type": "reasoning_step", "key": key}
+    return {"type": "unknown", "key": key}
+
+
+def _codec_from_state(
+    value: Any,
+    existing_by_key: Mapping[str, ActionCodec],
+) -> ActionCodec | None:
+    state = _mapping_state(value)
+    codec_type = state.get("type")
+    key = str(state.get("key", ""))
+    if codec_type == "token":
+        return TokenActionCodec()
+    if codec_type == "chunk":
+        return ChunkActionCodec(
+            chunk_size=max(1, _state_int(state.get("chunk_size"), 1))
+        )
+    if codec_type == "latent_patch":
+        return LatentPatchActionCodec(
+            patch_size=max(1, _state_int(state.get("patch_size"), 1)),
+            latent_size=max(1, _state_int(state.get("latent_size"), 1)),
+        )
+    if codec_type == "command":
+        return CommandActionCodec()
+    if codec_type == "reasoning_step":
+        return ReasoningStepCodec()
+    return existing_by_key.get(key)
+
+
+def _action_space_decision_key(
+    *,
+    kind: str,
+    codec_key: str,
+    parent_key: str | None,
+) -> str:
+    parent = safe_metric_key(parent_key) if parent_key is not None else "none"
+    return f"{kind}_{safe_metric_key(codec_key)}_from_{parent}"
+
+
+def _action_space_decision_stats_state(
+    stats: _ActionSpaceDecisionStats,
+) -> dict[str, Any]:
+    return {
+        "kind": stats.kind,
+        "codec_key": stats.codec_key,
+        "parent_codec_key": stats.parent_codec_key,
+        "source_codec_key": stats.source_codec_key,
+        "decisions": stats.decisions,
+        "target_pulls": stats.target_pulls,
+        "parent_pulls": stats.parent_pulls,
+        "target_objective": stats.target_objective,
+        "parent_objective": stats.parent_objective,
+        "objective_delta_vs_parent": stats.objective_delta_vs_parent,
+        "estimated_objective_payoff": stats.estimated_objective_payoff,
+        "target_source_tokens_per_dollar_second": (
+            stats.target_source_tokens_per_dollar_second
+        ),
+        "parent_source_tokens_per_dollar_second": (
+            stats.parent_source_tokens_per_dollar_second
+        ),
+        "source_token_throughput_delta_vs_parent": (
+            stats.source_token_throughput_delta_vs_parent
+        ),
+        "has_decision_baseline": stats.has_decision_baseline,
+        "decision_target_pulls": stats.decision_target_pulls,
+        "decision_parent_pulls": stats.decision_parent_pulls,
+        "post_decision_target_pulls": stats.post_decision_target_pulls,
+        "post_decision_parent_pulls": stats.post_decision_parent_pulls,
+        "post_decision_observations": stats.post_decision_observations,
+        "realized_objective_payoff": stats.realized_objective_payoff,
+        "realized_source_token_throughput_payoff": (
+            stats.realized_source_token_throughput_payoff
+        ),
+    }
+
+
+def _action_space_decision_stats_from_state(
+    value: Any,
+) -> dict[str, _ActionSpaceDecisionStats]:
+    if not isinstance(value, MappingABC):
+        return {}
+    restored: dict[str, _ActionSpaceDecisionStats] = {}
+    for key, raw_stats in value.items():
+        state = _mapping_state(raw_stats)
+        kind = str(state.get("kind", ""))
+        codec_key = str(state.get("codec_key", ""))
+        if kind not in {"promotion", "demotion"} or not codec_key:
+            continue
+        parent_codec_key = _optional_string_state(state.get("parent_codec_key"))
+        source_codec_key = _optional_string_state(state.get("source_codec_key"))
+        decision_key = str(key) or _action_space_decision_key(
+            kind=kind,
+            codec_key=codec_key,
+            parent_key=parent_codec_key,
+        )
+        restored[decision_key] = _ActionSpaceDecisionStats(
+            kind=kind,
+            codec_key=codec_key,
+            parent_codec_key=parent_codec_key,
+            source_codec_key=source_codec_key,
+            decisions=max(0, _state_int(state.get("decisions"), 0)),
+            target_pulls=max(0.0, _state_float(state.get("target_pulls"), 0.0)),
+            parent_pulls=max(0.0, _state_float(state.get("parent_pulls"), 0.0)),
+            target_objective=_state_float(state.get("target_objective"), 0.0),
+            parent_objective=_state_float(state.get("parent_objective"), 0.0),
+            objective_delta_vs_parent=_state_float(
+                state.get("objective_delta_vs_parent"),
+                0.0,
+            ),
+            estimated_objective_payoff=_state_float(
+                state.get("estimated_objective_payoff"),
+                0.0,
+            ),
+            target_source_tokens_per_dollar_second=max(
+                0.0,
+                _state_float(
+                    state.get("target_source_tokens_per_dollar_second"),
+                    0.0,
+                ),
+            ),
+            parent_source_tokens_per_dollar_second=max(
+                0.0,
+                _state_float(
+                    state.get("parent_source_tokens_per_dollar_second"),
+                    0.0,
+                ),
+            ),
+            source_token_throughput_delta_vs_parent=_state_float(
+                state.get("source_token_throughput_delta_vs_parent"),
+                0.0,
+            ),
+            has_decision_baseline=_state_bool(
+                state.get("has_decision_baseline"),
+                False,
+            ),
+            decision_target_pulls=max(
+                0.0,
+                _state_float(state.get("decision_target_pulls"), 0.0),
+            ),
+            decision_parent_pulls=max(
+                0.0,
+                _state_float(state.get("decision_parent_pulls"), 0.0),
+            ),
+            post_decision_target_pulls=max(
+                0.0,
+                _state_float(state.get("post_decision_target_pulls"), 0.0),
+            ),
+            post_decision_parent_pulls=max(
+                0.0,
+                _state_float(state.get("post_decision_parent_pulls"), 0.0),
+            ),
+            post_decision_observations=max(
+                0.0,
+                _state_float(state.get("post_decision_observations"), 0.0),
+            ),
+            realized_objective_payoff=_state_float(
+                state.get("realized_objective_payoff"),
+                0.0,
+            ),
+            realized_source_token_throughput_payoff=_state_float(
+                state.get("realized_source_token_throughput_payoff"),
+                0.0,
+            ),
+        )
+    return restored
+
+
+def _optional_string_state(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _mapping_state(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, MappingABC) else {}
+
+
+def _string_set_state(value: Any) -> set[str]:
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)):
+        return set()
+    return {str(item) for item in value if item is not None}
+
+
+def _state_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _state_float(value: Any, default: float) -> float:
+    parsed = _finite_float(value)
+    return default if parsed is None else parsed
+
+
+def _state_optional_float(value: Any, default: float | None) -> float | None:
+    if value is None:
+        return default
+    parsed = _finite_float(value)
+    return default if parsed is None else parsed
+
+
+def _clamp_fraction(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate if isfinite(candidate) else None
+
+
+def _state_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return default
