@@ -404,6 +404,7 @@ class AdaptiveActionSpace:
     promotion_parent_margin: float = 0.0
     promotion_quality_threshold: float = 0.95
     promotion_semantic_bandwidth_threshold: float = 1.0
+    promotion_parent_source_token_throughput_margin: float = 0.0
     promotion_max_reconstruction_drift: float = 0.05
     promotion_min_old_logprob_coverage: float = 0.0
     promotion_min_new_logprob_coverage: float = 0.0
@@ -414,6 +415,7 @@ class AdaptiveActionSpace:
     demotion_parent_margin: float = 0.0
     demotion_quality_threshold: float = 0.5
     demotion_semantic_bandwidth_threshold: float = 1.0
+    demotion_parent_source_token_throughput_margin: float = 0.0
     demotion_max_reconstruction_drift: float = 0.05
     demotion_min_old_logprob_coverage: float = 0.0
     demotion_min_new_logprob_coverage: float = 0.0
@@ -442,6 +444,11 @@ class AdaptiveActionSpace:
             raise ValueError(
                 "promotion_semantic_bandwidth_threshold must be non-negative"
             )
+        if self.promotion_parent_source_token_throughput_margin < 0:
+            raise ValueError(
+                "promotion_parent_source_token_throughput_margin must be "
+                "non-negative"
+            )
         if self.promotion_max_reconstruction_drift < 0:
             raise ValueError("promotion_max_reconstruction_drift must be non-negative")
         for name in (
@@ -465,6 +472,11 @@ class AdaptiveActionSpace:
         if self.demotion_semantic_bandwidth_threshold < 0:
             raise ValueError(
                 "demotion_semantic_bandwidth_threshold must be non-negative"
+            )
+        if self.demotion_parent_source_token_throughput_margin < 0:
+            raise ValueError(
+                "demotion_parent_source_token_throughput_margin must be "
+                "non-negative"
             )
         if self.demotion_max_reconstruction_drift < 0:
             raise ValueError("demotion_max_reconstruction_drift must be non-negative")
@@ -574,11 +586,32 @@ class AdaptiveActionSpace:
             return True
         parent_signal = self._codec_signal(parent, metrics)
         if parent_signal.pulls <= 0.0:
-            return True
+            return self.promotion_parent_source_token_throughput_margin <= 0.0
         if parent_signal.unsafe_rate > self.unsafe_rate_threshold:
             return True
+        if not self._parent_source_token_throughput_allows_promotion(
+            signal,
+            parent_signal,
+        ):
+            return False
         return signal.objective > (
             parent_signal.objective + self.promotion_parent_margin
+        )
+
+    def _parent_source_token_throughput_allows_promotion(
+        self,
+        signal: "_CodecSignal",
+        parent_signal: "_CodecSignal",
+    ) -> bool:
+        margin = self.promotion_parent_source_token_throughput_margin
+        if margin <= 0.0:
+            return True
+        if parent_signal.pulls <= 0.0:
+            return False
+        if parent_signal.source_tokens_per_dollar_second <= 0.0:
+            return False
+        return signal.source_tokens_per_dollar_second > (
+            parent_signal.source_tokens_per_dollar_second + margin
         )
 
     def _demote_from_metrics(self, metrics: Mapping[str, float]) -> set[str]:
@@ -643,6 +676,14 @@ class AdaptiveActionSpace:
             return False
         if parent_signal.quality < self.demotion_quality_threshold:
             return False
+        margin = self.demotion_parent_source_token_throughput_margin
+        if (
+            margin > 0.0
+            and parent_signal.source_tokens_per_dollar_second > 0.0
+            and parent_signal.source_tokens_per_dollar_second
+            > signal.source_tokens_per_dollar_second + margin
+        ):
+            return True
         return parent_signal.objective > (
             signal.objective + self.demotion_parent_margin
         )
@@ -728,6 +769,9 @@ class AdaptiveActionSpace:
                 "promotion_semantic_bandwidth_threshold": (
                     self.promotion_semantic_bandwidth_threshold
                 ),
+                "promotion_parent_source_token_throughput_margin": (
+                    self.promotion_parent_source_token_throughput_margin
+                ),
                 "promotion_max_reconstruction_drift": (
                     self.promotion_max_reconstruction_drift
                 ),
@@ -747,6 +791,9 @@ class AdaptiveActionSpace:
                 "demotion_quality_threshold": self.demotion_quality_threshold,
                 "demotion_semantic_bandwidth_threshold": (
                     self.demotion_semantic_bandwidth_threshold
+                ),
+                "demotion_parent_source_token_throughput_margin": (
+                    self.demotion_parent_source_token_throughput_margin
                 ),
                 "demotion_max_reconstruction_drift": (
                     self.demotion_max_reconstruction_drift
@@ -807,6 +854,10 @@ class AdaptiveActionSpace:
             config.get("promotion_semantic_bandwidth_threshold"),
             self.promotion_semantic_bandwidth_threshold,
         )
+        self.promotion_parent_source_token_throughput_margin = _state_float(
+            config.get("promotion_parent_source_token_throughput_margin"),
+            self.promotion_parent_source_token_throughput_margin,
+        )
         self.promotion_max_reconstruction_drift = _state_float(
             config.get("promotion_max_reconstruction_drift"),
             self.promotion_max_reconstruction_drift,
@@ -846,6 +897,10 @@ class AdaptiveActionSpace:
         self.demotion_semantic_bandwidth_threshold = _state_float(
             config.get("demotion_semantic_bandwidth_threshold"),
             self.demotion_semantic_bandwidth_threshold,
+        )
+        self.demotion_parent_source_token_throughput_margin = _state_float(
+            config.get("demotion_parent_source_token_throughput_margin"),
+            self.demotion_parent_source_token_throughput_margin,
         )
         self.demotion_max_reconstruction_drift = _state_float(
             config.get("demotion_max_reconstruction_drift"),
@@ -890,6 +945,10 @@ class AdaptiveActionSpace:
             self.promotion_semantic_bandwidth_threshold,
         )
         self.promotion_parent_margin = max(0.0, self.promotion_parent_margin)
+        self.promotion_parent_source_token_throughput_margin = max(
+            0.0,
+            self.promotion_parent_source_token_throughput_margin,
+        )
         self.promotion_max_reconstruction_drift = max(
             0.0,
             self.promotion_max_reconstruction_drift,
@@ -909,6 +968,10 @@ class AdaptiveActionSpace:
             self.demotion_semantic_bandwidth_threshold,
         )
         self.demotion_parent_margin = max(0.0, self.demotion_parent_margin)
+        self.demotion_parent_source_token_throughput_margin = max(
+            0.0,
+            self.demotion_parent_source_token_throughput_margin,
+        )
         self.demotion_max_reconstruction_drift = max(
             0.0,
             self.demotion_max_reconstruction_drift,
@@ -974,6 +1037,9 @@ class AdaptiveActionSpace:
             "action_space/promotion_min_reference_logprob_coverage": (
                 self.promotion_min_reference_logprob_coverage
             ),
+            "action_space/promotion_parent_source_token_throughput_margin": (
+                self.promotion_parent_source_token_throughput_margin
+            ),
             "action_space/demotion_min_old_logprob_coverage": (
                 self.demotion_min_old_logprob_coverage
             ),
@@ -982,6 +1048,9 @@ class AdaptiveActionSpace:
             ),
             "action_space/demotion_min_reference_logprob_coverage": (
                 self.demotion_min_reference_logprob_coverage
+            ),
+            "action_space/demotion_parent_source_token_throughput_margin": (
+                self.demotion_parent_source_token_throughput_margin
             ),
             "action_space/demote_on_stale_feedback": (
                 1.0 if self.demote_on_stale_feedback else 0.0
@@ -1016,6 +1085,7 @@ class AdaptiveActionSpace:
         failure_values: list[float] = []
         pull_values: list[float] = []
         semantic_bandwidth_values: list[float] = []
+        source_token_throughput_values: list[float] = []
         reconstruction_drift_values: list[float] = []
         old_logprob_coverage_values: list[float] = []
         new_logprob_coverage_values: list[float] = []
@@ -1039,6 +1109,8 @@ class AdaptiveActionSpace:
                 pull_values.append(float(value))
             elif key.endswith("/semantic_bandwidth_tokens_per_decision"):
                 semantic_bandwidth_values.append(float(value))
+            elif key.endswith("/source_tokens_per_dollar_second"):
+                source_token_throughput_values.append(float(value))
             elif key.endswith("/reconstruction_max_drift"):
                 reconstruction_drift_values.append(float(value))
             elif key.endswith("/reconstruction_drift_ema"):
@@ -1062,6 +1134,11 @@ class AdaptiveActionSpace:
             semantic_bandwidth=(
                 max(semantic_bandwidth_values)
                 if semantic_bandwidth_values
+                else 0.0
+            ),
+            source_tokens_per_dollar_second=(
+                max(source_token_throughput_values)
+                if source_token_throughput_values
                 else 0.0
             ),
             reconstruction_drift=(
@@ -1105,6 +1182,7 @@ class _CodecSignal:
     unsafe_rate: float
     pulls: float
     semantic_bandwidth: float
+    source_tokens_per_dollar_second: float
     reconstruction_drift: float
     old_logprob_coverage: float
     new_logprob_coverage: float

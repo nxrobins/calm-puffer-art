@@ -225,6 +225,56 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
 
+    def test_adaptive_action_space_can_require_parent_throughput_margin_for_promotion(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            promotion_parent_source_token_throughput_margin=0.25,
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_token/pulls": 3.0,
+                "scheduler/arm/task_token/objective_score": 1.0,
+                "scheduler/arm/task_token/action_quality_ema": 1.0,
+                "scheduler/arm/task_token/unsafe_rate": 0.0,
+                "scheduler/arm/task_token/source_tokens_per_dollar_second": 10.0,
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 10.1,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_token/pulls": 4.0,
+                "scheduler/arm/task_token/objective_score": 1.0,
+                "scheduler/arm/task_token/action_quality_ema": 1.0,
+                "scheduler/arm/task_token/unsafe_rate": 0.0,
+                "scheduler/arm/task_token/source_tokens_per_dollar_second": 10.0,
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 10.5,
+            }
+        )
+
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/promotions"], 1.0)
+
     def test_adaptive_action_space_can_promote_latent_patch_from_chunk_signal(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -587,6 +637,50 @@ class ActionCodecTests(unittest.TestCase):
         )
         self.assertEqual(action_space.metrics()["action_space/demotions"], 1.0)
 
+    def test_adaptive_action_space_demotes_chunk_when_parent_has_better_throughput(self):
+        action_space = AdaptiveActionSpace(
+            min_chunk_size=2,
+            max_chunk_size=4,
+            demotion_parent_source_token_throughput_margin=0.5,
+        )
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 12.0,
+            }
+        )
+        self.assertIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+
+        action_space.update_from_metrics(
+            {
+                "scheduler/arm/task_chunk_chunk_size_2/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 12.0,
+                "scheduler/arm/task_chunk_chunk_size_4/pulls": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_4/objective_score": 1.2,
+                "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 1.0,
+                "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 0.0,
+                "scheduler/arm/task_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision": 4.0,
+                "scheduler/arm/task_chunk_chunk_size_4/source_tokens_per_dollar_second": 11.0,
+            }
+        )
+
+        self.assertNotIn(
+            "chunk(chunk_size=4)",
+            [action_codec_key(codec) for codec in action_space.codecs],
+        )
+        self.assertEqual(action_space.metrics()["action_space/demotions"], 1.0)
+
     def test_adaptive_action_space_demotes_bad_latent_patch_candidate(self):
         action_space = AdaptiveActionSpace(
             min_chunk_size=2,
@@ -730,6 +824,8 @@ class ActionCodecTests(unittest.TestCase):
             max_chunk_size=8,
             promotion_parent_margin=0.1,
             demotion_parent_margin=0.25,
+            promotion_parent_source_token_throughput_margin=0.5,
+            demotion_parent_source_token_throughput_margin=0.75,
             promote_latent_patches=True,
             latent_patch_latent_size=3,
             promotion_min_pulls=2,
@@ -739,11 +835,17 @@ class ActionCodecTests(unittest.TestCase):
         )
         action_space.update_from_metrics(
             {
+                "scheduler/arm/task_token/pulls": 3.0,
+                "scheduler/arm/task_token/objective_score": 0.0,
+                "scheduler/arm/task_token/action_quality_ema": 1.0,
+                "scheduler/arm/task_token/unsafe_rate": 0.0,
+                "scheduler/arm/task_token/source_tokens_per_dollar_second": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/pulls": 3.0,
                 "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
                 "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
                 "scheduler/arm/task_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision": 2.0,
+                "scheduler/arm/task_chunk_chunk_size_2/source_tokens_per_dollar_second": 2.0,
             }
         )
         action_space.update_from_metrics(
@@ -763,10 +865,26 @@ class ActionCodecTests(unittest.TestCase):
         self.assertEqual(restored.max_chunk_size, 8)
         self.assertEqual(restored.promotion_parent_margin, 0.1)
         self.assertEqual(restored.promotion_semantic_bandwidth_threshold, 1.0)
+        self.assertEqual(
+            restored.promotion_parent_source_token_throughput_margin,
+            0.5,
+        )
+        self.assertEqual(
+            metrics["action_space/promotion_parent_source_token_throughput_margin"],
+            0.5,
+        )
         self.assertEqual(restored.promotion_max_reconstruction_drift, 0.03)
         self.assertEqual(restored.promotion_min_pulls, 2)
         self.assertEqual(restored.demotion_parent_margin, 0.25)
         self.assertEqual(restored.demotion_semantic_bandwidth_threshold, 1.0)
+        self.assertEqual(
+            restored.demotion_parent_source_token_throughput_margin,
+            0.75,
+        )
+        self.assertEqual(
+            metrics["action_space/demotion_parent_source_token_throughput_margin"],
+            0.75,
+        )
         self.assertEqual(restored.demotion_max_reconstruction_drift, 0.08)
         self.assertTrue(restored.demote_on_stale_feedback)
         self.assertEqual(metrics["action_space/demote_on_stale_feedback"], 1.0)
