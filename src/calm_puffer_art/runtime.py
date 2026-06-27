@@ -1645,6 +1645,8 @@ class ControlPlane:
                 policy_step=snapshot.step,
                 trajectory_queue=trajectory_queue,
                 train_ring=train_ring,
+                active_actor_count=active_actor_count,
+                admission_delay_s=admission_delay_s,
             )
             if self._selected_rollout_exceeds_accounted_budget(scheduler):
                 self._should_continue_training(
@@ -1767,6 +1769,8 @@ class ControlPlane:
             "estimated_rollout_dollar_seconds",
             "reserved_rollout_dollar_seconds",
             "unobserved_rollout_cost_penalty",
+            "joint_action_score",
+            "joint_action_score_weight",
         ):
             value = decision.metadata.get(key)
             if isinstance(value, bool):
@@ -2004,6 +2008,8 @@ class ControlPlane:
         policy_step: int,
         trajectory_queue: asyncio.Queue[Trajectory],
         train_ring: TrajectoryRingBuffer,
+        active_actor_count: int | None = None,
+        admission_delay_s: float | None = None,
     ) -> SchedulerDecision:
         if scheduler is not None:
             return scheduler.select_rollout(
@@ -2015,6 +2021,12 @@ class ControlPlane:
                 train_queue_pressure=self._train_queue_pressure(train_ring),
                 configured_train_batch_groups=self.config.train_batch_groups,
                 configured_max_policy_lag=self.config.max_policy_lag,
+                active_actor_count=active_actor_count,
+                rollout_admission_delay_ms=(
+                    None
+                    if admission_delay_s is None
+                    else max(0, int(round(admission_delay_s * 1000.0)))
+                ),
             )
         scenario = await sampler.next()
         codec = action_codecs[0]

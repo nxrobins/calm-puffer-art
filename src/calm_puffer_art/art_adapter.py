@@ -582,6 +582,10 @@ class AsyncArtBackend:
             action_codecs=action_codecs,
             actor_id=actor_id,
             trajectory_queue_pressure=trajectory_queue_pressure,
+            active_actor_count=admission.active_actor_count,
+            rollout_admission_delay_ms=_optional_int(
+                admission.metadata.get("scheduler/active_rollout_admission_delay_ms")
+            ),
         )
         if self._selected_rollout_exceeds_accounted_budget():
             self._cancel_rollout_decision(
@@ -750,6 +754,8 @@ class AsyncArtBackend:
         action_codecs: Sequence[ActionCodec] | None = None,
         actor_id: int = 0,
         trajectory_queue_pressure: float = 0.0,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> SchedulerDecision:
         """Choose scenario and action granularity for an external ART rollout.
 
@@ -774,6 +780,8 @@ class AsyncArtBackend:
                 train_queue_pressure=self._train_queue_pressure(),
                 configured_train_batch_groups=self.config.train_batch_groups,
                 configured_max_policy_lag=self.config.max_policy_lag,
+                active_actor_count=active_actor_count,
+                rollout_admission_delay_ms=rollout_admission_delay_ms,
             )
         scenario = scenarios[0]
         codec = codecs[0]
@@ -1748,12 +1756,17 @@ def art_rollout_metadata(
         "reserved_rollout_dollar_seconds",
         "unobserved_rollout_cost_penalty",
         "unobserved_rollout_cost_estimated",
+        "joint_action_score",
+        "joint_action_score_weight",
     ):
         value = decision.metadata.get(key)
         if isinstance(value, bool):
             metadata[f"scheduler/decision/{key}"] = value
         elif isinstance(value, (int, float)) and isfinite(float(value)):
             metadata[f"scheduler/decision/{key}"] = float(value)
+    selected_joint_key = decision.metadata.get("joint_action_key")
+    if selected_joint_key is not None and not isinstance(selected_joint_key, bool):
+        metadata.setdefault("scheduler/joint_action_key", str(selected_joint_key))
     if extra is not None:
         metadata.update(extra)
     active_actor_count = _optional_int(metadata.get("scheduler/active_actor_count"))

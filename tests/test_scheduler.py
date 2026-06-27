@@ -84,6 +84,78 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(restored_metrics[f"{prefix}/feedback_updates"], 3.0)
 
+    def test_joint_scheduling_action_payoff_influences_rollout_selection(self):
+        token_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        chunk_key = scheduling_action_key(
+            arm_id="task|chunk(chunk_size=2)",
+            target_train_batch_groups=1,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "learning_state": {
+                    "total_decisions": 2,
+                    "total_pulls": 2,
+                },
+                "arms": {
+                    "task|token": {
+                        "decisions": 1,
+                        "pulls": 1,
+                        "accepted": 1,
+                        "marginal_objective_ema": 0.1,
+                    },
+                    "task|chunk(chunk_size=2)": {
+                        "decisions": 1,
+                        "pulls": 1,
+                        "accepted": 1,
+                        "marginal_objective_ema": 0.1,
+                    },
+                },
+                "joint_action_controls": {
+                    token_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": -1.0,
+                        "total_objective": -1.0,
+                    },
+                    chunk_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 1.0,
+                        "total_objective": 1.0,
+                    },
+                },
+            }
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+        )
+
+        self.assertEqual(decision.arm_id, "task|chunk(chunk_size=2)")
+        self.assertEqual(decision.metadata["joint_action_key"], chunk_key)
+        self.assertGreater(decision.metadata["joint_action_score"], 0.0)
+
     def test_scheduler_explores_then_prefers_best_marginal_objective_arm(self):
         scenarios = [Scenario(id="easy"), Scenario(id="hard")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]

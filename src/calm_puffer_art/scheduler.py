@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping, Protocol, Sequence
 
 from .actions import ActionCodec, ActionLogprobStats, action_logprob_stats
@@ -59,6 +59,8 @@ class AdaptiveScheduler(Protocol):
         train_queue_pressure: float,
         configured_train_batch_groups: int,
         configured_max_policy_lag: int,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> SchedulerDecision:
         ...
 
@@ -310,6 +312,7 @@ class ObjectiveScheduler:
         confidence_penalty_weight: float = 0.0,
         control_exploration_bonus: float = 0.1,
         rollout_cadence_lag_control_weight: float = 0.0,
+        joint_action_objective_weight: float = 1.0,
         max_control_candidate_values: int = 8,
         min_rollout_coverage_fraction: float = 0.0,
         max_rollout_coverage_cost_fraction: float | None = None,
@@ -367,6 +370,8 @@ class ObjectiveScheduler:
             raise ValueError(
                 "rollout_cadence_lag_control_weight must be non-negative"
             )
+        if joint_action_objective_weight < 0:
+            raise ValueError("joint_action_objective_weight must be non-negative")
         if max_control_candidate_values <= 0:
             raise ValueError("max_control_candidate_values must be positive")
         if not 0 <= min_rollout_coverage_fraction <= 1:
@@ -440,6 +445,7 @@ class ObjectiveScheduler:
         self.rollout_cadence_lag_control_weight = (
             rollout_cadence_lag_control_weight
         )
+        self.joint_action_objective_weight = joint_action_objective_weight
         self.max_control_candidate_values = max_control_candidate_values
         self.min_rollout_coverage_fraction = min_rollout_coverage_fraction
         self.max_rollout_coverage_cost_fraction = (
@@ -544,19 +550,46 @@ class ObjectiveScheduler:
         train_queue_pressure: float,
         configured_train_batch_groups: int,
         configured_max_policy_lag: int,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> SchedulerDecision:
         if not scenarios:
             raise ValueError("at least one scenario is required")
         if not action_codecs:
             raise ValueError("at least one action codec is required")
 
+        target_train_batch_groups = self.target_train_batch_groups(
+            configured=configured_train_batch_groups,
+            pending_groups=0,
+            train_queue_pressure=train_queue_pressure,
+            policy_step=policy_step,
+        )
+        max_policy_lag = self.max_policy_lag(
+            configured=configured_max_policy_lag,
+            train_queue_pressure=train_queue_pressure,
+            policy_step=policy_step,
+        )
         arms = self._arm_candidates(scenarios, action_codecs)
-        coverage_selection, coverage_cost_limited = self._coverage_candidate(arms)
+        coverage_selection, coverage_cost_limited = self._coverage_candidate(
+            arms,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
         arm_ids = [candidate[0] for candidate in arms]
         if coverage_selection is None:
             arm_id, scenario, codec = max(
                 arms,
-                key=lambda arm: self._score_arm(arm[0], arm[1], arm[2]),
+                key=lambda arm: self._score_arm(
+                    arm[0],
+                    arm[1],
+                    arm[2],
+                    target_train_batch_groups=target_train_batch_groups,
+                    max_policy_lag=max_policy_lag,
+                    active_actor_count=active_actor_count,
+                    rollout_admission_delay_ms=rollout_admission_delay_ms,
+                ),
             )
             coverage_forced = False
             coverage_target = self._effective_coverage_target(len(arms))
@@ -583,9 +616,31 @@ class ObjectiveScheduler:
         unobserved_rollout_cost_penalty = (
             self._unobserved_rollout_cost_penalty(arm_id, scenario, codec)
         )
-        decision_score = self._score_arm(arm_id, scenario, codec)
+        decision_score = self._score_arm(
+            arm_id,
+            scenario,
+            codec,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
         objective_score = self._arm_value(selected_stats)
         exploration_score = self._exploration_value(selected_stats)
+        joint_action_score = self._joint_action_score(
+            arm_id=arm_id,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
+        joint_action_key = self._candidate_joint_action_key(
+            arm_id=arm_id,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
         reserved_rollout_dollar_seconds = max(0.0, estimated_rollout_dollar_seconds)
         self._record_arm_decision(
             selected_stats,
@@ -603,17 +658,8 @@ class ObjectiveScheduler:
             scenario=scenario,
             action_codec=codec,
             arm_id=arm_id,
-            target_train_batch_groups=self.target_train_batch_groups(
-                configured=configured_train_batch_groups,
-                pending_groups=0,
-                train_queue_pressure=train_queue_pressure,
-                policy_step=policy_step,
-            ),
-            max_policy_lag=self.max_policy_lag(
-                configured=configured_max_policy_lag,
-                train_queue_pressure=train_queue_pressure,
-                policy_step=policy_step,
-            ),
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
             metadata={
                 "actor_id": actor_id,
                 "policy_step": policy_step,
@@ -622,6 +668,8 @@ class ObjectiveScheduler:
                 "score": decision_score,
                 "objective_score": objective_score,
                 "exploration_score": exploration_score,
+                "joint_action_score": joint_action_score,
+                "joint_action_score_weight": self.joint_action_objective_weight,
                 "inflight_rollouts": selected_stats.inflight,
                 "coverage_forced": coverage_forced,
                 "coverage_target": coverage_target,
@@ -648,6 +696,14 @@ class ObjectiveScheduler:
                 ),
             },
         )
+        if joint_action_key is not None:
+            decision = replace(
+                decision,
+                metadata={
+                    **decision.metadata,
+                    "joint_action_key": joint_action_key,
+                },
+            )
         self._last_decision = decision
         self._last_decision_snapshot = _decision_to_state(decision)
         return decision
@@ -1441,6 +1497,9 @@ class ObjectiveScheduler:
                 "rollout_cadence_lag_control_weight": (
                     self.rollout_cadence_lag_control_weight
                 ),
+                "joint_action_objective_weight": (
+                    self.joint_action_objective_weight
+                ),
                 "max_control_candidate_values": (
                     self.max_control_candidate_values
                 ),
@@ -1754,6 +1813,13 @@ class ObjectiveScheduler:
             _state_float(
                 config.get("rollout_cadence_lag_control_weight"),
                 self.rollout_cadence_lag_control_weight,
+            ),
+        )
+        self.joint_action_objective_weight = max(
+            0.0,
+            _state_float(
+                config.get("joint_action_objective_weight"),
+                self.joint_action_objective_weight,
             ),
         )
         self.max_control_candidate_values = max(
@@ -2347,6 +2413,9 @@ class ObjectiveScheduler:
             "scheduler/weights/rollout_cadence_lag_control": (
                 self.rollout_cadence_lag_control_weight
             ),
+            "scheduler/weights/joint_action_objective": (
+                self.joint_action_objective_weight
+            ),
             "scheduler/reward_scale_normalization/arm_range": (
                 1.0
                 if self.reward_scale_normalization == "arm_range"
@@ -2870,6 +2939,11 @@ class ObjectiveScheduler:
     def _coverage_candidate(
         self,
         arms: Sequence[tuple[str, Scenario, ActionCodec]],
+        *,
+        target_train_batch_groups: int,
+        max_policy_lag: int,
+        active_actor_count: int | None,
+        rollout_admission_delay_ms: int | None,
     ) -> tuple[
         tuple[str, Scenario, ActionCodec, float, float, float, float] | None,
         bool,
@@ -2918,11 +2992,23 @@ class ObjectiveScheduler:
                 continue
             if (
                 math.isclose(deficit, most_undercovered[5])
-                and self._score_arm(arm_id, scenario, codec)
+                and self._score_arm(
+                    arm_id,
+                    scenario,
+                    codec,
+                    target_train_batch_groups=target_train_batch_groups,
+                    max_policy_lag=max_policy_lag,
+                    active_actor_count=active_actor_count,
+                    rollout_admission_delay_ms=rollout_admission_delay_ms,
+                )
                 > self._score_arm(
                     most_undercovered[0],
                     most_undercovered[1],
                     most_undercovered[2],
+                    target_train_batch_groups=target_train_batch_groups,
+                    max_policy_lag=max_policy_lag,
+                    active_actor_count=active_actor_count,
+                    rollout_admission_delay_ms=rollout_admission_delay_ms,
                 )
             ):
                 most_undercovered = candidate
@@ -2968,6 +3054,11 @@ class ObjectiveScheduler:
         arm_id: str,
         scenario: Scenario | None = None,
         codec: ActionCodec | None = None,
+        *,
+        target_train_batch_groups: int | None = None,
+        max_policy_lag: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> float:
         stats = self._arms.setdefault(arm_id, ArmStats())
         if stats.pulls == 0:
@@ -2982,7 +3073,65 @@ class ObjectiveScheduler:
             )
         exploitation = self._arm_value(stats)
         exploration = self._exploration_value(stats)
-        return exploitation + exploration
+        return exploitation + exploration + self._joint_action_score(
+            arm_id=arm_id,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
+
+    def _joint_action_score(
+        self,
+        *,
+        arm_id: str,
+        target_train_batch_groups: int | None,
+        max_policy_lag: int | None,
+        active_actor_count: int | None,
+        rollout_admission_delay_ms: int | None,
+    ) -> float:
+        if self.joint_action_objective_weight <= 0.0:
+            return 0.0
+        key = self._candidate_joint_action_key(
+            arm_id=arm_id,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
+        if key is None:
+            return 0.0
+        stats = self._joint_action_controls.get(key)
+        if stats is None or _control_feedback_updates(stats) <= 0:
+            return 0.0
+        return self.joint_action_objective_weight * self._score_control_value(
+            self._joint_action_controls,
+            key,
+        )
+
+    @staticmethod
+    def _candidate_joint_action_key(
+        *,
+        arm_id: str,
+        target_train_batch_groups: int | None,
+        max_policy_lag: int | None,
+        active_actor_count: int | None,
+        rollout_admission_delay_ms: int | None,
+    ) -> str | None:
+        if (
+            target_train_batch_groups is None
+            or max_policy_lag is None
+            or active_actor_count is None
+            or rollout_admission_delay_ms is None
+        ):
+            return None
+        return scheduling_action_key(
+            arm_id=arm_id,
+            target_train_batch_groups=target_train_batch_groups,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            admission_delay_ms=rollout_admission_delay_ms,
+        )
 
     def _estimated_rollout_dollar_seconds(
         self,
