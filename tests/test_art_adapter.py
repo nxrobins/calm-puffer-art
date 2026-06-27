@@ -1855,6 +1855,10 @@ class ArtAdapterTests(unittest.TestCase):
             stats["scheduler/budget/accounted_dollar_seconds"],
             6.0,
         )
+        self.assertEqual(
+            stats["art_backend/accounted_dollar_seconds"],
+            6.0,
+        )
 
     def test_async_art_backend_submit_train_returns_future_before_training_finishes(self):
         async def run():

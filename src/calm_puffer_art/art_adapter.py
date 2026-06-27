@@ -1543,13 +1543,20 @@ class AsyncArtBackend:
         self,
         scheduler_stats: Mapping[str, float],
     ) -> float:
+        scheduler_total = max(
+            0.0,
+            float(scheduler_stats.get("scheduler/costs/total_dollar_seconds", 0.0)),
+        )
+        if scheduler_total > 0.0:
+            return scheduler_total
         scheduler_accounted = sum(
             max(0.0, float(scheduler_stats.get(key, 0.0)))
             for key in (
                 "scheduler/costs/rollout_dollar_seconds",
                 "scheduler/costs/queue_wait_dollar_seconds",
                 "scheduler/costs/rollout_admission_dollar_seconds",
-            "scheduler/costs/train_dollar_seconds",
+                "scheduler/costs/train_dollar_seconds",
+                "scheduler/costs/stale_additional_dollar_seconds",
             )
         )
         if scheduler_accounted > 0.0:
