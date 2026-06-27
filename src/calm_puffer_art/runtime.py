@@ -1026,6 +1026,9 @@ class RuntimeTelemetry:
         self.latest_promotion_improvement = decision.improvement
         self.latest_promotion_promoted = decision.promoted
 
+    def promotion_decision_state(self) -> dict[str, dict[str, float | int]]:
+        return _promotion_decision_stats_state(self._promotion_decision_stats)
+
     def metrics(self, *, stale_dropped: int) -> dict[str, float]:
         wall_s = max(time.perf_counter() - self.started_at, 1e-9)
         first_reward, last_reward = self._reward_windows()
@@ -1522,6 +1525,9 @@ class ControlPlane:
                             scheduler=scheduler,
                             action_space=action_space,
                             promotion_evaluator=promotion_evaluator,
+                            promotion_decision_stats=(
+                                telemetry.promotion_decision_state()
+                            ),
                         )
                     )
                     train_ring.current_policy_step = latest.step
@@ -2643,6 +2649,27 @@ def _promotion_decision_key(decision: PromotionDecision) -> str:
     return f"action={action}|reason={reason}"
 
 
+def _promotion_decision_stats_state(
+    stats: Mapping[str, PromotionDecisionStats],
+) -> dict[str, dict[str, float | int]]:
+    return {
+        key: {
+            "decisions": value.decisions,
+            "promoted": value.promoted,
+            "rejected": value.rejected,
+            "total_candidate_improvement": value.total_candidate_improvement,
+            "total_published_policy_improvement": (
+                value.total_published_policy_improvement
+            ),
+            "total_reward_improving_experience": (
+                value.total_reward_improving_experience
+            ),
+            "total_dollar_seconds": value.total_dollar_seconds,
+        }
+        for key, value in stats.items()
+    }
+
+
 def _trajectory_eval_dollar_seconds(
     trajectory: Trajectory,
     *,
@@ -2781,16 +2808,21 @@ def _first_nonnegative_float(
 
 def promotion_checkpoint_metadata(
     promotion_evaluator: Any | None,
+    *,
+    decision_stats: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return checkpoint metadata for promotion evaluators with state support."""
 
-    if promotion_evaluator is None:
-        return {}
-    state_dict = getattr(promotion_evaluator, "state_dict", None)
-    if state_dict is None:
-        return {}
-    state = state_dict()
-    if not isinstance(state, Mapping):
+    state: dict[str, Any] = {}
+    if promotion_evaluator is not None:
+        state_dict = getattr(promotion_evaluator, "state_dict", None)
+        if state_dict is not None:
+            evaluator_state = state_dict()
+            if isinstance(evaluator_state, Mapping):
+                state.update(dict(evaluator_state))
+    if decision_stats:
+        state["decision_stats"] = dict(decision_stats)
+    if not state:
         return {}
     return {PROMOTION_STATE_KEY: state}
 
@@ -2801,11 +2833,15 @@ def _with_control_checkpoint_metadata(
     scheduler: AdaptiveScheduler | None,
     action_space: AdaptiveActionSpace | None,
     promotion_evaluator: PromotionEvaluator | None,
+    promotion_decision_stats: Mapping[str, Any] | None = None,
 ) -> TrainResult:
     control_metadata = {
         **scheduler_checkpoint_metadata(scheduler),
         **action_space_checkpoint_metadata(action_space),
-        **promotion_checkpoint_metadata(promotion_evaluator),
+        **promotion_checkpoint_metadata(
+            promotion_evaluator,
+            decision_stats=promotion_decision_stats,
+        ),
     }
     if not control_metadata:
         return result

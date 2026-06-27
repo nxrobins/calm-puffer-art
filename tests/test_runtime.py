@@ -734,6 +734,31 @@ class RuntimeTests(unittest.TestCase):
             summary.checkpoints[-1].metadata["promotion/reason"],
             "metric_improved",
         )
+        decision_state = summary.checkpoints[-1].metadata[PROMOTION_STATE_KEY][
+            "decision_stats"
+        ]
+        self.assertEqual(
+            decision_state[
+                "action=reject|reason=metric_below_promotion_threshold"
+            ]["decisions"],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=reject|reason=metric_below_promotion_threshold"][
+                "rejected"
+            ],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=promote|reason=metric_improved"]["decisions"],
+            1,
+        )
+        self.assertEqual(
+            decision_state["action=promote|reason=metric_improved"][
+                "total_reward_improving_experience"
+            ],
+            1.0,
+        )
         self.assertEqual(
             summary.metrics["scheduler/train_last_reward_improvement"],
             1.0,
@@ -1309,7 +1334,14 @@ class RuntimeTests(unittest.TestCase):
         metadata = {
             **scheduler_checkpoint_metadata(source_scheduler),
             **action_space_checkpoint_metadata(source_action_space),
-            **promotion_checkpoint_metadata(source_promotion),
+            **promotion_checkpoint_metadata(
+                source_promotion,
+                decision_stats={
+                    "action=promote|reason=metric_improved": {
+                        "decisions": 2,
+                    },
+                },
+            ),
         }
         restored_scheduler = ObjectiveScheduler(exploration_bonus=0.0)
         restored_action_space = AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4)
@@ -1342,6 +1374,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(restored_promotion.metric_key, "eval/reward")
         self.assertEqual(restored_promotion.min_delta, 0.5)
         self.assertEqual(restored_promotion.best_score, 2.0)
+        self.assertEqual(
+            metadata[PROMOTION_STATE_KEY]["decision_stats"][
+                "action=promote|reason=metric_improved"
+            ]["decisions"],
+            2,
+        )
 
     def test_control_plane_resumes_from_policy_snapshot_control_state(self):
         async def run():
