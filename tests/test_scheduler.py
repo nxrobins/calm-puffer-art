@@ -84,6 +84,88 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
         self.assertEqual(restored_metrics[f"{prefix}/feedback_updates"], 3.0)
 
+    def test_joint_scheduling_action_decision_is_recorded_before_feedback(self):
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+        )
+        key = decision.metadata["joint_action_key"]
+        prefix = f"scheduler/joint_action/{_test_metric_key(key)}"
+        metrics_after_select = scheduler.metrics()
+
+        self.assertEqual(metrics_after_select[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics_after_select[f"{prefix}/rollout_updates"], 0.0)
+        self.assertEqual(metrics_after_select[f"{prefix}/feedback_updates"], 0.0)
+
+        scheduler.observe_rollout(
+            Trajectory(
+                scenario_id="task",
+                policy_step=0,
+                messages=[],
+                actions=[],
+                reward=1.0,
+                metadata={
+                    "scheduler/arm_id": decision.arm_id,
+                    "scheduler/target_train_batch_groups": (
+                        decision.target_train_batch_groups
+                    ),
+                    "scheduler/max_policy_lag": decision.max_policy_lag,
+                    "scheduler/active_actor_count": 1,
+                    "scheduler/active_rollout_admission_delay_ms": 0,
+                    "scheduler/joint_action_key": key,
+                    "scheduler/decision/reserved_rollout_dollar_seconds": (
+                        decision.metadata["reserved_rollout_dollar_seconds"]
+                    ),
+                },
+            ),
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        metrics_after_rollout = scheduler.metrics()
+
+        self.assertEqual(metrics_after_rollout[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics_after_rollout[f"{prefix}/rollout_updates"], 1.0)
+        self.assertEqual(metrics_after_rollout[f"{prefix}/feedback_updates"], 1.0)
+
+    def test_cancel_rollout_decision_rolls_back_joint_action_decision(self):
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+        )
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=1,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+        )
+        key = decision.metadata["joint_action_key"]
+        prefix = f"scheduler/joint_action/{_test_metric_key(key)}"
+
+        scheduler.cancel_rollout_decision(decision)
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics.get(f"{prefix}/decisions", 0.0), 0.0)
+        self.assertEqual(metrics.get(f"{prefix}/feedback_updates", 0.0), 0.0)
+
     def test_joint_scheduling_action_payoff_influences_rollout_selection(self):
         token_key = scheduling_action_key(
             arm_id="task|token",
@@ -155,6 +237,142 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(decision.arm_id, "task|chunk(chunk_size=2)")
         self.assertEqual(decision.metadata["joint_action_key"], chunk_key)
         self.assertGreater(decision.metadata["joint_action_score"], 0.0)
+
+    def test_joint_scheduling_action_payoff_influences_cadence_and_lag(self):
+        low_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=0,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        high_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=2,
+            max_policy_lag=1,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=1,
+            max_train_batch_groups=2,
+            min_policy_lag=0,
+            max_policy_lag=1,
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "joint_action_controls": {
+                    low_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": -1.0,
+                        "total_objective": -1.0,
+                    },
+                    high_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 1.0,
+                        "total_objective": 1.0,
+                    },
+                }
+            }
+        )
+
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=1,
+            configured_max_policy_lag=0,
+            active_actor_count=1,
+            rollout_admission_delay_ms=0,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(decision.target_train_batch_groups, 2)
+        self.assertEqual(decision.max_policy_lag, 1)
+        self.assertEqual(decision.metadata["joint_action_key"], high_key)
+        self.assertEqual(metrics["scheduler/control/cadence_2/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/control/policy_lag_1/decisions"], 1.0)
+
+    def test_joint_scheduling_action_payoff_influences_actor_cap_and_delay(self):
+        low_actor_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=0,
+            active_actor_count=1,
+            admission_delay_ms=0,
+        )
+        zero_delay_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=0,
+            active_actor_count=2,
+            admission_delay_ms=0,
+        )
+        delayed_key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=1,
+            max_policy_lag=0,
+            active_actor_count=2,
+            admission_delay_ms=100,
+        )
+        scheduler = ObjectiveScheduler(
+            min_actor_count=1,
+            max_actor_count=2,
+            max_rollout_admission_delay_s=0.1,
+            rollout_admission_pressure_threshold=0.5,
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+            joint_action_objective_weight=1.0,
+        )
+        scheduler.load_state_dict(
+            {
+                "joint_action_controls": {
+                    low_actor_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": -1.0,
+                        "total_objective": -1.0,
+                    },
+                    zero_delay_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": 2.0,
+                        "total_objective": 2.0,
+                    },
+                    delayed_key: {
+                        "rollout_updates": 1,
+                        "objective_ema": -2.0,
+                        "total_objective": -2.0,
+                    },
+                }
+            }
+        )
+
+        actor_count = scheduler.active_actor_count(
+            configured=1,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+        )
+        delay_s = scheduler.rollout_admission_delay_s(
+            trajectory_queue_pressure=1.0,
+            train_queue_pressure=0.0,
+            policy_step=0,
+            active_actor_count=actor_count,
+        )
+        metrics = scheduler.metrics()
+
+        self.assertEqual(actor_count, 2)
+        self.assertEqual(delay_s, 0.0)
+        self.assertEqual(metrics["scheduler/control/actor_count_2/decisions"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/control/admission_delay_ms_0/decisions"],
+            1.0,
+        )
 
     def test_scheduler_explores_then_prefers_best_marginal_objective_arm(self):
         scenarios = [Scenario(id="easy"), Scenario(id="hard")]

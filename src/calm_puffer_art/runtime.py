@@ -1619,6 +1619,7 @@ class ControlPlane:
                 train_ring=train_ring,
                 telemetry=telemetry,
                 policy_step=snapshot.step,
+                active_actor_count=active_actor_count,
             )
             if admission_delay_s > 0.0:
                 snapshot = await registry.snapshot()
@@ -1949,6 +1950,7 @@ class ControlPlane:
         train_ring: TrajectoryRingBuffer,
         telemetry: RuntimeTelemetry,
         policy_step: int,
+        active_actor_count: int | None = None,
     ) -> float:
         if scheduler is None:
             return 0.0
@@ -1964,6 +1966,7 @@ class ControlPlane:
                     ),
                     train_queue_pressure=self._train_queue_pressure(train_ring),
                     policy_step=policy_step,
+                    active_actor_count=active_actor_count,
                 )
             ),
         )

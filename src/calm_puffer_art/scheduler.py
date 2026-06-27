@@ -71,6 +71,9 @@ class AdaptiveScheduler(Protocol):
         pending_groups: int,
         train_queue_pressure: float,
         policy_step: int,
+        max_policy_lag: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> int:
         ...
 
@@ -80,6 +83,9 @@ class AdaptiveScheduler(Protocol):
         configured: int,
         train_queue_pressure: float,
         policy_step: int,
+        target_train_batch_groups: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> int:
         ...
 
@@ -89,6 +95,7 @@ class AdaptiveScheduler(Protocol):
         trajectory_queue_pressure: float,
         train_queue_pressure: float,
         policy_step: int,
+        active_actor_count: int | None = None,
     ) -> float:
         ...
 
@@ -563,11 +570,16 @@ class ObjectiveScheduler:
             pending_groups=0,
             train_queue_pressure=train_queue_pressure,
             policy_step=policy_step,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
         )
         max_policy_lag = self.max_policy_lag(
             configured=configured_max_policy_lag,
             train_queue_pressure=train_queue_pressure,
             policy_step=policy_step,
+            target_train_batch_groups=target_train_batch_groups,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
         )
         arms = self._arm_candidates(scenarios, action_codecs)
         coverage_selection, coverage_cost_limited = self._coverage_candidate(
@@ -704,6 +716,7 @@ class ObjectiveScheduler:
                     "joint_action_key": joint_action_key,
                 },
             )
+            self._record_joint_action_decision(joint_action_key)
         self._last_decision = decision
         self._last_decision_snapshot = _decision_to_state(decision)
         return decision
@@ -728,6 +741,13 @@ class ObjectiveScheduler:
         if actor_stats is not None:
             actor_stats.inflight = max(0, actor_stats.inflight - 1)
             actor_stats.decisions = max(0, actor_stats.decisions - 1)
+
+        joint_action_key = _joint_action_key_from_metadata(metadata)
+        if joint_action_key is not None:
+            self._cancel_control_decision(
+                self._joint_action_controls,
+                joint_action_key,
+            )
 
         self._cancel_control_decision(
             self._cadence_controls,
@@ -789,6 +809,9 @@ class ObjectiveScheduler:
         pending_groups: int,
         train_queue_pressure: float,
         policy_step: int,
+        max_policy_lag: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> int:
         upper = self.max_train_batch_groups or configured
         upper = max(self.min_train_batch_groups, upper)
@@ -810,6 +833,13 @@ class ObjectiveScheduler:
             preferred = upper
         else:
             preferred = configured
+        joint_scores = self._joint_action_scores_for_control_values(
+            "cadence",
+            candidates,
+            max_policy_lag=max_policy_lag,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
         if (
             preferred == upper
             and not self._has_positive_objective_signal()
@@ -817,6 +847,7 @@ class ObjectiveScheduler:
                 self._cadence_controls,
                 candidates,
             )
+            and not joint_scores
         ):
             return self._record_control_decision(self._cadence_controls, upper)
         return self._record_control_decision(
@@ -825,6 +856,7 @@ class ObjectiveScheduler:
                 self._cadence_controls,
                 candidates,
                 preferred=preferred,
+                joint_scores=joint_scores,
             ),
         )
 
@@ -834,6 +866,9 @@ class ObjectiveScheduler:
         configured: int,
         train_queue_pressure: float,
         policy_step: int,
+        target_train_batch_groups: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
     ) -> int:
         upper = self.max_policy_lag_limit
         if upper is None:
@@ -860,12 +895,20 @@ class ObjectiveScheduler:
             preferred = self.min_policy_lag
         else:
             preferred = configured
+        joint_scores = self._joint_action_scores_for_control_values(
+            "lag",
+            candidates,
+            target_train_batch_groups=target_train_batch_groups,
+            active_actor_count=active_actor_count,
+            rollout_admission_delay_ms=rollout_admission_delay_ms,
+        )
         if (
             protecting_unaccepted_arm
             and not self._control_family_has_feedback(
                 self._lag_controls,
                 candidates,
             )
+            and not joint_scores
         ):
             return self._record_control_decision(self._lag_controls, configured)
         return self._record_control_decision(
@@ -874,6 +917,7 @@ class ObjectiveScheduler:
                 self._lag_controls,
                 candidates,
                 preferred=preferred,
+                joint_scores=joint_scores,
             ),
         )
 
@@ -910,6 +954,10 @@ class ObjectiveScheduler:
             preferred = self.min_actor_count
         else:
             preferred = configured
+        joint_scores = self._joint_action_scores_for_control_values(
+            "actors",
+            candidates,
+        )
         if (
             preferred == self.min_actor_count
             and not self._has_positive_objective_signal()
@@ -917,6 +965,7 @@ class ObjectiveScheduler:
                 self._actor_count_controls,
                 candidates,
             )
+            and not joint_scores
         ):
             return self._record_control_decision(
                 self._actor_count_controls,
@@ -928,6 +977,7 @@ class ObjectiveScheduler:
                 self._actor_count_controls,
                 candidates,
                 preferred=preferred,
+                joint_scores=joint_scores,
             ),
         )
 
@@ -1133,6 +1183,7 @@ class ObjectiveScheduler:
         trajectory_queue_pressure: float,
         train_queue_pressure: float,
         policy_step: int,
+        active_actor_count: int | None = None,
     ) -> float:
         """Return a pre-rollout delay when downstream buffers are saturated."""
 
@@ -1164,14 +1215,21 @@ class ObjectiveScheduler:
         max_delay_ms = _seconds_to_milliseconds(
             self.max_rollout_admission_delay_s
         )
+        candidates = self._control_candidates(
+            min_value=0,
+            configured=preferred_ms,
+            upper=max_delay_ms,
+        )
+        joint_scores = self._joint_action_scores_for_control_values(
+            "admission_ms",
+            candidates,
+            active_actor_count=active_actor_count,
+        )
         selected_ms = self._select_control_value(
             self._admission_controls,
-            self._control_candidates(
-                min_value=0,
-                configured=preferred_ms,
-                upper=max_delay_ms,
-            ),
+            candidates,
             preferred=preferred_ms,
+            joint_scores=joint_scores,
         )
         self._record_control_decision(self._admission_controls, selected_ms)
         delay = selected_ms / 1000.0
@@ -3133,6 +3191,63 @@ class ObjectiveScheduler:
             admission_delay_ms=rollout_admission_delay_ms,
         )
 
+    def _joint_action_scores_for_control_values(
+        self,
+        control_name: str,
+        candidates: Sequence[int],
+        *,
+        target_train_batch_groups: int | None = None,
+        max_policy_lag: int | None = None,
+        active_actor_count: int | None = None,
+        rollout_admission_delay_ms: int | None = None,
+    ) -> dict[int, float]:
+        if self.joint_action_objective_weight <= 0.0 or not candidates:
+            return {}
+        candidate_set = set(int(value) for value in candidates)
+        scores: dict[int, float] = {}
+        for key, stats in self._joint_action_controls.items():
+            if _control_feedback_updates(stats) <= 0:
+                continue
+            fields = _joint_action_control_fields(key)
+            if fields is None:
+                continue
+            candidate = fields.get(control_name)
+            if candidate not in candidate_set:
+                continue
+            if (
+                target_train_batch_groups is not None
+                and fields.get("cadence") != target_train_batch_groups
+            ):
+                continue
+            if (
+                max_policy_lag is not None
+                and fields.get("lag") != max_policy_lag
+            ):
+                continue
+            if (
+                active_actor_count is not None
+                and fields.get("actors") != active_actor_count
+            ):
+                continue
+            if (
+                rollout_admission_delay_ms is not None
+                and fields.get("admission_ms") != rollout_admission_delay_ms
+            ):
+                continue
+            score = self.joint_action_objective_weight * self._score_control_value(
+                self._joint_action_controls,
+                key,
+            )
+            if self.control_exploration_bonus > 0.0:
+                score = max(
+                    -self.control_exploration_bonus,
+                    min(self.control_exploration_bonus, score),
+                )
+            current = scores.get(candidate)
+            if current is None or score > current:
+                scores[candidate] = score
+        return scores
+
     def _estimated_rollout_dollar_seconds(
         self,
         arm_id: str,
@@ -3789,7 +3904,8 @@ class ObjectiveScheduler:
         if key is None:
             return
         stats = self._joint_action_controls.setdefault(key, ControlStats())
-        stats.decisions += 1
+        if stats.decisions <= stats.rollout_updates:
+            stats.decisions += 1
         stats.rollout_updates += 1
         stats.total_objective += objective
         stats.objective_ema = self._ema(
@@ -4029,12 +4145,18 @@ class ObjectiveScheduler:
         candidates: Sequence[int],
         *,
         preferred: int,
+        joint_scores: Mapping[int, float] | None = None,
     ) -> int:
         if not candidates:
             return preferred
         candidate_values = tuple(candidates)
         if preferred not in candidate_values:
             preferred = candidate_values[0]
+        normalized_joint_scores = {
+            int(value): float(score)
+            for value, score in (joint_scores or {}).items()
+            if value in candidate_values and math.isfinite(float(score))
+        }
         if all(
             controls.get(value) is None
             or (
@@ -4042,12 +4164,13 @@ class ObjectiveScheduler:
                 and _control_feedback_updates(controls[value]) == 0
             )
             for value in candidate_values
-        ):
+        ) and not normalized_joint_scores:
             return preferred
         return max(
             candidate_values,
             key=lambda value: (
-                self._score_control_value(controls, value),
+                self._score_control_value(controls, value)
+                + normalized_joint_scores.get(value, 0.0),
                 1 if value == preferred else 0,
                 -abs(value - preferred),
                 -value,
@@ -4100,8 +4223,8 @@ class ObjectiveScheduler:
 
     def _cancel_control_decision(
         self,
-        controls: dict[int, ControlStats],
-        value: int,
+        controls: dict[Any, ControlStats],
+        value: Any,
     ) -> None:
         stats = controls.get(value)
         if stats is None:
@@ -4129,6 +4252,9 @@ class ObjectiveScheduler:
             reserved_rollout_dollar_seconds,
         )
         self._total_decisions += 1
+
+    def _record_joint_action_decision(self, key: str) -> None:
+        self._joint_action_controls.setdefault(key, ControlStats()).decisions += 1
 
     def _total_inflight_rollouts(self) -> int:
         return sum(stats.inflight for stats in self._arms.values())
@@ -4318,6 +4444,8 @@ def _first_int_metadata(
 def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     raw_key = metadata.get("scheduler/joint_action_key")
     if raw_key is None:
+        raw_key = metadata.get("joint_action_key")
+    if raw_key is None:
         raw_key = metadata.get("scheduler/scheduling_action_key")
     if raw_key is not None and not isinstance(raw_key, bool):
         key = str(raw_key)
@@ -4366,6 +4494,33 @@ def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         active_actor_count=active_actor_count,
         admission_delay_ms=admission_delay_ms,
     )
+
+
+def _joint_action_control_fields(key: str) -> dict[str, int] | None:
+    parts = str(key).rsplit("|cadence=", 1)
+    if len(parts) != 2:
+        return None
+    suffix = parts[1].split("|")
+    if len(suffix) != 4:
+        return None
+    cadence = _state_optional_int(suffix[0], None)
+    lag = _prefixed_int(suffix[1], "lag=")
+    actors = _prefixed_int(suffix[2], "actors=")
+    admission_ms = _prefixed_int(suffix[3], "admission_ms=")
+    if cadence is None or lag is None or actors is None or admission_ms is None:
+        return None
+    return {
+        "cadence": cadence,
+        "lag": lag,
+        "actors": actors,
+        "admission_ms": admission_ms,
+    }
+
+
+def _prefixed_int(value: str, prefix: str) -> int | None:
+    if not value.startswith(prefix):
+        return None
+    return _state_optional_int(value[len(prefix) :], None)
 
 
 def _batch_staleness_state(

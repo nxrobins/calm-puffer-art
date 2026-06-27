@@ -486,6 +486,7 @@ class AsyncArtBackend:
 
         requested_delay_s = self.rollout_admission_delay_s(
             trajectory_queue_pressure=queue_pressure,
+            active_actor_count=active_count,
         )
         elapsed_s = 0.0
         if requested_delay_s > 0.0:
@@ -726,6 +727,7 @@ class AsyncArtBackend:
         self,
         *,
         trajectory_queue_pressure: float = 0.0,
+        active_actor_count: int | None = None,
     ) -> float:
         if self.scheduler is None:
             return 0.0
@@ -742,6 +744,7 @@ class AsyncArtBackend:
                     ),
                     train_queue_pressure=self._train_queue_pressure(),
                     policy_step=self._current_step,
+                    active_actor_count=active_actor_count,
                 )
             ),
         )
