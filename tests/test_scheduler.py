@@ -4201,6 +4201,107 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(scheduler.metrics()["scheduler/stop_recommended"], 1.0)
 
+    def test_continuation_decision_receives_train_objective_payoff(self):
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            exploration_bonus=0.0,
+        )
+        trajectory = Trajectory(
+            scenario_id="continue",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metadata={"scheduler/arm_id": "continue|token"},
+        )
+        group = TrajectoryGroup(
+            scenario_id="continue",
+            trajectories=(trajectory,),
+        )
+
+        self.assertTrue(
+            scheduler.should_continue_training(
+                policy_step=0,
+                max_train_steps=10,
+                pending_train_batches=1,
+                train_queue_pressure=0.7,
+            )
+        )
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_train(
+            groups=[group],
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+
+        metrics = scheduler.metrics()
+        key = (
+            "action=continue|reason=no_patience|pending=1|pressure=medium"
+        )
+        prefix = f"scheduler/continuation/{_test_metric_key(key)}"
+
+        self.assertEqual(metrics["scheduler/continuation/keys"], 1.0)
+        self.assertEqual(metrics["scheduler/continuation/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/continuation/train_updates"], 1.0)
+        self.assertEqual(metrics["scheduler/continuation/feedback_updates"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/continuation/positive_objective_keys"],
+            1.0,
+        )
+        self.assertGreater(metrics["scheduler/continuation/total_objective"], 0.0)
+        self.assertAlmostEqual(
+            metrics["scheduler/continuation/mean_objective_per_decision"],
+            metrics["scheduler/continuation/total_objective"],
+        )
+        self.assertEqual(metrics["scheduler/continuation/last_decision_continue"], 1.0)
+        self.assertEqual(
+            metrics["scheduler/continuation/last_pending_train_batches"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["scheduler/continuation/last_train_queue_pressure"],
+            0.7,
+        )
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(restored_metrics[f"{prefix}/train_updates"], 1.0)
+
+    def test_continuation_stop_decision_is_recorded_without_feedback(self):
+        scheduler = ObjectiveScheduler()
+
+        self.assertFalse(
+            scheduler.should_continue_training(
+                policy_step=2,
+                max_train_steps=2,
+                pending_train_batches=3,
+                train_queue_pressure=0.95,
+            )
+        )
+
+        metrics = scheduler.metrics()
+        key = "action=stop|reason=max_steps|pending=2plus|pressure=high"
+        prefix = f"scheduler/continuation/{_test_metric_key(key)}"
+
+        self.assertEqual(metrics["scheduler/continuation/keys"], 1.0)
+        self.assertEqual(metrics["scheduler/continuation/decisions"], 1.0)
+        self.assertEqual(metrics["scheduler/continuation/train_updates"], 0.0)
+        self.assertEqual(metrics["scheduler/continuation/feedback_updates"], 0.0)
+        self.assertEqual(metrics["scheduler/continuation/last_decision_continue"], 0.0)
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 0.0)
+
     def test_accounted_continuation_roi_counts_sample_cost(self):
         train_only = ObjectiveScheduler(
             exploration_bonus=0.0,

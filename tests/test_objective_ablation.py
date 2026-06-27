@@ -80,6 +80,32 @@ def assert_train_selection_payoff_metrics(
     )
 
 
+def assert_continuation_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertGreater(metrics["scheduler/continuation/keys"], 0.0)
+    test_case.assertGreater(metrics["scheduler/continuation/decisions"], 0.0)
+    test_case.assertGreater(
+        metrics["scheduler/continuation/feedback_updates"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["scheduler/continuation/positive_objective_keys"],
+        0.0,
+    )
+    test_case.assertTrue(
+        isfinite(metrics["scheduler/continuation/mean_objective_per_decision"])
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "scheduler/continuation/mean_objective_per_feedback_update"
+            ]
+        )
+    )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -156,6 +182,7 @@ class ObjectiveAblationTests(unittest.TestCase):
             ),
         )
         assert_train_selection_payoff_metrics(self, objective)
+        assert_continuation_payoff_metrics(self, objective)
 
     def test_adaptive_action_space_ablation_beats_fixed_bandwidth(self):
         result = asyncio.run(run_action_space_ablation())
@@ -261,6 +288,7 @@ class ObjectiveAblationTests(unittest.TestCase):
             ),
         )
         assert_train_selection_payoff_metrics(self, objective)
+        assert_continuation_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
             objective["scheduler/joint_action/feedback_updates"],
@@ -354,6 +382,7 @@ class ObjectiveAblationTests(unittest.TestCase):
             ),
         )
         assert_train_selection_payoff_metrics(self, objective)
+        assert_continuation_payoff_metrics(self, objective)
         self.assertGreater(objective["scheduler/joint_action/tuples"], 0.0)
         self.assertGreater(
             objective["scheduler/joint_action/feedback_updates"],

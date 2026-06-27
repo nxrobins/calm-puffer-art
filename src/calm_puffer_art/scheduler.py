@@ -551,6 +551,11 @@ class ObjectiveScheduler:
         self._last_train_batch_cost_normalized_priority = 0.0
         self._last_train_batch_joint_action_score = 0.0
         self._last_train_batch_train_selection_score = 0.0
+        self._last_continuation_decision_continue = False
+        self._last_continuation_decision_key = ""
+        self._last_continuation_decision_reason = ""
+        self._last_continuation_pending_train_batches = 0
+        self._last_continuation_train_queue_pressure = 0.0
         self._global_action_quality_ema = 1.0
         self._low_roi_train_steps = 0
         self._stop_recommended = False
@@ -573,6 +578,9 @@ class ObjectiveScheduler:
         self._actor_count_controls: dict[int, ControlStats] = {}
         self._joint_action_controls: dict[str, ControlStats] = {}
         self._train_selection_controls: dict[str, ControlStats] = {}
+        self._continuation_controls: dict[str, ControlStats] = {}
+        self._pending_continuation_decisions: dict[int, str] = {}
+        self._recorded_continuation_stop_decisions: set[tuple[int, str]] = set()
         self._actors: dict[int, ActorStats] = {}
 
     def select_rollout(
@@ -1366,6 +1374,10 @@ class ObjectiveScheduler:
             arm_objectives=arm_objectives,
             arm_weights=arm_weights,
         )
+        self._credit_train_objective_to_continuation(
+            policy_step=policy_step,
+            objective=continuation_objective,
+        )
         if continuation_objective <= self.min_train_objective:
             self._low_roi_train_steps += 1
         else:
@@ -1594,20 +1606,62 @@ class ObjectiveScheduler:
     ) -> bool:
         if policy_step >= max_train_steps:
             self._stop_recommended = True
-            return False
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=False,
+                reason="max_steps",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
         if self._accounted_budget_exhausted():
             self._stop_recommended = True
-            return False
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=False,
+                reason="budget",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
         if self.roi_patience is None:
-            return True
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=True,
+                reason="no_patience",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
         if policy_step < self.min_train_steps:
-            return True
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=True,
+                reason="warmup",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
         if self._has_unaccepted_known_arm():
-            return True
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=True,
+                reason="exploration",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
         if self._low_roi_train_steps >= self.roi_patience:
             self._stop_recommended = True
-            return False
-        return True
+            return self._record_continuation_decision(
+                policy_step=policy_step,
+                continue_training=False,
+                reason="low_roi",
+                pending_train_batches=pending_train_batches,
+                train_queue_pressure=train_queue_pressure,
+            )
+        return self._record_continuation_decision(
+            policy_step=policy_step,
+            continue_training=True,
+            reason="roi_ok",
+            pending_train_batches=pending_train_batches,
+            train_queue_pressure=train_queue_pressure,
+        )
 
     def state_dict(self) -> dict[str, Any]:
         """Return JSON-friendly scheduler state for checkpoint/resume."""
@@ -1775,6 +1829,21 @@ class ObjectiveScheduler:
                 "last_train_batch_train_selection_score": (
                     self._last_train_batch_train_selection_score
                 ),
+                "last_continuation_decision_continue": (
+                    self._last_continuation_decision_continue
+                ),
+                "last_continuation_decision_key": (
+                    self._last_continuation_decision_key
+                ),
+                "last_continuation_decision_reason": (
+                    self._last_continuation_decision_reason
+                ),
+                "last_continuation_pending_train_batches": (
+                    self._last_continuation_pending_train_batches
+                ),
+                "last_continuation_train_queue_pressure": (
+                    self._last_continuation_train_queue_pressure
+                ),
                 "coverage_forced_decisions": self._coverage_forced_decisions,
                 "last_rollout_coverage_target": (
                     self._last_rollout_coverage_target
@@ -1845,6 +1914,10 @@ class ObjectiveScheduler:
             "train_selection_controls": {
                 key: _dataclass_state(stats)
                 for key, stats in self._train_selection_controls.items()
+            },
+            "continuation_controls": {
+                key: _dataclass_state(stats)
+                for key, stats in self._continuation_controls.items()
             },
             "actors": {
                 str(actor_id): _actor_stats_state(stats)
@@ -2108,6 +2181,11 @@ class ObjectiveScheduler:
         self._train_selection_controls = _string_control_family_from_state(
             state.get("train_selection_controls")
         )
+        self._continuation_controls = _string_control_family_from_state(
+            state.get("continuation_controls")
+        )
+        self._pending_continuation_decisions = {}
+        self._recorded_continuation_stop_decisions = set()
         self._actors = _actor_family_from_state(state.get("actors"))
 
         learning_state = _mapping_state(state.get("learning_state"))
@@ -2294,6 +2372,30 @@ class ObjectiveScheduler:
             learning_state.get("last_train_batch_train_selection_score"),
             self._last_train_batch_train_selection_score,
         )
+        self._last_continuation_decision_continue = _state_bool(
+            learning_state.get("last_continuation_decision_continue"),
+            self._last_continuation_decision_continue,
+        )
+        self._last_continuation_decision_key = str(
+            learning_state.get(
+                "last_continuation_decision_key",
+                self._last_continuation_decision_key,
+            )
+        )
+        self._last_continuation_decision_reason = str(
+            learning_state.get(
+                "last_continuation_decision_reason",
+                self._last_continuation_decision_reason,
+            )
+        )
+        self._last_continuation_pending_train_batches = _state_int(
+            learning_state.get("last_continuation_pending_train_batches"),
+            self._last_continuation_pending_train_batches,
+        )
+        self._last_continuation_train_queue_pressure = _state_float(
+            learning_state.get("last_continuation_train_queue_pressure"),
+            self._last_continuation_train_queue_pressure,
+        )
         self._coverage_forced_decisions = _state_int(
             learning_state.get("coverage_forced_decisions"),
             self._coverage_forced_decisions,
@@ -2475,6 +2577,15 @@ class ObjectiveScheduler:
             ),
             "scheduler/continuation/objective_accounted": (
                 1.0 if self.continuation_objective == "accounted" else 0.0
+            ),
+            "scheduler/continuation/last_decision_continue": (
+                1.0 if self._last_continuation_decision_continue else 0.0
+            ),
+            "scheduler/continuation/last_pending_train_batches": float(
+                self._last_continuation_pending_train_batches
+            ),
+            "scheduler/continuation/last_train_queue_pressure": (
+                self._last_continuation_train_queue_pressure
             ),
             "scheduler/budget/max_accounted_dollar_seconds": budget_limit,
             "scheduler/budget/accounted_dollar_seconds": accounted_dollar_seconds,
@@ -3119,6 +3230,85 @@ class ObjectiveScheduler:
                 stats.total_stale_penalty_objective
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        continuation_feedback_updates = {
+            key: _control_feedback_updates(stats)
+            for key, stats in self._continuation_controls.items()
+        }
+        continuation_decisions = sum(
+            stats.decisions for stats in self._continuation_controls.values()
+        )
+        continuation_train_updates = sum(
+            stats.train_updates for stats in self._continuation_controls.values()
+        )
+        continuation_total_feedback_updates = sum(
+            continuation_feedback_updates.values()
+        )
+        continuation_total_objective = sum(
+            stats.total_objective
+            for stats in self._continuation_controls.values()
+        )
+        metrics["scheduler/continuation/keys"] = float(
+            len(self._continuation_controls)
+        )
+        metrics["scheduler/continuation/decisions"] = float(
+            continuation_decisions
+        )
+        metrics["scheduler/continuation/train_updates"] = float(
+            continuation_train_updates
+        )
+        metrics["scheduler/continuation/feedback_updates"] = float(
+            continuation_total_feedback_updates
+        )
+        metrics["scheduler/continuation/positive_objective_keys"] = float(
+            sum(
+                1
+                for stats in self._continuation_controls.values()
+                if stats.total_objective > 0.0
+            )
+        )
+        metrics["scheduler/continuation/total_objective"] = (
+            continuation_total_objective
+        )
+        metrics["scheduler/continuation/mean_objective_per_decision"] = (
+            continuation_total_objective / continuation_decisions
+            if continuation_decisions
+            else 0.0
+        )
+        metrics[
+            "scheduler/continuation/mean_objective_per_feedback_update"
+        ] = (
+            continuation_total_objective / continuation_total_feedback_updates
+            if continuation_total_feedback_updates
+            else 0.0
+        )
+        for key, stats in sorted(self._continuation_controls.items()):
+            prefix = f"scheduler/continuation/{_safe_metric_key(key)}"
+            feedback_updates = _control_feedback_updates(stats)
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(feedback_updates)
+            metrics[f"{prefix}/mean_objective_per_decision"] = (
+                stats.total_objective / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[f"{prefix}/mean_objective_per_feedback_update"] = (
+                stats.total_objective / feedback_updates
+                if feedback_updates
+                else 0.0
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._continuation_controls,
+                key,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._continuation_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
         train_selection_feedback_updates = {
             key: _control_feedback_updates(stats)
             for key, stats in self._train_selection_controls.items()
@@ -4104,6 +4294,66 @@ class ObjectiveScheduler:
                 _control_feedback_updates(stats),
             )
 
+    def _record_continuation_decision(
+        self,
+        *,
+        policy_step: int,
+        continue_training: bool,
+        reason: str,
+        pending_train_batches: int,
+        train_queue_pressure: float,
+    ) -> bool:
+        key = _continuation_decision_key(
+            continue_training=continue_training,
+            reason=reason,
+            pending_train_batches=pending_train_batches,
+            train_queue_pressure=train_queue_pressure,
+        )
+        self._last_continuation_decision_continue = continue_training
+        self._last_continuation_decision_key = key
+        self._last_continuation_decision_reason = reason
+        self._last_continuation_pending_train_batches = max(
+            0,
+            int(pending_train_batches),
+        )
+        pressure = (
+            float(train_queue_pressure)
+            if math.isfinite(float(train_queue_pressure))
+            else 0.0
+        )
+        self._last_continuation_train_queue_pressure = max(0.0, pressure)
+
+        if continue_training:
+            if policy_step not in self._pending_continuation_decisions:
+                stats = self._continuation_controls.setdefault(key, ControlStats())
+                stats.decisions += 1
+                self._pending_continuation_decisions[policy_step] = key
+        else:
+            marker = (policy_step, key)
+            if marker not in self._recorded_continuation_stop_decisions:
+                stats = self._continuation_controls.setdefault(key, ControlStats())
+                stats.decisions += 1
+                self._recorded_continuation_stop_decisions.add(marker)
+        return continue_training
+
+    def _credit_train_objective_to_continuation(
+        self,
+        *,
+        policy_step: int,
+        objective: float,
+    ) -> None:
+        key = self._pending_continuation_decisions.pop(policy_step, None)
+        if key is None:
+            return
+        stats = self._continuation_controls.setdefault(key, ControlStats())
+        stats.train_updates += 1
+        stats.total_objective += objective
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _control_feedback_updates(stats),
+        )
+
     def _credit_train_objective_to_actors(
         self,
         groups: Sequence[TrajectoryGroup],
@@ -4783,6 +5033,49 @@ def _train_selection_key_from_metadata(metadata: Mapping[str, Any]) -> str | Non
         return None
     key = str(raw_key)
     return key if key else None
+
+
+def _continuation_decision_key(
+    *,
+    continue_training: bool,
+    reason: str,
+    pending_train_batches: int,
+    train_queue_pressure: float,
+) -> str:
+    action = "continue" if continue_training else "stop"
+    return (
+        f"action={action}"
+        f"|reason={_continuation_reason_key(reason)}"
+        f"|pending={_pending_batch_bucket(pending_train_batches)}"
+        f"|pressure={_queue_pressure_bucket(train_queue_pressure)}"
+    )
+
+
+def _continuation_reason_key(reason: str) -> str:
+    key = _safe_metric_key(str(reason))
+    return key or "unknown"
+
+
+def _pending_batch_bucket(pending_train_batches: int) -> str:
+    pending = max(0, int(pending_train_batches))
+    if pending == 0:
+        return "0"
+    if pending == 1:
+        return "1"
+    return "2plus"
+
+
+def _queue_pressure_bucket(train_queue_pressure: float) -> str:
+    pressure = (
+        float(train_queue_pressure)
+        if math.isfinite(float(train_queue_pressure))
+        else 0.0
+    )
+    if pressure < 0.5:
+        return "low"
+    if pressure < 0.85:
+        return "medium"
+    return "high"
 
 
 def _arm_feedback_updates(stats: ArmStats) -> int:
