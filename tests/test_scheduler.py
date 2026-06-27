@@ -11,12 +11,79 @@ from calm_puffer_art import (
     TrajectoryGroup,
     TrainResult,
     action_quality,
+    scheduling_action_key,
     trajectory_failure_modes,
     trajectory_reconstruction_accuracy,
 )
 
 
 class ObjectiveSchedulerTests(unittest.TestCase):
+    def test_joint_scheduling_action_receives_rollout_train_and_stale_credit(self):
+        scheduler = ObjectiveScheduler(
+            control_exploration_bonus=0.0,
+            ema_alpha=1.0,
+            exploration_bonus=0.0,
+        )
+        key = scheduling_action_key(
+            arm_id="task|token",
+            target_train_batch_groups=2,
+            max_policy_lag=3,
+            active_actor_count=1,
+            admission_delay_ms=25,
+        )
+        trajectory = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+            metrics={"rollout/dollar_seconds": 1.0},
+            metadata={
+                "scheduler/arm_id": "task|token",
+                "scheduler/target_train_batch_groups": 2,
+                "scheduler/max_policy_lag": 3,
+                "scheduler/active_actor_count": 1,
+                "scheduler/active_rollout_admission_delay_ms": 25,
+                "scheduler/joint_action_key": key,
+            },
+        )
+        group = TrajectoryGroup(scenario_id="task", trajectories=(trajectory,))
+
+        scheduler.observe_rollout(
+            trajectory,
+            accepted=True,
+            dollar_seconds=1.0,
+        )
+        scheduler.observe_train(
+            groups=(group,),
+            result=TrainResult(metrics={"train/reward": 2.0}),
+            duration_s=1.0,
+            dollar_seconds=1.0,
+            policy_step=0,
+        )
+        scheduler.observe_stale_batch(
+            groups=(group,),
+            policy_step=4,
+            reason="test",
+        )
+
+        prefix = f"scheduler/joint_action/{_test_metric_key(key)}"
+        metrics = scheduler.metrics()
+
+        self.assertEqual(metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/rollout_updates"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/train_updates"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/stale_updates"], 1.0)
+        self.assertEqual(metrics[f"{prefix}/feedback_updates"], 3.0)
+        self.assertLess(metrics[f"{prefix}/total_stale_penalty_objective"], 0.0)
+
+        restored = ObjectiveScheduler()
+        restored.load_state_dict(scheduler.state_dict())
+        restored_metrics = restored.metrics()
+
+        self.assertEqual(restored_metrics[f"{prefix}/decisions"], 1.0)
+        self.assertEqual(restored_metrics[f"{prefix}/feedback_updates"], 3.0)
+
     def test_scheduler_explores_then_prefers_best_marginal_objective_arm(self):
         scenarios = [Scenario(id="easy"), Scenario(id="hard")]
         codecs = [TokenActionCodec(), ChunkActionCodec(chunk_size=2)]
@@ -4192,6 +4259,10 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/total_rollout_decisions"], 2.0)
         self.assertEqual(metrics["scheduler/arm/task_token/pulls"], 2.0)
         self.assertEqual(decision.arm_id, "task|token")
+
+
+def _test_metric_key(value: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in value).strip("_")
 
 
 if __name__ == "__main__":

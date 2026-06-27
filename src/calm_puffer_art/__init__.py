@@ -74,6 +74,7 @@ from .scheduler import (
     action_quality,
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
+    scheduling_action_key,
     trajectory_failure_modes,
     trajectory_reconstruction_accuracy,
 )
@@ -160,6 +161,7 @@ __all__ = [
     "run_objective_ablation",
     "run_static_ablation",
     "scheduler_checkpoint_metadata",
+    "scheduling_action_key",
     "semantic_bandwidth",
     "train_result_from_art",
     "train_result_dollar_seconds",

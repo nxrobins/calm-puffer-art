@@ -25,6 +25,7 @@ from calm_puffer_art import (
     art_rollout_metadata,
     art_group_to_local,
     local_group_to_art,
+    scheduling_action_key,
     train_result_from_art,
 )
 
@@ -892,6 +893,18 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertIsNotNone(second.decision)
         self.assertIsNone(third.decision)
         self.assertEqual(first.metadata["scheduler/arm_id"], "budget-art|token")
+        self.assertEqual(
+            first.metadata["scheduler/joint_action_key"],
+            scheduling_action_key(
+                arm_id=first.decision.arm_id,
+                target_train_batch_groups=first.decision.target_train_batch_groups,
+                max_policy_lag=first.decision.max_policy_lag,
+                active_actor_count=first.metadata["scheduler/active_actor_count"],
+                admission_delay_ms=first.metadata[
+                    "scheduler/active_rollout_admission_delay_ms"
+                ],
+            ),
+        )
         self.assertEqual(
             first.metadata["scheduler/decision/reserved_rollout_dollar_seconds"],
             1.0,

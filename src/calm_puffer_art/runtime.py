@@ -27,6 +27,7 @@ from .scheduler import (
     action_quality,
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
+    scheduling_action_key,
 )
 from .types import (
     Checkpoint,
@@ -1783,6 +1784,16 @@ class ControlPlane:
         trajectory.metadata.setdefault(
             "scheduler/active_rollout_admission_delay_s",
             admission_delay_s,
+        )
+        trajectory.metadata.setdefault(
+            "scheduler/joint_action_key",
+            scheduling_action_key(
+                arm_id=decision.arm_id,
+                target_train_batch_groups=decision.target_train_batch_groups,
+                max_policy_lag=decision.max_policy_lag,
+                active_actor_count=active_actor_count,
+                admission_delay_ms=admission_delay_ms,
+            ),
         )
         admission_dollar_seconds = (
             admission_delay_s * self.config.cost_per_second_usd

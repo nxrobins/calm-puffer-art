@@ -26,6 +26,25 @@ class SchedulerDecision:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+def scheduling_action_key(
+    *,
+    arm_id: str,
+    target_train_batch_groups: int,
+    max_policy_lag: int,
+    active_actor_count: int,
+    admission_delay_ms: int,
+) -> str:
+    """Stable key for the full rollout/runtime/action scheduling tuple."""
+
+    return (
+        f"arm={arm_id}"
+        f"|cadence={max(1, int(target_train_batch_groups))}"
+        f"|lag={max(0, int(max_policy_lag))}"
+        f"|actors={max(0, int(active_actor_count))}"
+        f"|admission_ms={max(0, int(admission_delay_ms))}"
+    )
+
+
 class AdaptiveScheduler(Protocol):
     """Chooses rollout work and runtime controls from objective feedback."""
 
@@ -511,6 +530,7 @@ class ObjectiveScheduler:
         self._lag_controls: dict[int, ControlStats] = {}
         self._admission_controls: dict[int, ControlStats] = {}
         self._actor_count_controls: dict[int, ControlStats] = {}
+        self._joint_action_controls: dict[str, ControlStats] = {}
         self._actors: dict[int, ActorStats] = {}
 
     def select_rollout(
@@ -1023,6 +1043,10 @@ class ObjectiveScheduler:
             marginal_objective,
         )
         self._credit_rollout_objective_to_actor_count_control(
+            trajectory,
+            marginal_objective,
+        )
+        self._credit_rollout_objective_to_joint_action(
             trajectory,
             marginal_objective,
         )
@@ -1601,6 +1625,10 @@ class ObjectiveScheduler:
                 str(value): _dataclass_state(stats)
                 for value, stats in self._actor_count_controls.items()
             },
+            "joint_action_controls": {
+                key: _dataclass_state(stats)
+                for key, stats in self._joint_action_controls.items()
+            },
             "actors": {
                 str(actor_id): _actor_stats_state(stats)
                 for actor_id, stats in self._actors.items()
@@ -1842,6 +1870,9 @@ class ObjectiveScheduler:
         )
         self._actor_count_controls = _control_family_from_state(
             state.get("actor_count_controls")
+        )
+        self._joint_action_controls = _string_control_family_from_state(
+            state.get("joint_action_controls")
         )
         self._actors = _actor_family_from_state(state.get("actors"))
 
@@ -2798,6 +2829,31 @@ class ObjectiveScheduler:
                 stats.total_stale_penalty_objective
             )
             metrics[f"{prefix}/stale_experience"] = stats.stale_experience
+        for key, stats in sorted(self._joint_action_controls.items()):
+            prefix = f"scheduler/joint_action/{_safe_metric_key(key)}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/rollout_updates"] = float(stats.rollout_updates)
+            metrics[f"{prefix}/train_updates"] = float(stats.train_updates)
+            metrics[f"{prefix}/stale_updates"] = float(stats.stale_updates)
+            metrics[f"{prefix}/feedback_updates"] = float(
+                _control_feedback_updates(stats)
+            )
+            metrics[f"{prefix}/objective_ema"] = stats.objective_ema
+            metrics[f"{prefix}/score"] = self._score_control_value(
+                self._joint_action_controls,
+                key,
+            )
+            metrics[f"{prefix}/exploration_score"] = (
+                self._control_exploration_value(
+                    self._joint_action_controls,
+                    stats,
+                )
+            )
+            metrics[f"{prefix}/total_objective"] = stats.total_objective
+            metrics[f"{prefix}/total_stale_penalty_objective"] = (
+                stats.total_stale_penalty_objective
+            )
+            metrics[f"{prefix}/stale_experience"] = stats.stale_experience
         return metrics
 
     def _arm_candidates(
@@ -3318,6 +3374,11 @@ class ObjectiveScheduler:
                 "scheduler/actor_count",
             ),
         )
+        self._credit_train_objective_to_joint_actions(
+            groups,
+            arm_objectives=arm_objectives,
+            arm_weights=arm_weights,
+        )
 
     def _credit_train_objective_to_control_family(
         self,
@@ -3350,6 +3411,43 @@ class ObjectiveScheduler:
 
         for value, credit in value_credit.items():
             stats = controls.setdefault(value, ControlStats())
+            stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
+
+    def _credit_train_objective_to_joint_actions(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        *,
+        arm_objectives: Mapping[str, float],
+        arm_weights: Mapping[str, float],
+    ) -> None:
+        key_credit: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                key = _joint_action_key_from_metadata(trajectory.metadata)
+                if key is None:
+                    continue
+                arm_id = str(trajectory.metadata.get("scheduler/arm_id", "unassigned"))
+                total_arm_weight = arm_weights.get(arm_id, 0.0)
+                if total_arm_weight <= 0.0:
+                    continue
+                trajectory_weight = _trajectory_credit_weight(trajectory)
+                if trajectory_weight <= 0.0:
+                    continue
+                credit = (
+                    arm_objectives.get(arm_id, 0.0)
+                    * trajectory_weight
+                    / total_arm_weight
+                )
+                key_credit[key] = key_credit.get(key, 0.0) + credit
+
+        for key, credit in key_credit.items():
+            stats = self._joint_action_controls.setdefault(key, ControlStats())
             stats.train_updates += 1
             stats.total_objective += credit
             stats.objective_ema = self._ema(
@@ -3453,6 +3551,55 @@ class ObjectiveScheduler:
                 "scheduler/actor_count",
             ),
         )
+        self._credit_objective_to_joint_actions(
+            groups,
+            objective,
+            stale_feedback=stale_feedback,
+            stale_experience=stale_experience,
+        )
+
+    def _credit_objective_to_joint_actions(
+        self,
+        groups: Sequence[TrajectoryGroup],
+        objective: float,
+        *,
+        stale_feedback: bool,
+        stale_experience: float,
+    ) -> None:
+        key_weights: dict[str, float] = {}
+        for group in groups:
+            for trajectory in group.trajectories:
+                key = _joint_action_key_from_metadata(trajectory.metadata)
+                if key is None:
+                    continue
+                quality = action_quality(trajectory)
+                if quality <= 0.0:
+                    weight = 0.0
+                else:
+                    weight = max(0.0, trajectory.reward * quality) or quality
+                key_weights[key] = key_weights.get(key, 0.0) + weight
+
+        total_weight = sum(key_weights.values())
+        for key, weight in key_weights.items():
+            stats = self._joint_action_controls.setdefault(key, ControlStats())
+            credit = objective * weight / total_weight if total_weight > 0.0 else 0.0
+            stale_credit = (
+                stale_experience * weight / total_weight
+                if total_weight > 0.0
+                else 0.0
+            )
+            if stale_feedback:
+                stats.stale_updates += 1
+                stats.stale_experience += stale_credit
+                stats.total_stale_penalty_objective += credit
+            else:
+                stats.train_updates += 1
+            stats.total_objective += credit
+            stats.objective_ema = self._ema(
+                stats.objective_ema,
+                credit,
+                _control_feedback_updates(stats),
+            )
 
     def _credit_rollout_objective_to_admission_control(
         self,
@@ -3482,6 +3629,24 @@ class ObjectiveScheduler:
                 "scheduler/active_actor_count",
                 "scheduler/actor_count",
             ),
+        )
+
+    def _credit_rollout_objective_to_joint_action(
+        self,
+        trajectory: Trajectory,
+        objective: float,
+    ) -> None:
+        key = _joint_action_key_from_metadata(trajectory.metadata)
+        if key is None:
+            return
+        stats = self._joint_action_controls.setdefault(key, ControlStats())
+        stats.decisions += 1
+        stats.rollout_updates += 1
+        stats.total_objective += objective
+        stats.objective_ema = self._ema(
+            stats.objective_ema,
+            objective,
+            _control_feedback_updates(stats),
         )
 
     def _credit_rollout_objective_to_cadence_control(
@@ -3742,8 +3907,8 @@ class ObjectiveScheduler:
 
     def _score_control_value(
         self,
-        controls: Mapping[int, ControlStats],
-        value: int,
+        controls: Mapping[Any, ControlStats],
+        value: Any,
     ) -> float:
         stats = controls.get(value)
         if stats is None:
@@ -3758,7 +3923,7 @@ class ObjectiveScheduler:
 
     def _control_exploration_value(
         self,
-        controls: Mapping[int, ControlStats],
+        controls: Mapping[Any, ControlStats],
         stats: ControlStats,
     ) -> float:
         if self.control_exploration_bonus <= 0.0:
@@ -3999,6 +4164,59 @@ def _first_int_metadata(
             except ValueError:
                 continue
     return None
+
+
+def _joint_action_key_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    raw_key = metadata.get("scheduler/joint_action_key")
+    if raw_key is None:
+        raw_key = metadata.get("scheduler/scheduling_action_key")
+    if raw_key is not None and not isinstance(raw_key, bool):
+        key = str(raw_key)
+        if key:
+            return key
+
+    arm_id = metadata.get("scheduler/arm_id")
+    if arm_id is None or isinstance(arm_id, bool):
+        return None
+    cadence = _first_int_metadata(
+        metadata,
+        (
+            "scheduler/active_target_train_batch_groups",
+            "scheduler/target_train_batch_groups",
+        ),
+    )
+    max_policy_lag = _first_int_metadata(
+        metadata,
+        (
+            "scheduler/active_max_policy_lag",
+            "scheduler/max_policy_lag",
+        ),
+    )
+    active_actor_count = _first_int_metadata(
+        metadata,
+        ("scheduler/active_actor_count", "scheduler/actor_count"),
+    )
+    admission_delay_ms = _first_int_metadata(
+        metadata,
+        (
+            "scheduler/active_rollout_admission_delay_ms",
+            "scheduler/rollout_admission_delay_ms",
+        ),
+    )
+    if (
+        cadence is None
+        or max_policy_lag is None
+        or active_actor_count is None
+        or admission_delay_ms is None
+    ):
+        return None
+    return scheduling_action_key(
+        arm_id=str(arm_id),
+        target_train_batch_groups=cadence,
+        max_policy_lag=max_policy_lag,
+        active_actor_count=active_actor_count,
+        admission_delay_ms=admission_delay_ms,
+    )
 
 
 def _batch_staleness_state(
@@ -4390,6 +4608,15 @@ def _control_family_from_state(value: Any) -> dict[int, ControlStats]:
     for raw_key, raw_stats in _mapping_state(value).items():
         key = _state_optional_int(raw_key, None)
         if key is not None:
+            controls[key] = _control_stats_from_state(raw_stats)
+    return controls
+
+
+def _string_control_family_from_state(value: Any) -> dict[str, ControlStats]:
+    controls: dict[str, ControlStats] = {}
+    for raw_key, raw_stats in _mapping_state(value).items():
+        key = str(raw_key)
+        if key:
             controls[key] = _control_stats_from_state(raw_stats)
     return controls
 

@@ -29,6 +29,7 @@ from .scheduler import (
     SchedulerDecision,
     observe_stale_batch_feedback,
     scheduler_checkpoint_metadata,
+    scheduling_action_key,
 )
 from .types import (
     ActionUnit,
@@ -1755,6 +1756,21 @@ def art_rollout_metadata(
             metadata[f"scheduler/decision/{key}"] = float(value)
     if extra is not None:
         metadata.update(extra)
+    active_actor_count = _optional_int(metadata.get("scheduler/active_actor_count"))
+    admission_delay_ms = _optional_int(
+        metadata.get("scheduler/active_rollout_admission_delay_ms")
+    )
+    if active_actor_count is not None and admission_delay_ms is not None:
+        metadata.setdefault(
+            "scheduler/joint_action_key",
+            scheduling_action_key(
+                arm_id=decision.arm_id,
+                target_train_batch_groups=decision.target_train_batch_groups,
+                max_policy_lag=decision.max_policy_lag,
+                active_actor_count=active_actor_count,
+                admission_delay_ms=admission_delay_ms,
+            ),
+        )
     return metadata
 
 

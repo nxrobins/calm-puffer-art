@@ -34,6 +34,7 @@ from calm_puffer_art import (
     promotion_checkpoint_metadata,
     restore_control_state,
     scheduler_checkpoint_metadata,
+    scheduling_action_key,
     train_result_dollar_seconds,
 )
 from calm_puffer_art.actions import action_codec_key
@@ -278,6 +279,51 @@ async def adaptive_chunk_size_rollout(
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_runtime_stamps_joint_scheduling_action_key_on_rollouts(self):
+        scheduler = ObjectiveScheduler(
+            max_policy_lag=3,
+            max_train_batch_groups=2,
+            min_actor_count=1,
+            max_actor_count=2,
+            exploration_bonus=0.0,
+        )
+        decision = scheduler.select_rollout(
+            scenarios=[Scenario(id="task")],
+            action_codecs=[TokenActionCodec()],
+            actor_id=0,
+            policy_step=0,
+            trajectory_queue_pressure=0.0,
+            train_queue_pressure=0.0,
+            configured_train_batch_groups=2,
+            configured_max_policy_lag=3,
+        )
+        trajectory = Trajectory(
+            scenario_id="task",
+            policy_step=0,
+            messages=[],
+            actions=[],
+            reward=1.0,
+        )
+
+        ControlPlane(ControlPlaneConfig())._tag_rollout_control_metadata(
+            trajectory,
+            actor_id=0,
+            decision=decision,
+            active_actor_count=2,
+            admission_delay_s=0.025,
+        )
+
+        self.assertEqual(
+            trajectory.metadata["scheduler/joint_action_key"],
+            scheduling_action_key(
+                arm_id=decision.arm_id,
+                target_train_batch_groups=decision.target_train_batch_groups,
+                max_policy_lag=decision.max_policy_lag,
+                active_actor_count=2,
+                admission_delay_ms=25,
+            ),
+        )
+
     def test_actor_cap_lease_shares_one_control_decision_per_pool_sweep(self):
         async def run():
             lease = _ActorCapLease()
