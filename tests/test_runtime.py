@@ -658,6 +658,60 @@ class RuntimeTests(unittest.TestCase):
             ],
             1.0,
         )
+        self.assertEqual(summary.metrics["promotion/decision/keys"], 2.0)
+        self.assertEqual(summary.metrics["promotion/decision/decisions"], 2.0)
+        self.assertEqual(summary.metrics["promotion/decision/promoted"], 1.0)
+        self.assertEqual(summary.metrics["promotion/decision/rejected"], 1.0)
+        self.assertEqual(
+            summary.metrics["promotion/decision/positive_reward_improving_keys"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            summary.metrics["promotion/decision/total_candidate_improvement"],
+            1.1,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/total_published_policy_improvement"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/realized_reward_improving_experience"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/"
+                "mean_realized_reward_improving_experience_per_decision"
+            ],
+            0.5,
+        )
+        reject_prefix = (
+            "promotion/decision/"
+            "action_reject_reason_metric_below_promotion_threshold"
+        )
+        promote_prefix = (
+            "promotion/decision/action_promote_reason_metric_improved"
+        )
+        self.assertEqual(summary.metrics[f"{reject_prefix}/decisions"], 1.0)
+        self.assertEqual(summary.metrics[f"{reject_prefix}/rejected"], 1.0)
+        self.assertAlmostEqual(
+            summary.metrics[f"{reject_prefix}/total_candidate_improvement"],
+            0.1,
+        )
+        self.assertEqual(
+            summary.metrics[f"{reject_prefix}/realized_reward_improving_experience"],
+            0.0,
+        )
+        self.assertEqual(summary.metrics[f"{promote_prefix}/decisions"], 1.0)
+        self.assertEqual(summary.metrics[f"{promote_prefix}/promoted"], 1.0)
+        self.assertEqual(
+            summary.metrics[f"{promote_prefix}/realized_reward_improving_experience"],
+            1.0,
+        )
         self.assertGreater(
             summary.metrics[
                 "north_star/published_policy_reward_improving_experience_per_dollar_second"
@@ -1912,6 +1966,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(summary.latest_step, 1)
         self.assertEqual(summary.metrics["costs/trainer_dollar_seconds"], 2.0)
         self.assertEqual(summary.metrics["costs/promotion_eval_dollar_seconds"], 8.0)
+        self.assertEqual(
+            summary.metrics["promotion/decision/total_dollar_seconds"],
+            8.0,
+        )
+        self.assertEqual(
+            summary.metrics[
+                "promotion/decision/"
+                "realized_reward_improving_experience_per_dollar_second"
+            ],
+            0.125,
+        )
         expected_scheduler_cost = (
             summary.metrics["costs/trainer_dollar_seconds"]
             + summary.metrics["costs/promotion_eval_dollar_seconds"]

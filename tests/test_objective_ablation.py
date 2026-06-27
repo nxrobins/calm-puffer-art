@@ -106,6 +106,47 @@ def assert_continuation_payoff_metrics(
     )
 
 
+def assert_promotion_decision_payoff_metrics(
+    test_case: unittest.TestCase,
+    metrics: dict[str, float],
+) -> None:
+    test_case.assertGreater(metrics["promotion/decision/keys"], 0.0)
+    test_case.assertGreater(metrics["promotion/decision/decisions"], 0.0)
+    test_case.assertGreater(metrics["promotion/decision/promoted"], 0.0)
+    test_case.assertGreater(
+        metrics["promotion/decision/positive_reward_improving_keys"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["promotion/decision/total_candidate_improvement"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["promotion/decision/total_published_policy_improvement"],
+        0.0,
+    )
+    test_case.assertGreater(
+        metrics["promotion/decision/realized_reward_improving_experience"],
+        0.0,
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "promotion/decision/"
+                "mean_realized_reward_improving_experience_per_decision"
+            ]
+        )
+    )
+    test_case.assertTrue(
+        isfinite(
+            metrics[
+                "promotion/decision/"
+                "realized_reward_improving_experience_per_dollar_second"
+            ]
+        )
+    )
+
+
 class ObjectiveAblationTests(unittest.TestCase):
     def test_objective_scheduler_beats_static_baseline_on_north_star(self):
         result = asyncio.run(run_ablation())
@@ -183,6 +224,7 @@ class ObjectiveAblationTests(unittest.TestCase):
         )
         assert_train_selection_payoff_metrics(self, objective)
         assert_continuation_payoff_metrics(self, objective)
+        assert_promotion_decision_payoff_metrics(self, objective)
 
     def test_adaptive_action_space_ablation_beats_fixed_bandwidth(self):
         result = asyncio.run(run_action_space_ablation())
@@ -215,6 +257,7 @@ class ObjectiveAblationTests(unittest.TestCase):
             ],
         )
         assert_action_space_payoff_means(self, adaptive)
+        assert_promotion_decision_payoff_metrics(self, adaptive)
 
     def test_closed_loop_ablation_accounts_joint_scheduler_payoff(self):
         result = asyncio.run(run_closed_loop_ablation())
@@ -309,6 +352,7 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertTrue(
             isfinite(objective["scheduler/last_train_batch_joint_action_score"])
         )
+        assert_promotion_decision_payoff_metrics(self, objective)
 
     def test_art_bridge_ablation_accounts_external_producer_payoff(self):
         result = asyncio.run(run_art_bridge_ablation())

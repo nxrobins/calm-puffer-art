@@ -630,6 +630,19 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "mean_realized_source_token_throughput_payoff_per_decision",
         "action_space/decision/"
         "mean_realized_source_token_throughput_payoff_per_post_decision_observation",
+        "promotion/decision/keys",
+        "promotion/decision/decisions",
+        "promotion/decision/promoted",
+        "promotion/decision/rejected",
+        "promotion/decision/positive_reward_improving_keys",
+        "promotion/decision/total_candidate_improvement",
+        "promotion/decision/total_published_policy_improvement",
+        "promotion/decision/realized_reward_improving_experience",
+        "promotion/decision/total_dollar_seconds",
+        "promotion/decision/"
+        "mean_realized_reward_improving_experience_per_decision",
+        "promotion/decision/"
+        "realized_reward_improving_experience_per_dollar_second",
         "scheduler/control/cadence_1/train_updates",
         "scheduler/control/cadence_1/mean_objective_per_decision",
         "scheduler/control/cadence_1/mean_objective_per_feedback_update",

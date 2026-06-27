@@ -19,6 +19,7 @@ from .actions import (
     action_logprob_stats,
     action_space_checkpoint_metadata,
     action_space_signature,
+    safe_metric_key,
     semantic_bandwidth,
 )
 from .scheduler import (
@@ -320,6 +321,17 @@ class RolloutPromotionEvaluator:
             },
             trajectories=tuple(trajectories),
         )
+
+
+@dataclass
+class PromotionDecisionStats:
+    decisions: int = 0
+    promoted: int = 0
+    rejected: int = 0
+    total_candidate_improvement: float = 0.0
+    total_published_policy_improvement: float = 0.0
+    total_reward_improving_experience: float = 0.0
+    total_dollar_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -880,6 +892,10 @@ class RuntimeTelemetry:
         self.published_policy_reward_improving_experience = 0.0
         self.latest_published_policy_score = 0.0
         self._last_published_policy_score: float | None = None
+        self._promotion_decision_stats: defaultdict[
+            str,
+            PromotionDecisionStats,
+        ] = defaultdict(PromotionDecisionStats)
 
     def record_actor_admission_delay(self, seconds: float) -> None:
         self.actor_admission_delay_s += max(0.0, seconds)
@@ -964,6 +980,14 @@ class RuntimeTelemetry:
         groups: Sequence[TrajectoryGroup] = (),
     ) -> None:
         self.promotion_evaluations += 1
+        candidate_improvement = max(
+            0.0,
+            decision.improvement
+            if isfinite(decision.improvement)
+            else decision.score - decision.baseline_score,
+        )
+        published_improvement = 0.0
+        reward_improving_experience = 0.0
         if decision.promoted:
             self.promotions += 1
             previous_score = (
@@ -971,18 +995,32 @@ class RuntimeTelemetry:
                 if self._last_published_policy_score is not None
                 else decision.baseline_score
             )
-            improvement = max(0.0, decision.score - previous_score)
+            published_improvement = max(0.0, decision.score - previous_score)
             experience = _useful_experience_count(groups)
             self.published_policy_updates += 1
-            self.published_policy_improvement += improvement
+            self.published_policy_improvement += published_improvement
+            reward_improving_experience = published_improvement * experience
             self.published_policy_reward_improving_experience += (
-                improvement * experience
+                reward_improving_experience
             )
             self._last_published_policy_score = decision.score
             self.latest_published_policy_score = decision.score
         else:
             self.promotion_rejections += 1
         self.promotion_eval_dollar_seconds += max(0.0, decision.dollar_seconds)
+        decision_key = _promotion_decision_key(decision)
+        decision_stats = self._promotion_decision_stats[decision_key]
+        decision_stats.decisions += 1
+        if decision.promoted:
+            decision_stats.promoted += 1
+        else:
+            decision_stats.rejected += 1
+        decision_stats.total_candidate_improvement += candidate_improvement
+        decision_stats.total_published_policy_improvement += published_improvement
+        decision_stats.total_reward_improving_experience += (
+            reward_improving_experience
+        )
+        decision_stats.total_dollar_seconds += max(0.0, decision.dollar_seconds)
         self.latest_promotion_score = decision.score
         self.latest_promotion_baseline_score = decision.baseline_score
         self.latest_promotion_improvement = decision.improvement
@@ -1042,8 +1080,38 @@ class RuntimeTelemetry:
             accounted_published_reward_experience = 0.0
         trajectories_seen = max(float(self.trajectories_seen), 1.0)
         train_steps = max(float(self.train_steps), 1.0)
+        promotion_decision_count = sum(
+            stats.decisions for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_promoted = sum(
+            stats.promoted for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_rejected = sum(
+            stats.rejected for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_candidate_improvement = sum(
+            stats.total_candidate_improvement
+            for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_published_improvement = sum(
+            stats.total_published_policy_improvement
+            for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_experience = sum(
+            stats.total_reward_improving_experience
+            for stats in self._promotion_decision_stats.values()
+        )
+        promotion_decision_dollar_seconds = sum(
+            stats.total_dollar_seconds
+            for stats in self._promotion_decision_stats.values()
+        )
+        promotion_positive_decision_keys = sum(
+            1
+            for stats in self._promotion_decision_stats.values()
+            if stats.total_reward_improving_experience > 0.0
+        )
 
-        return {
+        metrics = {
             "time/wall_clock_s": wall_s,
             "time/rollout_s": self.rollout_s,
             "time/trainer_s": self.trainer_s,
@@ -1181,6 +1249,44 @@ class RuntimeTelemetry:
             "promotion/latest_published_policy_score": (
                 self.latest_published_policy_score
             ),
+            "promotion/decision/keys": float(len(self._promotion_decision_stats)),
+            "promotion/decision/decisions": float(promotion_decision_count),
+            "promotion/decision/promoted": float(promotion_decision_promoted),
+            "promotion/decision/rejected": float(promotion_decision_rejected),
+            "promotion/decision/positive_reward_improving_keys": float(
+                promotion_positive_decision_keys
+            ),
+            "promotion/decision/total_candidate_improvement": (
+                promotion_decision_candidate_improvement
+            ),
+            "promotion/decision/total_published_policy_improvement": (
+                promotion_decision_published_improvement
+            ),
+            "promotion/decision/realized_reward_improving_experience": (
+                promotion_decision_experience
+            ),
+            "promotion/decision/total_dollar_seconds": (
+                promotion_decision_dollar_seconds
+            ),
+            "promotion/decision/"
+            "mean_realized_reward_improving_experience_per_decision": (
+                promotion_decision_experience / promotion_decision_count
+                if promotion_decision_count
+                else 0.0
+            ),
+            "promotion/decision/"
+            "realized_reward_improving_experience_per_dollar_second": (
+                promotion_decision_experience / promotion_decision_dollar_seconds
+                if promotion_decision_dollar_seconds
+                else 0.0
+            ),
+            "promotion/decision/"
+            "mean_published_policy_improvement_per_decision": (
+                promotion_decision_published_improvement
+                / promotion_decision_count
+                if promotion_decision_count
+                else 0.0
+            ),
             "north_star/reward_improving_experience_per_dollar_second": reward_experience,
             "north_star/accounted_reward_improving_experience_per_dollar_second": (
                 accounted_reward_experience
@@ -1192,6 +1298,37 @@ class RuntimeTelemetry:
                 accounted_published_reward_experience
             ),
         }
+        for key, stats in sorted(self._promotion_decision_stats.items()):
+            prefix = f"promotion/decision/{safe_metric_key(key)}"
+            metrics[f"{prefix}/decisions"] = float(stats.decisions)
+            metrics[f"{prefix}/promoted"] = float(stats.promoted)
+            metrics[f"{prefix}/rejected"] = float(stats.rejected)
+            metrics[f"{prefix}/total_candidate_improvement"] = (
+                stats.total_candidate_improvement
+            )
+            metrics[f"{prefix}/total_published_policy_improvement"] = (
+                stats.total_published_policy_improvement
+            )
+            metrics[f"{prefix}/realized_reward_improving_experience"] = (
+                stats.total_reward_improving_experience
+            )
+            metrics[f"{prefix}/total_dollar_seconds"] = stats.total_dollar_seconds
+            metrics[
+                f"{prefix}/mean_realized_reward_improving_experience_per_decision"
+            ] = (
+                stats.total_reward_improving_experience / stats.decisions
+                if stats.decisions
+                else 0.0
+            )
+            metrics[
+                f"{prefix}/realized_reward_improving_experience_per_dollar_second"
+            ] = (
+                stats.total_reward_improving_experience
+                / stats.total_dollar_seconds
+                if stats.total_dollar_seconds
+                else 0.0
+            )
+        return metrics
 
     def _reward_windows(self) -> tuple[float, float]:
         values = self.rewards or self.train_rewards
@@ -2498,6 +2635,12 @@ def train_result_dollar_seconds(
     if explicit_cost is not None:
         return explicit_cost
     return max(0.0, duration_s) * cost_per_second_usd
+
+
+def _promotion_decision_key(decision: PromotionDecision) -> str:
+    action = "promote" if decision.promoted else "reject"
+    reason = safe_metric_key(str(decision.reason).strip()) or "unspecified"
+    return f"action={action}|reason={reason}"
 
 
 def _trajectory_eval_dollar_seconds(
