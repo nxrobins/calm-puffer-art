@@ -304,6 +304,7 @@ Implemented now:
 - Promotion-gated checkpoint publication with promotion cost telemetry and promotion-effective scheduler credit.
 - Static-vs-objective ablation harnesses that assert positive north-star lift from scheduler control, adaptive action-space control, the combined local closed-loop controller, and the ART-bridge external-producer path.
 - A deterministic ART runtime benchmark that compares stock token-level ART, async ART producer control, and async ART plus adaptive semantic actions under common accounted north-star keys.
+- Deterministic control-dimension sensitivity ablations for policy lag, train-ring capacity, actor count, and token-only action granularity.
 - Quality-aware effective reward for unsafe or low-fidelity action granularities.
 - Opt-in ROI-based early stopping when marginal train objective is exhausted.
 - Semantic action codecs that preserve decoded text and expose bandwidth metrics.

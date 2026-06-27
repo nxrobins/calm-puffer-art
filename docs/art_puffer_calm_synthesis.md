@@ -180,4 +180,4 @@ Phase 4: Measurement
 - Report reward-improving experience per dollar-second, not only throughput.
 - Report throughput and utilization next to the objective so rollouts/sec gains are distinguishable from reward-improving experience gains.
 - Compare both wall-clock infrastructure cost and accounted rollout/trainer/queue cost, including explicit rollout dollar-seconds for API, token, tool, or GPU spend when available.
-- Include ablations for `max_policy_lag`, `train_queue_capacity`, actor count, and action codec.
+- Include ablations for `max_policy_lag`, `train_queue_capacity`, actor count, and action codec; `run_control_dimension_ablation()` reports deterministic variants for those knobs as sensitivity telemetry rather than assuming every wider setting is universally better.

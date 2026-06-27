@@ -337,6 +337,92 @@ async def run_closed_loop_ablation() -> dict[str, Any]:
     }
 
 
+async def run_control_dimension_ablation() -> dict[str, Any]:
+    full = await _run_closed_loop(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=None,
+    )
+    fixed_policy_lag = await _run_closed_loop(
+        scheduler=_objective_scheduler(max_policy_lag=1),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=None,
+        max_policy_lag=1,
+    )
+    shallow_queue = await _run_closed_loop(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=None,
+        train_queue_capacity=1,
+    )
+    single_actor = await _run_closed_loop(
+        scheduler=_objective_scheduler(max_actor_count=1),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=None,
+        num_actors=1,
+    )
+    token_action_codec = await _run_closed_loop(
+        scheduler=_objective_scheduler(),
+        action_space=None,
+        action_codecs=[TokenActionCodec()],
+    )
+    full_score = float(full.metrics[ACCOUNTED_NORTH_STAR])
+    variants = {
+        "fixed_policy_lag": _control_dimension_summary(
+            fixed_policy_lag,
+            num_actors=2,
+            train_queue_capacity=2,
+            max_policy_lag=1,
+            adaptive_action_space=True,
+        ),
+        "shallow_queue": _control_dimension_summary(
+            shallow_queue,
+            num_actors=2,
+            train_queue_capacity=1,
+            max_policy_lag=2,
+            adaptive_action_space=True,
+        ),
+        "single_actor": _control_dimension_summary(
+            single_actor,
+            num_actors=1,
+            train_queue_capacity=2,
+            max_policy_lag=2,
+            adaptive_action_space=True,
+        ),
+        "token_action_codec": _control_dimension_summary(
+            token_action_codec,
+            num_actors=2,
+            train_queue_capacity=2,
+            max_policy_lag=2,
+            adaptive_action_space=False,
+        ),
+    }
+    return {
+        "full": _control_dimension_summary(
+            full,
+            num_actors=2,
+            train_queue_capacity=2,
+            max_policy_lag=2,
+            adaptive_action_space=True,
+        ),
+        **variants,
+        "lift": {
+            f"full_vs_{name}_accounted_north_star_absolute": (
+                full_score - float(metrics[ACCOUNTED_NORTH_STAR])
+            )
+            for name, metrics in variants.items()
+        }
+        | {
+            f"full_vs_{name}_accounted_north_star_ratio": (
+                full_score / float(metrics[ACCOUNTED_NORTH_STAR])
+                if float(metrics[ACCOUNTED_NORTH_STAR]) > 0.0
+                else None
+            )
+            for name, metrics in variants.items()
+        },
+    }
+
+
 async def run_art_bridge_ablation() -> dict[str, Any]:
     static = await run_static_art_bridge_ablation()
     objective = await run_objective_art_bridge_ablation()
@@ -557,16 +643,19 @@ async def _run_closed_loop(
     scheduler: ObjectiveScheduler | None,
     action_space: AdaptiveActionSpace | None,
     action_codecs: Sequence[ActionCodec] | None,
+    num_actors: int = 2,
+    train_queue_capacity: int = 2,
+    max_policy_lag: int = 2,
 ) -> RunSummary:
     runtime = ControlPlane(
         ControlPlaneConfig(
-            num_actors=2,
+            num_actors=num_actors,
             group_size=1,
             train_batch_groups=1,
             max_train_steps=8,
             queue_max_trajectories=4,
-            train_queue_capacity=2,
-            max_policy_lag=2,
+            train_queue_capacity=train_queue_capacity,
+            max_policy_lag=max_policy_lag,
             cost_per_second_usd=1.0,
         )
     )
@@ -712,16 +801,38 @@ def _payload_key_for_codec(codec_key: str) -> str:
     return "token"
 
 
-def _objective_scheduler() -> ObjectiveScheduler:
+def _objective_scheduler(
+    *,
+    max_policy_lag: int = 2,
+    max_actor_count: int = 2,
+) -> ObjectiveScheduler:
     return ObjectiveScheduler(
         min_train_batch_groups=1,
         max_train_batch_groups=2,
         min_policy_lag=1,
-        max_policy_lag=2,
+        max_policy_lag=max(1, max_policy_lag),
         min_actor_count=1,
-        max_actor_count=2,
+        max_actor_count=max(1, max_actor_count),
         exploration_bonus=0.0,
     )
+
+
+def _control_dimension_summary(
+    summary: RunSummary,
+    *,
+    num_actors: int,
+    train_queue_capacity: int,
+    max_policy_lag: int,
+    adaptive_action_space: bool,
+) -> dict[str, float]:
+    metrics = summary_metrics(summary)
+    metrics["ablation/config/num_actors"] = float(num_actors)
+    metrics["ablation/config/train_queue_capacity"] = float(train_queue_capacity)
+    metrics["ablation/config/max_policy_lag"] = float(max_policy_lag)
+    metrics["ablation/config/adaptive_action_space"] = (
+        1.0 if adaptive_action_space else 0.0
+    )
+    return metrics
 
 
 def _benchmark_metrics_from_bridge(metrics: Mapping[str, float]) -> dict[str, float]:

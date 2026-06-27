@@ -12,6 +12,7 @@ from calm_puffer_art.objective_ablation import (
     run_art_runtime_benchmark,
     run_art_bridge_ablation,
     run_closed_loop_ablation,
+    run_control_dimension_ablation,
 )
 
 
@@ -611,6 +612,61 @@ class ObjectiveAblationTests(unittest.TestCase):
         self.assertGreater(
             lift["async_semantic_vs_stock_accounted_north_star_ratio"],
             1.0,
+        )
+
+    def test_control_dimension_ablation_reports_knob_sensitivity(self):
+        result = asyncio.run(run_control_dimension_ablation())
+
+        full = result["full"]
+        fixed_policy_lag = result["fixed_policy_lag"]
+        shallow_queue = result["shallow_queue"]
+        single_actor = result["single_actor"]
+        token_action_codec = result["token_action_codec"]
+        lift = result["lift"]
+
+        for metrics in (
+            full,
+            fixed_policy_lag,
+            shallow_queue,
+            single_actor,
+            token_action_codec,
+        ):
+            self.assertGreater(metrics[ACCOUNTED_NORTH_STAR], 0.0)
+            self.assertGreater(metrics["actions/semantic_bandwidth_tokens_per_decision"], 0.0)
+
+        self.assertEqual(full["ablation/config/num_actors"], 2.0)
+        self.assertEqual(full["ablation/config/train_queue_capacity"], 2.0)
+        self.assertEqual(full["ablation/config/max_policy_lag"], 2.0)
+        self.assertEqual(full["ablation/config/adaptive_action_space"], 1.0)
+        self.assertEqual(fixed_policy_lag["ablation/config/max_policy_lag"], 1.0)
+        self.assertEqual(shallow_queue["ablation/config/train_queue_capacity"], 1.0)
+        self.assertEqual(single_actor["ablation/config/num_actors"], 1.0)
+        self.assertEqual(
+            token_action_codec["ablation/config/adaptive_action_space"],
+            0.0,
+        )
+        self.assertEqual(
+            token_action_codec["actions/semantic_bandwidth_tokens_per_decision"],
+            1.0,
+        )
+        self.assertGreater(
+            full[ACCOUNTED_NORTH_STAR],
+            token_action_codec[ACCOUNTED_NORTH_STAR],
+        )
+        self.assertGreaterEqual(full["action_space/promotions"], 1.0)
+        assert_control_context_payoff_metrics(self, full)
+        self.assertGreater(
+            lift["full_vs_token_action_codec_accounted_north_star_ratio"],
+            1.0,
+        )
+        self.assertTrue(
+            isfinite(lift["full_vs_fixed_policy_lag_accounted_north_star_absolute"])
+        )
+        self.assertTrue(
+            isfinite(lift["full_vs_shallow_queue_accounted_north_star_absolute"])
+        )
+        self.assertTrue(
+            isfinite(lift["full_vs_single_actor_accounted_north_star_absolute"])
         )
 
 

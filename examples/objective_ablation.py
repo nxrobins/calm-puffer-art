@@ -9,6 +9,7 @@ from calm_puffer_art.objective_ablation import (
     run_art_runtime_benchmark,
     run_art_bridge_ablation,
     run_closed_loop_ablation,
+    run_control_dimension_ablation,
 )
 
 
@@ -21,6 +22,7 @@ async def main() -> None:
                 "closed_loop_control": await run_closed_loop_ablation(),
                 "art_bridge_control": await run_art_bridge_ablation(),
                 "art_runtime_benchmark": await run_art_runtime_benchmark(),
+                "control_dimension_ablation": await run_control_dimension_ablation(),
             },
             indent=2,
             sort_keys=True,
