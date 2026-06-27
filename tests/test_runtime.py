@@ -2210,6 +2210,38 @@ class RuntimeTests(unittest.TestCase):
             metrics,
         )
 
+    def test_control_plane_reconciles_accounted_summary_with_scheduler_total(self):
+        metrics = {
+            "time/wall_clock_s": 2.0,
+            "costs/accounted_dollar_seconds": 4.0,
+            "throughput/accounted_dollar_seconds_per_s": 2.0,
+            "reward/delta": 3.0,
+            "data/trajectories_accepted": 4.0,
+            "promotion/published_policy_reward_improving_experience": 5.0,
+            "north_star/accounted_reward_improving_experience_per_dollar_second": 3.0,
+            "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second": 1.25,
+        }
+
+        ControlPlane._merge_scheduler_accounted_metrics(
+            metrics,
+            {"scheduler/costs/total_dollar_seconds": 10.0},
+        )
+
+        self.assertEqual(metrics["costs/accounted_dollar_seconds"], 10.0)
+        self.assertEqual(metrics["throughput/accounted_dollar_seconds_per_s"], 5.0)
+        self.assertEqual(
+            metrics[
+                "north_star/accounted_reward_improving_experience_per_dollar_second"
+            ],
+            1.2,
+        )
+        self.assertEqual(
+            metrics[
+                "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.5,
+        )
+
     def test_runtime_telemetry_reports_sample_production_rates(self):
         telemetry = RuntimeTelemetry(cost_per_second_usd=2.0)
         telemetry.started_at = time.perf_counter() - 10.0

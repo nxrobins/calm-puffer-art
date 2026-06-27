@@ -1579,7 +1579,9 @@ class ControlPlane:
             metrics[f"train_queue/{key}"] = float(value)
         metrics["weights/broadcasts"] = float(broadcaster.broadcast_count)
         if scheduler is not None:
-            metrics.update(scheduler.metrics())
+            scheduler_metrics = scheduler.metrics()
+            self._merge_scheduler_accounted_metrics(metrics, scheduler_metrics)
+            metrics.update(scheduler_metrics)
         if action_space is not None:
             metrics.update(action_space.metrics())
         return RunSummary(
@@ -2668,6 +2670,50 @@ class ControlPlane:
     @staticmethod
     def _train_queue_pressure(train_ring: TrajectoryRingBuffer) -> float:
         return min(1.0, train_ring.pending_batches / train_ring.capacity)
+
+    @staticmethod
+    def _merge_scheduler_accounted_metrics(
+        metrics: dict[str, float],
+        scheduler_metrics: Mapping[str, float],
+    ) -> None:
+        scheduler_total = max(
+            0.0,
+            _state_float(
+                scheduler_metrics.get("scheduler/costs/total_dollar_seconds"),
+                0.0,
+            ),
+        )
+        telemetry_total = max(
+            0.0,
+            _state_float(metrics.get("costs/accounted_dollar_seconds"), 0.0),
+        )
+        if scheduler_total <= telemetry_total:
+            return
+
+        metrics["costs/accounted_dollar_seconds"] = scheduler_total
+        wall_s = max(0.0, _state_float(metrics.get("time/wall_clock_s"), 0.0))
+        if wall_s > 0.0:
+            metrics["throughput/accounted_dollar_seconds_per_s"] = (
+                scheduler_total / wall_s
+            )
+        reward_delta = max(0.0, _state_float(metrics.get("reward/delta"), 0.0))
+        accepted = max(
+            0.0,
+            _state_float(metrics.get("data/trajectories_accepted"), 0.0),
+        )
+        metrics[
+            "north_star/accounted_reward_improving_experience_per_dollar_second"
+        ] = (reward_delta * accepted / scheduler_total)
+        published_experience = max(
+            0.0,
+            _state_float(
+                metrics.get("promotion/published_policy_reward_improving_experience"),
+                0.0,
+            ),
+        )
+        metrics[
+            "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+        ] = (published_experience / scheduler_total)
 
 
 def trajectory_semantic_bandwidth(trajectory: Trajectory) -> float:
