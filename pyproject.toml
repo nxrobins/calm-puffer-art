@@ -15,6 +15,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 calm = ["torch>=2"]
+art = ["openpipe-art>=0.4.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

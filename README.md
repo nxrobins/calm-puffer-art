@@ -59,6 +59,13 @@ $env:PYTHONPATH = "src"
 python examples\scalability_profile.py
 ```
 
+Run the optional live ART bridge smoke when `openpipe-art` is installed:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\live_art_bridge_smoke.py --backend structural --json
+```
+
 The ablation output includes separate scheduler-control and action-space-control
 checks, a combined local closed-loop run, an ART-bridge run where external
 producer-style submissions use `admit_and_select_rollout()` plus `submit_group()`,
@@ -73,6 +80,12 @@ action-space-scoped runtime-control keys, metric count, checkpoint JSON bytes,
 and rollout-selector timing as the synthetic scenario/action/runtime/action-space
 lattice grows. It is not a substitute for a live ART/CALM training job; it is a
 guardrail for spotting scheduler state growth before that integration run.
+
+The live ART smoke is intentionally optional. Install the ART extra with
+`pip install -e ".[art]"` to run the structural mode against real `art.Trajectory`
+and `art.TrajectoryGroup` classes without GPU or API spend. Manual `serverless`
+and `local` modes are available for a real ART backend after credentials or local
+GPU setup are present.
 
 Run tests:
 
