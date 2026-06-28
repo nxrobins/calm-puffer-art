@@ -60,6 +60,13 @@ $env:PYTHONPATH = "src"
 python examples\real_workload_ablation.py --json
 ```
 
+Run the unit-tested codegen semantic-bandwidth sweep:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\codegen_semantic_sweep.py --json
+```
+
 Run the scheduler scalability/readiness profile:
 
 ```powershell
@@ -109,6 +116,14 @@ sweeps. The JSON adds `semantic_break_even_train_steps`, the first budget where
 semantic scheduling beats token-only after exploration cost, and
 `chunk4_recovers_at_response_tokens`, the first response length where chunk-4
 beats chunk-2 while still active.
+
+The codegen sweep is the next domain probe after verifiable math. It uses
+embedded Python function-synthesis tasks, executes deterministic unit tests for
+reward, and compares fixed token, chunk-2, chunk-3, and chunk-4 codecs over
+natural code verbosity styles. Its JSON reports
+`chunk3_recovers_at_response_tokens` and
+`chunk4_recovers_at_response_tokens`, the first mean response length where that
+chunk size beats chunk-2 on improvement per dollar with meaningful pulls.
 
 The scalability profile is a deterministic local probe for the combinatorial
 controller risk: it reports arm count, joint scheduling-action keys,
@@ -336,6 +351,7 @@ result = await future
 - `examples/adaptive_scheduler_agent.py`: a deterministic closed-loop scheduler demo that learns which scenario/action-codec arm has better reward-per-cost signal.
 - `examples/adaptive_action_space_agent.py`: a deterministic demo where objective feedback promotes a larger chunk action codec during the run.
 - `examples/objective_ablation.py`: deterministic static-vs-objective comparisons that report published-policy north-star lift from scheduler control and adaptive action-space control, plus stock ART vs async ART vs async semantic ART and control-dimension benchmark reports.
+- `examples/codegen_semantic_sweep.py`: deterministic unit-tested codegen sweep comparing fixed token, chunk-2, chunk-3, and chunk-4 action codecs on natural code output lengths.
 - `docs/art_puffer_calm_synthesis.md`: cleaned integration plan for the ART backend and future optional CALM layer.
 
 ## Non-goals
