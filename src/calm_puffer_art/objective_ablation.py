@@ -93,6 +93,134 @@ class MeanRewardTrainer:
 
 
 @dataclass(frozen=True)
+class RealAblationTask:
+    scenario_id: str
+    prompt: str
+    features: tuple[float, ...]
+    label: int
+    answer: str
+    rollout_dollar_seconds: float
+
+
+class RealAblationPolicy:
+    """Tiny torch policy for verifiable math ablations.
+
+    This is intentionally not a language-model integration. It is a fast,
+    dependency-optional model path that lets the scheduler face real inference,
+    verifier reward, and supervised weight updates before ART/vLLM plumbing.
+    """
+
+    def __init__(
+        self,
+        *,
+        feature_dim: int = 10,
+        answers: int = 4,
+        hidden_dim: int = 16,
+        seed: int = 1337,
+        model: Any | None = None,
+    ) -> None:
+        torch, nn, _ = _import_torch()
+        self.feature_dim = feature_dim
+        self.answers = answers
+        self.hidden_dim = hidden_dim
+        self.seed = seed
+        if model is None:
+            torch.manual_seed(seed)
+            self.model = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, answers),
+            )
+        else:
+            self.model = model
+        self.model.eval()
+
+    def clone(self) -> "RealAblationPolicy":
+        import copy
+
+        return RealAblationPolicy(
+            feature_dim=self.feature_dim,
+            answers=self.answers,
+            hidden_dim=self.hidden_dim,
+            seed=self.seed,
+            model=copy.deepcopy(self.model),
+        )
+
+    def predict(self, task: RealAblationTask) -> tuple[int, str, tuple[float, ...]]:
+        torch, _, _ = _import_torch()
+        self.model.eval()
+        with torch.no_grad():
+            features = torch.tensor([task.features], dtype=torch.float32)
+            logits = self.model(features).squeeze(0)
+        prediction = int(torch.argmax(logits).item())
+        return prediction, str(prediction), tuple(float(value) for value in logits)
+
+
+class RealTrainer:
+    def __init__(
+        self,
+        *,
+        scenarios: Sequence[Scenario],
+        learning_rate: float = 0.2,
+        update_epochs: int = 8,
+    ) -> None:
+        self.scenarios = tuple(scenarios)
+        self.learning_rate = learning_rate
+        self.update_epochs = update_epochs
+
+    async def train(
+        self,
+        current: PolicySnapshot,
+        groups: Sequence[TrajectoryGroup],
+    ) -> TrainResult:
+        torch, _, functional = _import_torch()
+        policy = current.policy.clone()
+        examples = [
+            _real_example_from_trajectory(trajectory)
+            for group in groups
+            for trajectory in group.trajectories
+        ]
+        if examples:
+            policy.model.train()
+            optimizer = torch.optim.SGD(policy.model.parameters(), lr=self.learning_rate)
+            features = torch.tensor(
+                [example.features for example in examples],
+                dtype=torch.float32,
+            )
+            labels = torch.tensor([example.label for example in examples], dtype=torch.long)
+            loss_value = 0.0
+            for _ in range(self.update_epochs):
+                optimizer.zero_grad()
+                logits = policy.model(features)
+                loss = functional.cross_entropy(logits, labels)
+                loss.backward()
+                optimizer.step()
+                loss_value = float(loss.item())
+            policy.model.eval()
+        else:
+            loss_value = 0.0
+
+        eval_metrics = _evaluate_real_policy(policy, self.scenarios)
+        rewards = [
+            trajectory.reward
+            for group in groups
+            for trajectory in group.trajectories
+        ]
+        return TrainResult(
+            policy=policy,
+            checkpoint_id=f"real-ablation-step-{current.step + 1}",
+            metrics={
+                "train/reward": eval_metrics["real/eval_weighted_accuracy"],
+                "train/batch_reward": fmean(rewards) if rewards else 0.0,
+                "train/loss": loss_value,
+                "train/examples": float(len(examples)),
+                "train/dollar_seconds": 0.2 + 0.05 * len(examples),
+                **eval_metrics,
+            },
+        )
+
+
+@dataclass(frozen=True)
 class _AblationArtMessage:
     role: str
     content: str
@@ -211,6 +339,51 @@ async def action_space_ablation_rollout(
     )
 
 
+async def real_ablation_rollout(
+    policy: RealAblationPolicy,
+    scenario: Scenario,
+    context: RolloutContext,
+) -> Trajectory:
+    task = _real_task_for_context(scenario, context)
+    prediction, _, logits = policy.predict(task)
+    reward = 1.0 if prediction == task.label else 0.0
+    response_text = _real_response_text(prediction)
+    actions = context.action_codec.encode(response_text)
+    for action in actions:
+        action.metadata.setdefault("real/prediction", prediction)
+        action.metadata.setdefault("real/target", task.label)
+        action.metadata.setdefault("real/correct", prediction == task.label)
+    rollout_cost = _real_rollout_dollar_seconds(
+        task=task,
+        scenario=scenario,
+        action_units=len(actions),
+    )
+    return Trajectory(
+        scenario_id=scenario.id,
+        policy_step=context.policy_step,
+        messages=[Message(role="user", content=task.prompt)],
+        actions=actions,
+        reward=reward,
+        metrics={"rollout/dollar_seconds": rollout_cost},
+        metadata={
+            **dict(context.decision_metadata),
+            "scenario_id": scenario.id,
+            "real/workload": "verifiable_math",
+            "real/prompt": task.prompt,
+            "real/features": task.features,
+            "real/label": task.label,
+            "real/answer": task.answer,
+            "real/response_text": response_text,
+            "real/prediction": prediction,
+            "real/logits": logits,
+            "action/safe": True,
+            "reconstruction/accuracy": 1.0,
+            "reconstruction/safe": True,
+            "verifier/passed": prediction == task.label,
+        },
+    )
+
+
 async def run_static_ablation() -> RunSummary:
     return await _run(scheduler=None)
 
@@ -323,6 +496,58 @@ async def run_action_space_ablation() -> dict[str, Any]:
 async def run_closed_loop_ablation() -> dict[str, Any]:
     static = await run_static_closed_loop_ablation()
     objective = await run_objective_closed_loop_ablation()
+    static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
+    objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
+    return {
+        "static": summary_metrics(static),
+        "objective": summary_metrics(objective),
+        "lift": {
+            "accounted_north_star_absolute": objective_score - static_score,
+            "accounted_north_star_ratio": (
+                objective_score / static_score if static_score > 0.0 else None
+            ),
+        },
+    }
+
+
+async def run_real_ablation() -> dict[str, Any]:
+    static = await _run(scheduler=None, real_workload=True)
+    objective = await _run(scheduler=_objective_scheduler(), real_workload=True)
+    static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
+    objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
+    return {
+        "static": summary_metrics(static),
+        "objective": summary_metrics(objective),
+        "lift": {
+            "accounted_north_star_absolute": objective_score - static_score,
+            "accounted_north_star_ratio": (
+                objective_score / static_score if static_score > 0.0 else None
+            ),
+        },
+    }
+
+
+async def run_real_closed_loop_ablation() -> dict[str, Any]:
+    static = await _run_closed_loop(
+        scheduler=None,
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=[
+            TokenActionCodec(),
+            ChunkActionCodec(chunk_size=2),
+            ChunkActionCodec(chunk_size=4),
+        ],
+        real_workload=True,
+    )
+    objective = await _run_closed_loop(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=[
+            TokenActionCodec(),
+            ChunkActionCodec(chunk_size=2),
+            ChunkActionCodec(chunk_size=4),
+        ],
+        real_workload=True,
+    )
     static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
     objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
     return {
@@ -564,7 +789,13 @@ async def run_art_runtime_benchmark() -> dict[str, Any]:
     }
 
 
-async def _run(scheduler: ObjectiveScheduler | None) -> RunSummary:
+async def _run(
+    scheduler: ObjectiveScheduler | None,
+    *,
+    real_workload: bool = False,
+) -> RunSummary:
+    if real_workload:
+        return await _run_real_workload(scheduler=scheduler)
     runtime = ControlPlane(
         ControlPlaneConfig(
             num_actors=2,
@@ -646,7 +877,17 @@ async def _run_closed_loop(
     num_actors: int = 2,
     train_queue_capacity: int = 2,
     max_policy_lag: int = 2,
+    real_workload: bool = False,
 ) -> RunSummary:
+    if real_workload:
+        return await _run_real_workload(
+            scheduler=scheduler,
+            action_space=action_space,
+            action_codecs=action_codecs,
+            num_actors=num_actors,
+            train_queue_capacity=train_queue_capacity,
+            max_policy_lag=max_policy_lag,
+        )
     runtime = ControlPlane(
         ControlPlaneConfig(
             num_actors=num_actors,
@@ -677,6 +918,48 @@ async def _run_closed_loop(
         trainer=MeanRewardTrainer(),
         workflow=action_space_ablation_rollout,
         action_codecs=action_codecs,
+        action_space=action_space,
+        scheduler=scheduler,
+    )
+
+
+async def _run_real_workload(
+    *,
+    scheduler: ObjectiveScheduler | None,
+    action_space: AdaptiveActionSpace | None = None,
+    action_codecs: Sequence[ActionCodec] | None = None,
+    num_actors: int = 2,
+    train_queue_capacity: int = 2,
+    max_policy_lag: int = 2,
+) -> RunSummary:
+    semantic_costing = (
+        action_space is not None
+        or any(
+            isinstance(codec, ChunkActionCodec)
+            for codec in (action_codecs or ())
+        )
+    )
+    scenarios = _real_workload_scenarios(
+        action_unit_dollar_seconds=0.5 if semantic_costing else 0.0
+    )
+    runtime = ControlPlane(
+        ControlPlaneConfig(
+            num_actors=num_actors,
+            group_size=1,
+            train_batch_groups=2,
+            max_train_steps=10,
+            queue_max_trajectories=8,
+            train_queue_capacity=train_queue_capacity,
+            max_policy_lag=max_policy_lag,
+            cost_per_second_usd=1.0,
+        )
+    )
+    return await runtime.run(
+        scenarios=scenarios,
+        initial_policy=RealAblationPolicy(),
+        trainer=RealTrainer(scenarios=scenarios),
+        workflow=real_ablation_rollout,
+        action_codecs=action_codecs or [TokenActionCodec()],
         action_space=action_space,
         scheduler=scheduler,
     )
@@ -801,6 +1084,144 @@ def _payload_key_for_codec(codec_key: str) -> str:
     return "token"
 
 
+def _real_workload_scenarios(
+    *,
+    action_unit_dollar_seconds: float = 0.0,
+) -> tuple[Scenario, ...]:
+    return (
+        Scenario(
+            id="easy_math",
+            payload={
+                "rollout_dollar_seconds": 0.2,
+                "action_unit_dollar_seconds": action_unit_dollar_seconds,
+                "eval_weight": 0.9,
+                "task_offset": 0,
+            },
+        ),
+        Scenario(
+            id="hard_math",
+            payload={
+                "rollout_dollar_seconds": 4.0,
+                "action_unit_dollar_seconds": action_unit_dollar_seconds,
+                "eval_weight": 0.1,
+                "task_offset": 11,
+            },
+        ),
+    )
+
+
+def _real_task_for_context(
+    scenario: Scenario,
+    context: RolloutContext,
+) -> RealAblationTask:
+    offset = int(scenario.payload.get("task_offset", 0))
+    index = context.policy_step * 7 + context.actor_id * 3 + offset
+    return _real_task(scenario, index)
+
+
+def _real_task(scenario: Scenario, index: int) -> RealAblationTask:
+    x = index % 4
+    y = (index // 2) % 4
+    if scenario.id == "easy_math":
+        label = (x + y) % 2
+        prompt = f"What is ({x} + {y}) mod 2?"
+    elif scenario.id == "hard_math":
+        label = (x + 2 * y + 1) % 4
+        prompt = f"What is ({x} + 2*{y} + 1) mod 4?"
+    else:
+        raise ValueError(f"unknown real ablation scenario: {scenario.id}")
+    return RealAblationTask(
+        scenario_id=scenario.id,
+        prompt=prompt,
+        features=_real_features(scenario.id, x, y),
+        label=label,
+        answer=str(label),
+        rollout_dollar_seconds=float(scenario.payload["rollout_dollar_seconds"]),
+    )
+
+
+def _real_features(scenario_id: str, x: int, y: int) -> tuple[float, ...]:
+    scenario_bits = (1.0, 0.0) if scenario_id == "easy_math" else (0.0, 1.0)
+    x_bits = tuple(1.0 if index == x else 0.0 for index in range(4))
+    y_bits = tuple(1.0 if index == y else 0.0 for index in range(4))
+    return scenario_bits + x_bits + y_bits
+
+
+def _real_response_text(prediction: int) -> str:
+    return f"answer {prediction} final class {prediction} verifier ready"
+
+
+def _real_rollout_dollar_seconds(
+    *,
+    task: RealAblationTask,
+    scenario: Scenario,
+    action_units: int,
+) -> float:
+    action_unit_cost = float(scenario.payload.get("action_unit_dollar_seconds", 0.0))
+    return task.rollout_dollar_seconds + action_unit_cost * max(1, action_units)
+
+
+def _real_example_from_trajectory(trajectory: Trajectory) -> RealAblationTask:
+    metadata = trajectory.metadata
+    features = metadata.get("real/features")
+    label = metadata.get("real/label")
+    if (
+        not isinstance(features, (list, tuple))
+        or not all(isinstance(value, (int, float)) for value in features)
+        or not isinstance(label, int)
+    ):
+        raise ValueError("real_ablation_training_example_missing")
+    return RealAblationTask(
+        scenario_id=trajectory.scenario_id,
+        prompt=str(metadata.get("real/prompt", "")),
+        features=tuple(float(value) for value in features),
+        label=label,
+        answer=str(metadata.get("real/answer", label)),
+        rollout_dollar_seconds=float(
+            trajectory.metrics.get("rollout/dollar_seconds", 0.0)
+        ),
+    )
+
+
+def _evaluate_real_policy(
+    policy: RealAblationPolicy,
+    scenarios: Sequence[Scenario],
+) -> dict[str, float]:
+    total_weight = 0.0
+    weighted_correct = 0.0
+    metrics: dict[str, float] = {}
+    for scenario in scenarios:
+        correct = 0
+        total = 0
+        for index in range(16):
+            task = _real_task(scenario, index)
+            prediction, _, _ = policy.predict(task)
+            correct += 1 if prediction == task.label else 0
+            total += 1
+        accuracy = correct / total if total else 0.0
+        weight = float(scenario.payload.get("eval_weight", 1.0))
+        total_weight += weight
+        weighted_correct += weight * accuracy
+        metrics[f"real/eval_accuracy/{scenario.id}"] = accuracy
+    metrics["real/eval_weighted_accuracy"] = (
+        weighted_correct / total_weight if total_weight else 0.0
+    )
+    return metrics
+
+
+def _import_torch():
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise ImportError(
+            "real workload ablations require torch. "
+            'Install with `pip install -e ".[calm]"`.'
+        ) from exc
+    return torch, nn, functional
+
+
 def _objective_scheduler(
     *,
     max_policy_lag: int = 2,
@@ -898,6 +1319,46 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "data/groups_trained",
         "data/train_steps",
         "actions/semantic_bandwidth_tokens_per_decision",
+        "costs/rollout_dollar_seconds",
+        "costs/trainer_dollar_seconds",
+        "costs/accounted_dollar_seconds",
+        "promotion/latest_score",
+        "promotion/latest_baseline_score",
+        "promotion/latest_improvement",
+        "promotion/latest_published_policy_score",
+        "real/eval_weighted_accuracy",
+        "real/eval_accuracy/easy_math",
+        "real/eval_accuracy/hard_math",
+        "scheduler/arm/easy_math_token/pulls",
+        "scheduler/arm/easy_math_token/mean_rollout_dollar_seconds",
+        "scheduler/arm/easy_math_token/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_token/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_token/source_tokens_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/pulls",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/mean_rollout_dollar_seconds",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/source_tokens_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/pulls",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/mean_rollout_dollar_seconds",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/source_tokens_per_dollar_second",
+        "scheduler/arm/hard_math_token/pulls",
+        "scheduler/arm/hard_math_token/mean_rollout_dollar_seconds",
+        "scheduler/arm/hard_math_token/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_token/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_token/source_tokens_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/pulls",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/mean_rollout_dollar_seconds",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/source_tokens_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/pulls",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/mean_rollout_dollar_seconds",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/source_tokens_per_dollar_second",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/pulls",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/mean_rollout_dollar_seconds",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/total_improvement_per_dollar_second",
@@ -927,7 +1388,9 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "action_space/demotions",
         "action_space/decision_payoff_demotions",
         "action_space/max_chunk_size",
+        "action_space/codec/chunk_chunk_size_2/active",
         "action_space/codec/chunk_chunk_size_4/active",
+        "action_space/codec/chunk_chunk_size_4/disabled",
         "action_space/decision/decisions",
         "action_space/decision/post_decision_observations",
         "action_space/decision/realized_objective_payoff",

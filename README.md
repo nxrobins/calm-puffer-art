@@ -52,6 +52,14 @@ $env:PYTHONPATH = "src"
 python examples\objective_ablation.py
 ```
 
+Run the optional tiny trainable real-workload ablation when `torch` is
+installed:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\real_workload_ablation.py --json
+```
+
 Run the scheduler scalability/readiness profile:
 
 ```powershell
@@ -73,6 +81,21 @@ and a three-way benchmark comparing stock token-level ART, async ART producer
 control, and async ART plus adaptive semantic actions on the accounted north-star.
 It also emits a control-dimension sensitivity report for policy lag, train-ring
 capacity, actor count, and token-only action granularity.
+
+The real-workload ablation is deliberately smaller than full ART or Hugging Face
+model training. It runs a CPU torch policy on deterministic verifiable modular
+math tasks, trains from rewarded trajectories, and compares the objective
+scheduler against static rollout allocation on the accounted north-star. Its
+purpose is to test whether scheduler allocation improves a real trainable loop
+before adding model-serving, ART backend registration, LoRA, GRPO, or dataset
+plumbing.
+
+The same real-workload example also includes a semantic-bandwidth closed-loop
+probe. The direct scheduler-control section remains token-only, while the
+closed-loop section offers token, chunk-2, and chunk-4 action codecs through an
+adaptive action space and charges per action decision. This lets the JSON report
+whether chunk actions produced more reward-improving experience per dollar than
+token actions on the same verifier-driven workload.
 
 The scalability profile is a deterministic local probe for the combinatorial
 controller risk: it reports arm count, joint scheduling-action keys,
