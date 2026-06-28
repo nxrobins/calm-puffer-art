@@ -141,6 +141,12 @@ The torch-backed CALM path should be optional and later. Before it is used for r
 
 For code-generation tasks, the conservative plan is `K=2` or `K=4`, syntax-aware chunking, and token-level fallback after verifier failure.
 
+### Constraints & Fallbacks
+
+The learned chunk path is deliberately bounded: CPU-only smoke, seed `1337`, max `1000` train steps, `30s` timeout, max `4096` input bytes, max `256` source tokens, max chunk size `8`, max latent dim `64`, exact `reconstruction_threshold=1.0`, and `max_unknown_tokens=0`. Learned actions may be emitted only when reconstruction is measured against original unpadded source tokens and every action has finite logprobs from explicit frozen `reference`, `old`, and `new` scorer snapshots.
+
+Any violated bound or missing invariant must fail fast with a named `ValueError`, `AssertionError`, `TimeoutError`, or `NotImplementedError`; reconstruction drift, unknown tokens, or decode failure must return token fallback actions marked `action/fallback=True`, `reconstruction/safe=False`, and an explicit `failure/mode`, and those fallback actions must not count toward learned-chunk success, semantic-bandwidth, or logprob-coverage metrics.
+
 ## Implementation Phases
 
 Phase 1: Runtime bridge
@@ -171,6 +177,7 @@ Phase 2: ART adapter
 Phase 3: CALM action layer
 
 - Add an optional `calm` extra for torch-backed encoders.
+- Keep `examples/chunk_encoder_smoke.py --json` green as a smoke-only proof that a tiny learned chunk encoder can pass exact reconstruction and emit scheduler-compatible old/new/reference logprobs.
 - Train or load a domain-specific autoencoder.
 - Compare token-level, adaptive chunk-level, latent-patch, command-unit, and hybrid policies.
 

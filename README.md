@@ -66,6 +66,13 @@ $env:PYTHONPATH = "src"
 python examples\live_art_bridge_smoke.py --backend structural --json
 ```
 
+Run the optional torch-backed chunk encoder smoke:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\chunk_encoder_smoke.py --json
+```
+
 The ablation output includes separate scheduler-control and action-space-control
 checks, a combined local closed-loop run, an ART-bridge run where external
 producer-style submissions use `admit_and_select_rollout()` plus `submit_group()`,
@@ -86,6 +93,11 @@ The live ART smoke is intentionally optional. Install the ART extra with
 and `art.TrajectoryGroup` classes without GPU or API spend. Manual `serverless`
 and `local` modes are available for a real ART backend after credentials or local
 GPU setup are present.
+
+The chunk encoder smoke is intentionally bounded to a tiny deterministic corpus.
+It proves optional torch wiring, exact reconstruction on that smoke split, and
+old/new/reference logprob emission for learned chunk actions; it is not evidence
+of production CALM quality.
 
 Run tests:
 
