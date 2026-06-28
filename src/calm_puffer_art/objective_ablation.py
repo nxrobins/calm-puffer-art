@@ -345,28 +345,26 @@ async def real_ablation_rollout(
     context: RolloutContext,
 ) -> Trajectory:
     task = _real_task_for_context(scenario, context)
-    prediction, answer, logits = policy.predict(task)
+    prediction, _, logits = policy.predict(task)
     reward = 1.0 if prediction == task.label else 0.0
-    actions = [
-        ActionUnit(
-            kind="token",
-            payload=answer,
-            token_count=1,
-            text=answer,
-            metadata={
-                "real/prediction": prediction,
-                "real/target": task.label,
-                "real/correct": prediction == task.label,
-            },
-        )
-    ]
+    response_text = _real_response_text(prediction)
+    actions = context.action_codec.encode(response_text)
+    for action in actions:
+        action.metadata.setdefault("real/prediction", prediction)
+        action.metadata.setdefault("real/target", task.label)
+        action.metadata.setdefault("real/correct", prediction == task.label)
+    rollout_cost = _real_rollout_dollar_seconds(
+        task=task,
+        scenario=scenario,
+        action_units=len(actions),
+    )
     return Trajectory(
         scenario_id=scenario.id,
         policy_step=context.policy_step,
         messages=[Message(role="user", content=task.prompt)],
         actions=actions,
         reward=reward,
-        metrics={"rollout/dollar_seconds": task.rollout_dollar_seconds},
+        metrics={"rollout/dollar_seconds": rollout_cost},
         metadata={
             **dict(context.decision_metadata),
             "scenario_id": scenario.id,
@@ -375,8 +373,12 @@ async def real_ablation_rollout(
             "real/features": task.features,
             "real/label": task.label,
             "real/answer": task.answer,
+            "real/response_text": response_text,
             "real/prediction": prediction,
             "real/logits": logits,
+            "action/safe": True,
+            "reconstruction/accuracy": 1.0,
+            "reconstruction/safe": True,
             "verifier/passed": prediction == task.label,
         },
     )
@@ -528,14 +530,22 @@ async def run_real_ablation() -> dict[str, Any]:
 async def run_real_closed_loop_ablation() -> dict[str, Any]:
     static = await _run_closed_loop(
         scheduler=None,
-        action_space=None,
-        action_codecs=[TokenActionCodec()],
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=[
+            TokenActionCodec(),
+            ChunkActionCodec(chunk_size=2),
+            ChunkActionCodec(chunk_size=4),
+        ],
         real_workload=True,
     )
     objective = await _run_closed_loop(
         scheduler=_objective_scheduler(),
-        action_space=None,
-        action_codecs=[TokenActionCodec()],
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=[
+            TokenActionCodec(),
+            ChunkActionCodec(chunk_size=2),
+            ChunkActionCodec(chunk_size=4),
+        ],
         real_workload=True,
     )
     static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
@@ -872,6 +882,8 @@ async def _run_closed_loop(
     if real_workload:
         return await _run_real_workload(
             scheduler=scheduler,
+            action_space=action_space,
+            action_codecs=action_codecs,
             num_actors=num_actors,
             train_queue_capacity=train_queue_capacity,
             max_policy_lag=max_policy_lag,
@@ -914,11 +926,22 @@ async def _run_closed_loop(
 async def _run_real_workload(
     *,
     scheduler: ObjectiveScheduler | None,
+    action_space: AdaptiveActionSpace | None = None,
+    action_codecs: Sequence[ActionCodec] | None = None,
     num_actors: int = 2,
     train_queue_capacity: int = 2,
     max_policy_lag: int = 2,
 ) -> RunSummary:
-    scenarios = _real_workload_scenarios()
+    semantic_costing = (
+        action_space is not None
+        or any(
+            isinstance(codec, ChunkActionCodec)
+            for codec in (action_codecs or ())
+        )
+    )
+    scenarios = _real_workload_scenarios(
+        action_unit_dollar_seconds=0.5 if semantic_costing else 0.0
+    )
     runtime = ControlPlane(
         ControlPlaneConfig(
             num_actors=num_actors,
@@ -936,7 +959,8 @@ async def _run_real_workload(
         initial_policy=RealAblationPolicy(),
         trainer=RealTrainer(scenarios=scenarios),
         workflow=real_ablation_rollout,
-        action_codecs=[TokenActionCodec()],
+        action_codecs=action_codecs or [TokenActionCodec()],
+        action_space=action_space,
         scheduler=scheduler,
     )
 
@@ -1060,12 +1084,16 @@ def _payload_key_for_codec(codec_key: str) -> str:
     return "token"
 
 
-def _real_workload_scenarios() -> tuple[Scenario, ...]:
+def _real_workload_scenarios(
+    *,
+    action_unit_dollar_seconds: float = 0.0,
+) -> tuple[Scenario, ...]:
     return (
         Scenario(
             id="easy_math",
             payload={
                 "rollout_dollar_seconds": 0.2,
+                "action_unit_dollar_seconds": action_unit_dollar_seconds,
                 "eval_weight": 0.9,
                 "task_offset": 0,
             },
@@ -1074,6 +1102,7 @@ def _real_workload_scenarios() -> tuple[Scenario, ...]:
             id="hard_math",
             payload={
                 "rollout_dollar_seconds": 4.0,
+                "action_unit_dollar_seconds": action_unit_dollar_seconds,
                 "eval_weight": 0.1,
                 "task_offset": 11,
             },
@@ -1116,6 +1145,20 @@ def _real_features(scenario_id: str, x: int, y: int) -> tuple[float, ...]:
     x_bits = tuple(1.0 if index == x else 0.0 for index in range(4))
     y_bits = tuple(1.0 if index == y else 0.0 for index in range(4))
     return scenario_bits + x_bits + y_bits
+
+
+def _real_response_text(prediction: int) -> str:
+    return f"answer {prediction} final class {prediction} verifier ready"
+
+
+def _real_rollout_dollar_seconds(
+    *,
+    task: RealAblationTask,
+    scenario: Scenario,
+    action_units: int,
+) -> float:
+    action_unit_cost = float(scenario.payload.get("action_unit_dollar_seconds", 0.0))
+    return task.rollout_dollar_seconds + action_unit_cost * max(1, action_units)
 
 
 def _real_example_from_trajectory(trajectory: Trajectory) -> RealAblationTask:
@@ -1289,9 +1332,33 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "scheduler/arm/easy_math_token/pulls",
         "scheduler/arm/easy_math_token/mean_rollout_dollar_seconds",
         "scheduler/arm/easy_math_token/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_token/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_token/source_tokens_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/pulls",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/mean_rollout_dollar_seconds",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_chunk_chunk_size_2/source_tokens_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/pulls",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/mean_rollout_dollar_seconds",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/total_improvement_per_dollar_second",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/easy_math_chunk_chunk_size_4/source_tokens_per_dollar_second",
         "scheduler/arm/hard_math_token/pulls",
         "scheduler/arm/hard_math_token/mean_rollout_dollar_seconds",
         "scheduler/arm/hard_math_token/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_token/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_token/source_tokens_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/pulls",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/mean_rollout_dollar_seconds",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_chunk_chunk_size_2/source_tokens_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/pulls",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/mean_rollout_dollar_seconds",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/total_improvement_per_dollar_second",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/semantic_bandwidth_tokens_per_decision",
+        "scheduler/arm/hard_math_chunk_chunk_size_4/source_tokens_per_dollar_second",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/pulls",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/mean_rollout_dollar_seconds",
         "scheduler/arm/bandwidth_chunk_chunk_size_2/total_improvement_per_dollar_second",
@@ -1321,7 +1388,9 @@ def summary_metrics(summary: RunSummary) -> dict[str, float]:
         "action_space/demotions",
         "action_space/decision_payoff_demotions",
         "action_space/max_chunk_size",
+        "action_space/codec/chunk_chunk_size_2/active",
         "action_space/codec/chunk_chunk_size_4/active",
+        "action_space/codec/chunk_chunk_size_4/disabled",
         "action_space/decision/decisions",
         "action_space/decision/post_decision_observations",
         "action_space/decision/realized_objective_payoff",

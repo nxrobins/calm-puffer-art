@@ -86,13 +86,50 @@ class RealWorkloadAblationTests(unittest.TestCase):
         from calm_puffer_art.objective_ablation import run_real_closed_loop_ablation
 
         result = asyncio.run(run_real_closed_loop_ablation())
+        static = result["static"]
+        objective = result["objective"]
 
         self.assertGreater(
-            result["objective"][ACCOUNTED_NORTH_STAR],
-            result["static"][ACCOUNTED_NORTH_STAR],
+            objective[ACCOUNTED_NORTH_STAR],
+            static[ACCOUNTED_NORTH_STAR],
         )
         self.assertGreater(result["lift"]["accounted_north_star_absolute"], 0.0)
         self.assertGreater(result["lift"]["accounted_north_star_ratio"], 1.0)
+        self.assertGreater(
+            objective["actions/semantic_bandwidth_tokens_per_decision"],
+            static["actions/semantic_bandwidth_tokens_per_decision"],
+        )
+        self.assertGreater(
+            objective["scheduler/arm/easy_math_chunk_chunk_size_2/pulls"],
+            0.0,
+        )
+        self.assertGreater(
+            objective[
+                "scheduler/arm/easy_math_chunk_chunk_size_2/"
+                "semantic_bandwidth_tokens_per_decision"
+            ],
+            objective[
+                "scheduler/arm/easy_math_token/"
+                "semantic_bandwidth_tokens_per_decision"
+            ],
+        )
+        self.assertLess(
+            objective[
+                "scheduler/arm/easy_math_chunk_chunk_size_2/"
+                "mean_rollout_dollar_seconds"
+            ],
+            objective["scheduler/arm/easy_math_token/mean_rollout_dollar_seconds"],
+        )
+        self.assertGreater(
+            objective[
+                "scheduler/arm/easy_math_chunk_chunk_size_2/"
+                "total_improvement_per_dollar_second"
+            ],
+            objective[
+                "scheduler/arm/easy_math_token/"
+                "total_improvement_per_dollar_second"
+            ],
+        )
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch") is not None,
@@ -122,6 +159,19 @@ class RealWorkloadAblationTests(unittest.TestCase):
                 result["static"][ACCOUNTED_NORTH_STAR],
             )
             self.assertGreater(result["lift"]["accounted_north_star_ratio"], 1.0)
+        closed_loop = payload["closed_loop_control"]
+        self.assertGreater(
+            closed_loop["objective"][
+                "actions/semantic_bandwidth_tokens_per_decision"
+            ],
+            closed_loop["static"]["actions/semantic_bandwidth_tokens_per_decision"],
+        )
+        self.assertGreater(
+            closed_loop["objective"][
+                "scheduler/arm/easy_math_chunk_chunk_size_2/pulls"
+            ],
+            0.0,
+        )
 
 
 if __name__ == "__main__":
