@@ -198,12 +198,18 @@ def action_codec_key(codec: ActionCodec) -> str:
     """Stable key used for scheduler arms and action-space telemetry."""
 
     name = getattr(codec, "name", codec.__class__.__name__)
-    values = getattr(codec, "__dict__", {})
-    public_values = {
-        key: value
-        for key, value in values.items()
-        if not key.startswith("_") and key != "name"
-    }
+    identity = getattr(codec, "identity", None)
+    if isinstance(identity, MappingABC):
+        public_values = {
+            str(key): value for key, value in identity.items() if key != "name"
+        }
+    else:
+        values = getattr(codec, "__dict__", {})
+        public_values = {
+            key: value
+            for key, value in values.items()
+            if not key.startswith("_") and key != "name"
+        }
     if not public_values:
         return str(name)
     suffix = ",".join(f"{key}={public_values[key]}" for key in sorted(public_values))
