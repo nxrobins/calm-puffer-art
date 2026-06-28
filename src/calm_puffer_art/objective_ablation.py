@@ -58,6 +58,11 @@ RUNTIME_CONTROL_CONTEXT_SUMMARY_KEYS = [
     "scheduler/control_context/mean_objective_per_feedback_update",
 ]
 
+DEFAULT_REAL_SWEEP_TRAIN_STEPS = (2, 4, 6, 8, 10, 16)
+DEFAULT_REAL_SWEEP_RESPONSE_MULTIPLIERS = (1, 2, 4, 8)
+DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS = 0.5
+CHUNK4_RECOVERY_MIN_PULLS = 2.0
+
 
 @dataclass(frozen=True)
 class AblationPolicy:
@@ -347,7 +352,10 @@ async def real_ablation_rollout(
     task = _real_task_for_context(scenario, context)
     prediction, _, logits = policy.predict(task)
     reward = 1.0 if prediction == task.label else 0.0
-    response_text = _real_response_text(prediction)
+    response_text = _real_response_text(
+        prediction,
+        repeats=int(scenario.payload.get("response_repeats", 1)),
+    )
     actions = context.action_codec.encode(response_text)
     for action in actions:
         action.metadata.setdefault("real/prediction", prediction)
@@ -510,9 +518,24 @@ async def run_closed_loop_ablation() -> dict[str, Any]:
     }
 
 
-async def run_real_ablation() -> dict[str, Any]:
-    static = await _run(scheduler=None, real_workload=True)
-    objective = await _run(scheduler=_objective_scheduler(), real_workload=True)
+async def run_real_ablation(
+    *,
+    max_train_steps: int = 10,
+    response_repeats: int = 1,
+    action_unit_dollar_seconds: float | None = None,
+) -> dict[str, Any]:
+    static = await _run_real_workload(
+        scheduler=None,
+        max_train_steps=max_train_steps,
+        response_repeats=response_repeats,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+    )
+    objective = await _run_real_workload(
+        scheduler=_objective_scheduler(),
+        max_train_steps=max_train_steps,
+        response_repeats=response_repeats,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+    )
     static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
     objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
     return {
@@ -527,7 +550,12 @@ async def run_real_ablation() -> dict[str, Any]:
     }
 
 
-async def run_real_closed_loop_ablation() -> dict[str, Any]:
+async def run_real_closed_loop_ablation(
+    *,
+    max_train_steps: int = 10,
+    response_repeats: int = 1,
+    action_unit_dollar_seconds: float | None = None,
+) -> dict[str, Any]:
     static = await _run_closed_loop(
         scheduler=None,
         action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
@@ -537,6 +565,9 @@ async def run_real_closed_loop_ablation() -> dict[str, Any]:
             ChunkActionCodec(chunk_size=4),
         ],
         real_workload=True,
+        max_train_steps=max_train_steps,
+        response_repeats=response_repeats,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
     )
     objective = await _run_closed_loop(
         scheduler=_objective_scheduler(),
@@ -547,6 +578,9 @@ async def run_real_closed_loop_ablation() -> dict[str, Any]:
             ChunkActionCodec(chunk_size=4),
         ],
         real_workload=True,
+        max_train_steps=max_train_steps,
+        response_repeats=response_repeats,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
     )
     static_score = float(static.metrics[ACCOUNTED_NORTH_STAR])
     objective_score = float(objective.metrics[ACCOUNTED_NORTH_STAR])
@@ -560,6 +594,319 @@ async def run_real_closed_loop_ablation() -> dict[str, Any]:
             ),
         },
     }
+
+
+async def run_real_semantic_budget_sweep(
+    train_steps: Sequence[int] = DEFAULT_REAL_SWEEP_TRAIN_STEPS,
+    repeats: int = 1,
+) -> dict[str, Any]:
+    steps = _positive_int_sequence(train_steps, "train_steps")
+    repeat_count = _positive_int(repeats, "repeats")
+    rows = []
+    for max_train_steps in steps:
+        runs = [
+            await _run_real_semantic_budget_point(max_train_steps)
+            for _ in range(repeat_count)
+        ]
+        row = _mean_numeric_rows(runs)
+        row["max_train_steps"] = max_train_steps
+        row["measurement_repeats"] = repeat_count
+        rows.append(row)
+    break_even = next(
+        (
+            int(row["max_train_steps"])
+            for row in rows
+            if row["semantic_accounted_north_star"]
+            > row["token_accounted_north_star"]
+        ),
+        None,
+    )
+    return {
+        "proof_scope": "tiny_torch_verifiable_math",
+        "measurement": "semantic_budget_sweep",
+        "action_unit_dollar_seconds": DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS,
+        "repeats": repeat_count,
+        "rows": rows,
+        "semantic_break_even_train_steps": break_even,
+    }
+
+
+async def run_real_chunk_length_sweep(
+    response_multipliers: Sequence[int] = DEFAULT_REAL_SWEEP_RESPONSE_MULTIPLIERS,
+    repeats: int = 1,
+) -> dict[str, Any]:
+    multipliers = _positive_int_sequence(
+        response_multipliers,
+        "response_multipliers",
+    )
+    repeat_count = _positive_int(repeats, "repeats")
+    rows = []
+    for multiplier in multipliers:
+        runs = [
+            await _run_real_chunk_length_point(multiplier)
+            for _ in range(repeat_count)
+        ]
+        row = _mean_numeric_rows(runs)
+        row["response_multiplier"] = multiplier
+        row["response_tokens"] = len(_real_response_text(0, repeats=multiplier).split())
+        row["measurement_repeats"] = repeat_count
+        rows.append(row)
+    recovers_at = next(
+        (
+            int(row["response_tokens"])
+            for row in rows
+            if _chunk4_recovered(row)
+        ),
+        None,
+    )
+    return {
+        "proof_scope": "tiny_torch_verifiable_math",
+        "measurement": "chunk_length_sweep",
+        "action_unit_dollar_seconds": DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS,
+        "max_train_steps": 10,
+        "repeats": repeat_count,
+        "rows": rows,
+        "chunk4_recovers_at_response_tokens": recovers_at,
+    }
+
+
+async def run_real_semantic_sweeps(
+    *,
+    train_steps: Sequence[int] = DEFAULT_REAL_SWEEP_TRAIN_STEPS,
+    response_multipliers: Sequence[int] = DEFAULT_REAL_SWEEP_RESPONSE_MULTIPLIERS,
+    repeats: int = 1,
+) -> dict[str, Any]:
+    budget = await run_real_semantic_budget_sweep(
+        train_steps=train_steps,
+        repeats=repeats,
+    )
+    chunk_length = await run_real_chunk_length_sweep(
+        response_multipliers=response_multipliers,
+        repeats=repeats,
+    )
+    return {
+        "proof_scope": "tiny_torch_verifiable_math",
+        "semantic_break_even_train_steps": (
+            budget["semantic_break_even_train_steps"]
+        ),
+        "chunk4_recovers_at_response_tokens": (
+            chunk_length["chunk4_recovers_at_response_tokens"]
+        ),
+        "budget_sweep": budget,
+        "chunk_length_sweep": chunk_length,
+    }
+
+
+async def _run_real_semantic_budget_point(max_train_steps: int) -> dict[str, Any]:
+    token_summary = await _run_real_workload(
+        scheduler=_objective_scheduler(),
+        action_space=None,
+        action_codecs=[TokenActionCodec()],
+        max_train_steps=max_train_steps,
+        action_unit_dollar_seconds=DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS,
+    )
+    semantic_summary = await _run_real_workload(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=_real_semantic_action_codecs(),
+        max_train_steps=max_train_steps,
+        action_unit_dollar_seconds=DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS,
+    )
+    token = summary_metrics(token_summary)
+    semantic = summary_metrics(semantic_summary)
+    token_score = _metric(token, ACCOUNTED_NORTH_STAR)
+    semantic_score = _metric(semantic, ACCOUNTED_NORTH_STAR)
+    row = {
+        "max_train_steps": max_train_steps,
+        "token_accounted_north_star": token_score,
+        "semantic_accounted_north_star": semantic_score,
+        "semantic_over_token_ratio": _finite_ratio(semantic_score, token_score),
+        "semantic_over_token_absolute": semantic_score - token_score,
+        "token_accounted_dollar_seconds": _metric(
+            token,
+            "costs/accounted_dollar_seconds",
+        ),
+        "semantic_accounted_dollar_seconds": _metric(
+            semantic,
+            "costs/accounted_dollar_seconds",
+        ),
+        "semantic_bandwidth_tokens_per_decision": _metric(
+            semantic,
+            "actions/semantic_bandwidth_tokens_per_decision",
+        ),
+    }
+    row.update(_semantic_codec_metrics(semantic))
+    row.update(
+        {
+            "token_only_easy_token_pulls": _metric(
+                token,
+                "scheduler/arm/easy_math_token/pulls",
+            ),
+            "token_only_hard_token_pulls": _metric(
+                token,
+                "scheduler/arm/hard_math_token/pulls",
+            ),
+        }
+    )
+    return row
+
+
+async def _run_real_chunk_length_point(response_multiplier: int) -> dict[str, Any]:
+    summary = await _run_real_workload(
+        scheduler=_objective_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=_real_semantic_action_codecs(),
+        max_train_steps=10,
+        response_repeats=response_multiplier,
+        action_unit_dollar_seconds=DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS,
+    )
+    metrics = summary_metrics(summary)
+    row = {
+        "response_multiplier": response_multiplier,
+        "response_tokens": len(
+            _real_response_text(0, repeats=response_multiplier).split()
+        ),
+        "accounted_north_star": _metric(metrics, ACCOUNTED_NORTH_STAR),
+        "accounted_dollar_seconds": _metric(
+            metrics,
+            "costs/accounted_dollar_seconds",
+        ),
+        "semantic_bandwidth_tokens_per_decision": _metric(
+            metrics,
+            "actions/semantic_bandwidth_tokens_per_decision",
+        ),
+        "chunk4_active": _metric(
+            metrics,
+            "action_space/codec/chunk_chunk_size_4/active",
+        ),
+        "chunk4_disabled": _metric(
+            metrics,
+            "action_space/codec/chunk_chunk_size_4/disabled",
+        ),
+    }
+    row.update(_semantic_codec_metrics(metrics))
+    return row
+
+
+def _real_semantic_action_codecs() -> list[ActionCodec]:
+    return [
+        TokenActionCodec(),
+        ChunkActionCodec(chunk_size=2),
+        ChunkActionCodec(chunk_size=4),
+    ]
+
+
+def _semantic_codec_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+    row: dict[str, float] = {}
+    for label, codec_key in (
+        ("token", "token"),
+        ("chunk2", "chunk_chunk_size_2"),
+        ("chunk4", "chunk_chunk_size_4"),
+    ):
+        row[f"{label}_pulls"] = _codec_metric_sum(metrics, codec_key, "pulls")
+        row[f"{label}_improvement_per_dollar"] = _codec_metric_weighted(
+            metrics,
+            codec_key,
+            "total_improvement_per_dollar_second",
+        )
+        row[f"{label}_mean_rollout_dollar_seconds"] = _codec_metric_weighted(
+            metrics,
+            codec_key,
+            "mean_rollout_dollar_seconds",
+        )
+        row[f"{label}_semantic_bandwidth_tokens_per_decision"] = (
+            _codec_metric_weighted(
+                metrics,
+                codec_key,
+                "semantic_bandwidth_tokens_per_decision",
+            )
+        )
+        for scenario in ("easy_math", "hard_math"):
+            prefix = f"{scenario}_{label}"
+            arm = f"scheduler/arm/{scenario}_{codec_key}"
+            row[f"{prefix}_pulls"] = _metric(metrics, f"{arm}/pulls")
+            row[f"{prefix}_improvement_per_dollar"] = _metric(
+                metrics,
+                f"{arm}/total_improvement_per_dollar_second",
+            )
+            row[f"{prefix}_mean_rollout_dollar_seconds"] = _metric(
+                metrics,
+                f"{arm}/mean_rollout_dollar_seconds",
+            )
+    return row
+
+
+def _codec_metric_sum(
+    metrics: Mapping[str, float],
+    codec_key: str,
+    metric_name: str,
+) -> float:
+    return sum(
+        _metric(metrics, f"scheduler/arm/{scenario}_{codec_key}/{metric_name}")
+        for scenario in ("easy_math", "hard_math")
+    )
+
+
+def _codec_metric_weighted(
+    metrics: Mapping[str, float],
+    codec_key: str,
+    metric_name: str,
+) -> float:
+    weighted_total = 0.0
+    total_pulls = 0.0
+    for scenario in ("easy_math", "hard_math"):
+        arm = f"scheduler/arm/{scenario}_{codec_key}"
+        pulls = _metric(metrics, f"{arm}/pulls")
+        weighted_total += pulls * _metric(metrics, f"{arm}/{metric_name}")
+        total_pulls += pulls
+    return weighted_total / total_pulls if total_pulls else 0.0
+
+
+def _chunk4_recovered(row: Mapping[str, Any]) -> bool:
+    return (
+        float(row.get("chunk4_pulls", 0.0)) >= CHUNK4_RECOVERY_MIN_PULLS
+        and float(row.get("chunk4_improvement_per_dollar", 0.0))
+        > float(row.get("chunk2_improvement_per_dollar", 0.0))
+        and float(row.get("chunk4_active", 0.0)) > 0.0
+        and float(row.get("chunk4_disabled", 0.0)) < 1.0
+    )
+
+
+def _mean_numeric_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("empty_sweep_runs")
+    if len(rows) == 1:
+        return dict(rows[0])
+    merged = dict(rows[0])
+    keys = set().union(*(row.keys() for row in rows))
+    for key in keys:
+        values = [row.get(key) for row in rows]
+        if all(isinstance(value, (int, float)) for value in values):
+            merged[key] = fmean(float(value) for value in values)
+    merged["runs"] = [dict(row) for row in rows]
+    return merged
+
+
+def _positive_int_sequence(values: Sequence[int], name: str) -> tuple[int, ...]:
+    parsed = tuple(sorted(_positive_int(value, name) for value in values))
+    if not parsed:
+        raise ValueError(f"{name}_empty")
+    return parsed
+
+
+def _positive_int(value: int, name: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{name}_must_be_positive")
+    return parsed
+
+
+def _metric(metrics: Mapping[str, float], key: str) -> float:
+    return float(metrics.get(key, 0.0))
+
+
+def _finite_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0.0 else 0.0
 
 
 async def run_control_dimension_ablation() -> dict[str, Any]:
@@ -878,6 +1225,9 @@ async def _run_closed_loop(
     train_queue_capacity: int = 2,
     max_policy_lag: int = 2,
     real_workload: bool = False,
+    max_train_steps: int = 10,
+    response_repeats: int = 1,
+    action_unit_dollar_seconds: float | None = None,
 ) -> RunSummary:
     if real_workload:
         return await _run_real_workload(
@@ -887,6 +1237,9 @@ async def _run_closed_loop(
             num_actors=num_actors,
             train_queue_capacity=train_queue_capacity,
             max_policy_lag=max_policy_lag,
+            max_train_steps=max_train_steps,
+            response_repeats=response_repeats,
+            action_unit_dollar_seconds=action_unit_dollar_seconds,
         )
     runtime = ControlPlane(
         ControlPlaneConfig(
@@ -931,6 +1284,9 @@ async def _run_real_workload(
     num_actors: int = 2,
     train_queue_capacity: int = 2,
     max_policy_lag: int = 2,
+    max_train_steps: int = 10,
+    response_repeats: int = 1,
+    action_unit_dollar_seconds: float | None = None,
 ) -> RunSummary:
     semantic_costing = (
         action_space is not None
@@ -939,15 +1295,20 @@ async def _run_real_workload(
             for codec in (action_codecs or ())
         )
     )
+    if action_unit_dollar_seconds is None:
+        action_unit_dollar_seconds = (
+            DEFAULT_REAL_ACTION_UNIT_DOLLAR_SECONDS if semantic_costing else 0.0
+        )
     scenarios = _real_workload_scenarios(
-        action_unit_dollar_seconds=0.5 if semantic_costing else 0.0
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+        response_repeats=response_repeats,
     )
     runtime = ControlPlane(
         ControlPlaneConfig(
             num_actors=num_actors,
             group_size=1,
             train_batch_groups=2,
-            max_train_steps=10,
+            max_train_steps=max_train_steps,
             queue_max_trajectories=8,
             train_queue_capacity=train_queue_capacity,
             max_policy_lag=max_policy_lag,
@@ -1087,6 +1448,7 @@ def _payload_key_for_codec(codec_key: str) -> str:
 def _real_workload_scenarios(
     *,
     action_unit_dollar_seconds: float = 0.0,
+    response_repeats: int = 1,
 ) -> tuple[Scenario, ...]:
     return (
         Scenario(
@@ -1094,6 +1456,7 @@ def _real_workload_scenarios(
             payload={
                 "rollout_dollar_seconds": 0.2,
                 "action_unit_dollar_seconds": action_unit_dollar_seconds,
+                "response_repeats": response_repeats,
                 "eval_weight": 0.9,
                 "task_offset": 0,
             },
@@ -1103,6 +1466,7 @@ def _real_workload_scenarios(
             payload={
                 "rollout_dollar_seconds": 4.0,
                 "action_unit_dollar_seconds": action_unit_dollar_seconds,
+                "response_repeats": response_repeats,
                 "eval_weight": 0.1,
                 "task_offset": 11,
             },
@@ -1147,8 +1511,9 @@ def _real_features(scenario_id: str, x: int, y: int) -> tuple[float, ...]:
     return scenario_bits + x_bits + y_bits
 
 
-def _real_response_text(prediction: int) -> str:
-    return f"answer {prediction} final class {prediction} verifier ready"
+def _real_response_text(prediction: int, *, repeats: int = 1) -> str:
+    base = f"answer {prediction} final class {prediction} verifier ready"
+    return " ".join(base for _ in range(max(1, repeats)))
 
 
 def _real_rollout_dollar_seconds(

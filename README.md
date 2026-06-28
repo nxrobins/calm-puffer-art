@@ -104,6 +104,12 @@ adaptive action space and charges per action decision. This lets the JSON report
 whether chunk actions produced more reward-improving experience per dollar than
 token actions on the same verifier-driven workload.
 
+Add `--include-sweeps` to the same command to run the fast semantic-bandwidth
+sweeps. The JSON adds `semantic_break_even_train_steps`, the first budget where
+semantic scheduling beats token-only after exploration cost, and
+`chunk4_recovers_at_response_tokens`, the first response length where chunk-4
+beats chunk-2 while still active.
+
 The scalability profile is a deterministic local probe for the combinatorial
 controller risk: it reports arm count, joint scheduling-action keys,
 action-space-scoped runtime-control keys, metric count, checkpoint JSON bytes,

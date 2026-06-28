@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -135,6 +136,49 @@ class RealWorkloadAblationTests(unittest.TestCase):
         importlib.util.find_spec("torch") is not None,
         "torch is not installed",
     )
+    def test_real_semantic_budget_sweep_reports_finite_rows(self):
+        from calm_puffer_art.objective_ablation import run_real_semantic_budget_sweep
+
+        result = asyncio.run(
+            run_real_semantic_budget_sweep(train_steps=(2, 4), repeats=1)
+        )
+        rows = result["rows"]
+
+        self.assertEqual([row["max_train_steps"] for row in rows], [2, 4])
+        self.assertIn("semantic_break_even_train_steps", result)
+        for row in rows:
+            self.assertTrue(math.isfinite(row["token_accounted_north_star"]))
+            self.assertTrue(math.isfinite(row["semantic_accounted_north_star"]))
+            self.assertTrue(math.isfinite(row["semantic_over_token_ratio"]))
+            self.assertTrue(math.isfinite(row["semantic_over_token_absolute"]))
+            self.assertIn("chunk2_improvement_per_dollar", row)
+            self.assertIn("chunk4_improvement_per_dollar", row)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is not installed",
+    )
+    def test_real_chunk_length_sweep_reports_chunk_metrics(self):
+        from calm_puffer_art.objective_ablation import run_real_chunk_length_sweep
+
+        result = asyncio.run(
+            run_real_chunk_length_sweep(response_multipliers=(1, 2), repeats=1)
+        )
+        rows = result["rows"]
+
+        self.assertEqual([row["response_multiplier"] for row in rows], [1, 2])
+        self.assertLess(rows[0]["response_tokens"], rows[1]["response_tokens"])
+        self.assertIn("chunk4_recovers_at_response_tokens", result)
+        for row in rows:
+            self.assertTrue(math.isfinite(row["chunk2_improvement_per_dollar"]))
+            self.assertTrue(math.isfinite(row["chunk4_improvement_per_dollar"]))
+            self.assertIn("chunk4_active", row)
+            self.assertIn("chunk4_disabled", row)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is not installed",
+    )
     def test_real_workload_ablation_example_json_contract(self):
         command = [
             sys.executable,
@@ -171,6 +215,43 @@ class RealWorkloadAblationTests(unittest.TestCase):
                 "scheduler/arm/easy_math_chunk_chunk_size_2/pulls"
             ],
             0.0,
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is not installed",
+    )
+    def test_real_workload_ablation_example_sweeps_json_contract(self):
+        command = [
+            sys.executable,
+            str(ROOT / "examples" / "real_workload_ablation.py"),
+            "--json",
+            "--include-sweeps",
+            "--budget-train-steps",
+            "2",
+            "--response-multipliers",
+            "1",
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=_subprocess_env(),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        payload = json.loads(completed.stdout)
+
+        self.assertIn("semantic_sweeps", payload)
+        self.assertIn("semantic_break_even_train_steps", payload)
+        self.assertIn("chunk4_recovers_at_response_tokens", payload)
+        sweeps = payload["semantic_sweeps"]
+        self.assertEqual(len(sweeps["budget_sweep"]["rows"]), 1)
+        self.assertEqual(len(sweeps["chunk_length_sweep"]["rows"]), 1)
+        self.assertTrue(
+            math.isfinite(
+                sweeps["budget_sweep"]["rows"][0]["semantic_over_token_ratio"]
+            )
         )
 
 
