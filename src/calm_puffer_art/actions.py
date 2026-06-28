@@ -1382,6 +1382,7 @@ class AdaptiveActionSpace:
             "action_space/demotion_min_reference_logprob_coverage": (
                 self.demotion_min_reference_logprob_coverage
             ),
+            "action_space/demotion_min_pulls": float(self.demotion_min_pulls),
             "action_space/demotion_parent_source_token_throughput_margin": (
                 self.demotion_parent_source_token_throughput_margin
             ),
