@@ -164,6 +164,7 @@ Phase 1: Runtime bridge
 Phase 2: ART adapter
 
 - Package and verify the structural backend wrapper against live ART as a drop-in `art.Backend`.
+- Keep `examples/live_art_bridge_smoke.py` green in structural mode with real ART classes when the optional `art` extra is installed, and use its `serverless` or `local` modes for manual real-backend checks.
 - Preserve ART's existing trajectory schema and loss implementation.
 - Treat async mode as opt-in and keep a synchronous fallback for debugging.
 
