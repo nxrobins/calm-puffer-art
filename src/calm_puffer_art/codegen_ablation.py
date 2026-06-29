@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from .actions import (
     ActionCodec,
+    AdaptiveActionSpace,
     ChunkActionCodec,
     TokenActionCodec,
     action_codec_key,
@@ -35,6 +36,8 @@ DEFAULT_CODEGEN_RESPONSE_STYLES = (1, 2, 4)
 DEFAULT_CODEGEN_TRAIN_STEPS = 12
 DEFAULT_CODEGEN_ACTION_UNIT_DOLLAR_SECONDS = 0.08
 CODEGEN_RECOVERY_MIN_PULLS = 2.0
+DEFAULT_CODEGEN_SHOWCASE_TRAIN_STEPS = 8
+DEFAULT_CODEGEN_SHOWCASE_RESPONSE_STYLE = 4
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,119 @@ async def run_codegen_semantic_sweep(
     }
 
 
+async def run_python_codegen_showcase(
+    *,
+    max_train_steps: int = DEFAULT_CODEGEN_SHOWCASE_TRAIN_STEPS,
+    response_style: int = DEFAULT_CODEGEN_SHOWCASE_RESPONSE_STYLE,
+    action_unit_dollar_seconds: float = DEFAULT_CODEGEN_ACTION_UNIT_DOLLAR_SECONDS,
+) -> dict[str, Any]:
+    """Compare ART-shaped codegen conditions on unit-test verified tasks."""
+
+    train_steps = _positive_int(max_train_steps, "max_train_steps")
+    style = _positive_int(response_style, "response_style")
+    if action_unit_dollar_seconds < 0.0:
+        raise ValueError("action_unit_dollar_seconds_must_be_non_negative")
+
+    static = await _run_codegen_condition(
+        scheduler=None,
+        action_space=None,
+        action_codecs=[TokenActionCodec()],
+        response_style=style,
+        max_train_steps=train_steps,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+    )
+    scheduler_only = await _run_codegen_condition(
+        scheduler=_codegen_scheduler(),
+        action_space=None,
+        action_codecs=[TokenActionCodec()],
+        response_style=style,
+        max_train_steps=train_steps,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+    )
+    full_trinity = await _run_codegen_condition(
+        scheduler=_codegen_scheduler(),
+        action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+        action_codecs=[TokenActionCodec(), ChunkActionCodec(chunk_size=2)],
+        response_style=style,
+        max_train_steps=train_steps,
+        action_unit_dollar_seconds=action_unit_dollar_seconds,
+    )
+
+    conditions = {
+        "static_art": _codegen_summary_metrics(static),
+        "scheduler_only": _codegen_summary_metrics(scheduler_only),
+        "full_trinity": _codegen_summary_metrics(full_trinity),
+    }
+    static_score = conditions["static_art"].get(CODEGEN_ACCOUNTED_NORTH_STAR, 0.0)
+    scheduler_score = conditions["scheduler_only"].get(
+        CODEGEN_ACCOUNTED_NORTH_STAR,
+        0.0,
+    )
+    full_score = conditions["full_trinity"].get(CODEGEN_ACCOUNTED_NORTH_STAR, 0.0)
+    winning_condition = max(
+        conditions,
+        key=lambda name: conditions[name].get(CODEGEN_ACCOUNTED_NORTH_STAR, 0.0),
+    )
+    full_codec_winner = _winning_codegen_codec(conditions["full_trinity"])
+
+    return {
+        "ok": True,
+        "proof_scope": "tiny_unit_test_codegen_showcase",
+        "measurement": "python_codegen_showcase",
+        "workload": "embedded_python_function_synthesis_unit_tests",
+        "max_train_steps": train_steps,
+        "response_style": style,
+        "mean_response_tokens": _mean_codegen_response_tokens(style),
+        "action_unit_dollar_seconds": action_unit_dollar_seconds,
+        "conditions": conditions,
+        "lift": {
+            "scheduler_over_static_accounted_north_star_ratio": _finite_ratio(
+                scheduler_score,
+                static_score,
+            ),
+            "scheduler_over_static_accounted_north_star_absolute": (
+                scheduler_score - static_score
+            ),
+            "full_trinity_over_static_accounted_north_star_ratio": _finite_ratio(
+                full_score,
+                static_score,
+            ),
+            "full_trinity_over_static_accounted_north_star_absolute": (
+                full_score - static_score
+            ),
+            "full_trinity_over_scheduler_accounted_north_star_ratio": _finite_ratio(
+                full_score,
+                scheduler_score,
+            ),
+            "full_trinity_over_scheduler_accounted_north_star_absolute": (
+                full_score - scheduler_score
+            ),
+            "full_trinity_semantic_bandwidth_over_scheduler_ratio": _finite_ratio(
+                conditions["full_trinity"].get(
+                    "actions/semantic_bandwidth_tokens_per_decision",
+                    0.0,
+                ),
+                conditions["scheduler_only"].get(
+                    "actions/semantic_bandwidth_tokens_per_decision",
+                    0.0,
+                ),
+            ),
+        },
+        "winning_condition_by_accounted_north_star": winning_condition,
+        "winning_codec_by_improvement_per_dollar": full_codec_winner,
+        "chunk4_promoted": (
+            conditions["full_trinity"].get("action_space/promotions", 0.0) > 0.0
+        ),
+        "chunk4_active": (
+            conditions["full_trinity"].get(
+                "action_space/codec/chunk_chunk_size_4/active",
+                0.0,
+            )
+            > 0.0
+        ),
+    }
+
+
 async def _run_codegen_semantic_point(
     *,
     response_style: int,
@@ -305,6 +421,41 @@ async def _run_codegen_workload(
     )
 
 
+async def _run_codegen_condition(
+    *,
+    scheduler: ObjectiveScheduler | None,
+    action_space: AdaptiveActionSpace | None,
+    action_codecs: Sequence[ActionCodec],
+    response_style: int,
+    max_train_steps: int,
+    action_unit_dollar_seconds: float,
+) -> RunSummary:
+    runtime = ControlPlane(
+        ControlPlaneConfig(
+            num_actors=2,
+            group_size=1,
+            train_batch_groups=2,
+            max_train_steps=max_train_steps,
+            queue_max_trajectories=8,
+            train_queue_capacity=2,
+            max_policy_lag=2,
+            cost_per_second_usd=1.0,
+        )
+    )
+    return await runtime.run(
+        scenarios=_codegen_scenarios(
+            response_style=response_style,
+            action_unit_dollar_seconds=action_unit_dollar_seconds,
+        ),
+        initial_policy=_initial_wrong_codegen_policy(),
+        trainer=CodegenTrainer(),
+        workflow=codegen_ablation_rollout,
+        action_codecs=action_codecs,
+        action_space=action_space,
+        scheduler=scheduler,
+    )
+
+
 def _codegen_scenarios(
     *,
     response_style: int,
@@ -330,6 +481,28 @@ def _codegen_action_codecs() -> list[ActionCodec]:
         ChunkActionCodec(chunk_size=3),
         ChunkActionCodec(chunk_size=4),
     ]
+
+
+def _codegen_scheduler() -> ObjectiveScheduler:
+    return ObjectiveScheduler(
+        min_train_batch_groups=1,
+        max_train_batch_groups=2,
+        min_policy_lag=1,
+        max_policy_lag=2,
+        min_actor_count=1,
+        max_actor_count=2,
+        exploration_bonus=0.0,
+    )
+
+
+def _initial_wrong_codegen_policy() -> CodegenPolicy:
+    scores = {}
+    for task in _CODEGEN_TASKS:
+        values = [0.0 for _ in task.candidates]
+        wrong_index = 1 if len(values) > 1 else 0
+        values[wrong_index] = 1.0
+        scores[task.id] = values
+    return CodegenPolicy(scores=scores)
 
 
 def _codegen_task_for_scenario(scenario: Scenario) -> CodegenTask:
@@ -425,6 +598,48 @@ def _codegen_codec_labels() -> tuple[tuple[str, ActionCodec], ...]:
     )
 
 
+def _codegen_summary_metrics(summary: RunSummary) -> dict[str, Any]:
+    metrics = dict(summary.metrics)
+    keys = [
+        CODEGEN_NORTH_STAR,
+        CODEGEN_ACCOUNTED_NORTH_STAR,
+        "reward/delta",
+        "data/groups_trained",
+        "data/train_steps",
+        "actions/semantic_bandwidth_tokens_per_decision",
+        "costs/rollout_dollar_seconds",
+        "costs/trainer_dollar_seconds",
+        "costs/accounted_dollar_seconds",
+        "promotion/latest_score",
+        "promotion/latest_baseline_score",
+        "promotion/latest_improvement",
+        "promotion/latest_published_policy_score",
+        "action_space/active_codecs",
+        "action_space/promotions",
+        "action_space/demotions",
+        "action_space/codec/chunk_chunk_size_2/active",
+        "action_space/codec/chunk_chunk_size_4/active",
+        "action_space/codec/chunk_chunk_size_4/disabled",
+        "scheduler/joint_action/tuples",
+        "scheduler/joint_action/decisions",
+        "scheduler/joint_action/feedback_updates",
+        "scheduler/joint_action/positive_objective_tuples",
+        "scheduler/joint_action/mean_objective_per_decision",
+        "scheduler/continuation/decisions",
+        "scheduler/continuation/feedback_updates",
+    ]
+    summary_values = {
+        key: float(metrics[key])
+        for key in keys
+        if key in metrics
+    }
+    summary_values.update(_codegen_codec_metrics(metrics))
+    summary_values["winning_codec_by_improvement_per_dollar"] = (
+        _winning_codegen_codec(summary_values)
+    )
+    return summary_values
+
+
 def _codegen_codec_sum(
     metrics: Mapping[str, float],
     codec_key: str,
@@ -510,6 +725,10 @@ def _positive_int(value: int, name: str) -> int:
 
 def _metric(metrics: Mapping[str, float], key: str) -> float:
     return float(metrics.get(key, 0.0))
+
+
+def _finite_ratio(numerator: float, denominator: float) -> float | None:
+    return numerator / denominator if denominator > 0.0 else None
 
 
 _CODEGEN_TASKS = (
