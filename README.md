@@ -81,15 +81,15 @@ The most useful optional live check is the Azure Foundry budget race:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path D:\topology-engine\.env --deployment gpt-5.5 --task-limit 17 --train-steps 512 --model-call-budget 256
+python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name --task-limit 17 --train-steps 512 --model-call-budget 256
 ```
 
 That command makes live model calls. Keep credentials in a dotenv file with:
 
 ```text
-COVENANT_AZURE_KEY=...
-COVENANT_AZURE_ENDPOINT=...
-COVENANT_AZURE_API_VERSION=...
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=...
+AZURE_OPENAI_API_VERSION=...
 ```
 
 ## What To Run
@@ -104,8 +104,8 @@ COVENANT_AZURE_API_VERSION=...
 | Scheduler state-size and timing profile | `python examples\scalability_profile.py` |
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
-| Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path D:\topology-engine\.env --deployment gpt-5.5` |
-| Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path D:\topology-engine\.env --deployment gpt-5.5` |
+| Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
+| Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
 
 ## Architecture
 
@@ -218,14 +218,14 @@ Train-step ablation:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python examples\azure_foundry_codegen_ablation.py --json --env-path D:\topology-engine\.env --deployment gpt-5.5 --task-limit 17 --train-steps 160 --model-call-budget 256
+python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name --task-limit 17 --train-steps 160 --model-call-budget 256
 ```
 
 Fixed-budget race:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path D:\topology-engine\.env --deployment gpt-5.5 --task-limit 17 --train-steps 512 --model-call-budget 256
+python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name --task-limit 17 --train-steps 512 --model-call-budget 256
 ```
 
 The fixed-budget race is the sharper test when asking whether the system wins on
@@ -277,7 +277,7 @@ Optional checks:
 ```powershell
 python examples\chunk_encoder_smoke.py --json
 python examples\live_art_bridge_smoke.py --backend structural --json
-python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path D:\topology-engine\.env --deployment gpt-5.5
+python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name
 ```
 
 The optional checks may need `torch`, `openpipe-art`, `openai`, credentials, or

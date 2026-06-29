@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
     PythonRepairTask,
+    _env_first,
     extract_python_solution,
     load_env_file,
     run_azure_foundry_budget_race,
@@ -100,29 +101,45 @@ class FoundryCodegenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env_path = Path(directory) / ".env"
             env_path.write_text(
-                "COVENANT_AZURE_KEY=secret\n"
-                "COVENANT_AZURE_ENDPOINT=https://example.invalid\n"
+                "AZURE_OPENAI_API_KEY=secret\n"
+                "AZURE_OPENAI_ENDPOINT=https://example.invalid\n"
                 "# ignored\n",
                 encoding="utf-8",
             )
-            old_key = os.environ.pop("COVENANT_AZURE_KEY", None)
-            old_endpoint = os.environ.pop("COVENANT_AZURE_ENDPOINT", None)
+            old_key = os.environ.pop("AZURE_OPENAI_API_KEY", None)
+            old_endpoint = os.environ.pop("AZURE_OPENAI_ENDPOINT", None)
             try:
                 loaded = load_env_file(env_path)
                 self.assertEqual(
                     loaded,
-                    ("COVENANT_AZURE_KEY", "COVENANT_AZURE_ENDPOINT"),
+                    ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"),
                 )
-                self.assertEqual(os.environ["COVENANT_AZURE_KEY"], "secret")
+                self.assertEqual(os.environ["AZURE_OPENAI_API_KEY"], "secret")
             finally:
                 if old_key is not None:
-                    os.environ["COVENANT_AZURE_KEY"] = old_key
+                    os.environ["AZURE_OPENAI_API_KEY"] = old_key
                 else:
-                    os.environ.pop("COVENANT_AZURE_KEY", None)
+                    os.environ.pop("AZURE_OPENAI_API_KEY", None)
                 if old_endpoint is not None:
-                    os.environ["COVENANT_AZURE_ENDPOINT"] = old_endpoint
+                    os.environ["AZURE_OPENAI_ENDPOINT"] = old_endpoint
                 else:
-                    os.environ.pop("COVENANT_AZURE_ENDPOINT", None)
+                    os.environ.pop("AZURE_OPENAI_ENDPOINT", None)
+
+    def test_azure_env_aliases_remain_backward_compatible(self):
+        names = ("AZURE_OPENAI_API_KEY", "COVENANT_AZURE_KEY")
+        old_values = {name: os.environ.pop(name, None) for name in names}
+        try:
+            os.environ["COVENANT_AZURE_KEY"] = "legacy"
+            self.assertEqual(_env_first(*names), "legacy")
+
+            os.environ["AZURE_OPENAI_API_KEY"] = "standard"
+            self.assertEqual(_env_first(*names), "standard")
+        finally:
+            for name, value in old_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def test_extract_python_solution_accepts_fenced_or_plain_code(self):
         fenced = "Here:\n```python\ndef solve(x):\n    return x\n```"

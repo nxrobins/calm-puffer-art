@@ -40,7 +40,7 @@ from .types import (
 )
 
 
-DEFAULT_FOUNDRY_ENV_PATH = Path("D:/topology-engine/.env")
+DEFAULT_FOUNDRY_ENV_PATH = Path(".env")
 DEFAULT_FOUNDRY_DEPLOYMENT = "gpt-5.5"
 DEFAULT_FOUNDRY_API_VERSION = "2025-04-01-preview"
 DEFAULT_FOUNDRY_TRAIN_STEPS = 2
@@ -528,8 +528,8 @@ async def run_azure_foundry_budget_race(
 
 def create_azure_foundry_client(config: AzureFoundryCodegenConfig) -> Any:
     load_env_file(config.env_path)
-    key = os.environ.get("COVENANT_AZURE_KEY")
-    endpoint = os.environ.get("COVENANT_AZURE_ENDPOINT")
+    key = _env_first("AZURE_OPENAI_API_KEY", "COVENANT_AZURE_KEY")
+    endpoint = _env_first("AZURE_OPENAI_ENDPOINT", "COVENANT_AZURE_ENDPOINT")
     if not key or not endpoint:
         raise RuntimeError("azure_foundry_env_missing_required_keys")
     try:
@@ -539,9 +539,21 @@ def create_azure_foundry_client(config: AzureFoundryCodegenConfig) -> Any:
     return AsyncAzureOpenAI(
         api_key=key,
         azure_endpoint=endpoint,
-        api_version=os.environ.get("COVENANT_AZURE_API_VERSION", config.api_version),
+        api_version=_env_first(
+            "AZURE_OPENAI_API_VERSION",
+            "COVENANT_AZURE_API_VERSION",
+        )
+        or config.api_version,
         timeout=config.request_timeout_s,
     )
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
 
 
 def load_env_file(path: Path) -> tuple[str, ...]:

@@ -70,7 +70,7 @@ def _parse_args() -> argparse.Namespace:
         "--env-path",
         type=Path,
         default=DEFAULT_FOUNDRY_ENV_PATH,
-        help="Path to a dotenv file containing COVENANT_AZURE_* keys.",
+        help="Path to a dotenv file containing AZURE_OPENAI_* keys.",
     )
     parser.add_argument(
         "--deployment",
