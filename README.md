@@ -228,6 +228,16 @@ $env:PYTHONPATH = "src"
 python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name --task-limit 17 --train-steps 512 --model-call-budget 256
 ```
 
+For longer live runs, add an overall watchdog and durable JSONL telemetry:
+
+```powershell
+python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name --task-limit 17 --train-steps 512 --model-call-budget 256 --run-timeout-s 3600 --heartbeat-interval-s 30 --telemetry-path .codex\foundry-runs\trial.jsonl
+```
+
+Heartbeat events are written to stderr so stdout remains parseable JSON. The
+telemetry file records `run_started`, `run_heartbeat`, `run_completed`,
+`run_failed`, or `run_timeout` events with elapsed time and run settings.
+
 The fixed-budget race is the sharper test when asking whether the system wins on
 both performance and cost. It stops every condition on the same accounted
 dollar-second ceiling and reports:
