@@ -624,10 +624,6 @@ class ActionCodecTests(unittest.TestCase):
                 "scheduler/arm/task_chunk_chunk_size_4/objective_score": 0.0,
                 "scheduler/arm/task_chunk_chunk_size_4/action_quality_ema": 0.0,
                 "scheduler/arm/task_chunk_chunk_size_4/unsafe_rate": 1.0,
-                "scheduler/arm/task_chunk_chunk_size_2/pulls": 4.0,
-                "scheduler/arm/task_chunk_chunk_size_2/objective_score": 1.0,
-                "scheduler/arm/task_chunk_chunk_size_2/action_quality_ema": 1.0,
-                "scheduler/arm/task_chunk_chunk_size_2/unsafe_rate": 0.0,
             }
         )
         metrics = action_space.metrics()

@@ -181,6 +181,75 @@ class FoundryCodegenTests(unittest.TestCase):
         self.assertFalse(timed_out.passed)
         self.assertEqual(timed_out.failure_mode, "timeout")
 
+    def test_verify_python_solution_enforces_memory_limit(self):
+        task = PythonRepairTask(
+            id="mini",
+            prompt="Return x plus one.",
+            signature="def solve(x)",
+            buggy_code="def solve(x):\n    return x\n",
+            tests=(((1,), 2),),
+        )
+
+        limited = verify_python_solution(
+            task,
+            "def solve(x):\n    values = [0] * 20_000_000\n    return x + 1\n",
+            timeout_s=3.0,
+            memory_limit_bytes=96 * 1024 * 1024,
+        )
+
+        self.assertFalse(limited.passed)
+        self.assertIn(
+            limited.failure_mode,
+            {
+                "exec_error",
+                "resource_limit_exceeded",
+                "resource_limit_unavailable",
+                "unit_test_exception",
+                "verifier_crashed",
+            },
+        )
+
+    def test_foundry_cli_json_reports_missing_env_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = _subprocess_env()
+            for name in (
+                "AZURE_OPENAI_API_KEY",
+                "AZURE_OPENAI_ENDPOINT",
+                "AZURE_OPENAI_API_VERSION",
+                "COVENANT_AZURE_KEY",
+                "COVENANT_AZURE_ENDPOINT",
+                "COVENANT_AZURE_API_VERSION",
+            ):
+                env.pop(name, None)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "examples/azure_foundry_codegen_ablation.py",
+                    "--json",
+                    "--env-path",
+                    str(Path(directory) / ".env"),
+                    "--task-limit",
+                    "1",
+                    "--train-steps",
+                    "1",
+                    "--model-call-budget",
+                    "0",
+                    "--deployment",
+                    "dry-run-placeholder",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        payload = json.loads(completed.stdout)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "azure_foundry_env_missing_required_keys")
+        self.assertNotIn("Traceback", completed.stderr)
+
     def test_fake_foundry_ablation_reports_live_contract_shape(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):
             return _FakeClient()
