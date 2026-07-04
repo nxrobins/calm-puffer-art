@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
+import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from calm_puffer_art.foundry_codegen import (
     DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS,
@@ -21,6 +25,35 @@ from calm_puffer_art.foundry_codegen import (
     run_azure_foundry_budget_race,
     run_azure_foundry_codegen_ablation,
 )
+
+
+class RunTimeoutError(RuntimeError):
+    pass
+
+
+@dataclass
+class _TelemetrySink:
+    path: Path | None = None
+    echo_to_stderr: bool = False
+    started_at: float = time.perf_counter()
+
+    def elapsed_s(self) -> float:
+        return max(0.0, time.perf_counter() - self.started_at)
+
+    def emit(self, event: str, **fields: Any) -> None:
+        payload = {
+            "event": event,
+            "elapsed_s": round(self.elapsed_s(), 6),
+            "timestamp_unix_s": round(time.time(), 6),
+            **fields,
+        }
+        line = json.dumps(payload, sort_keys=True)
+        if self.echo_to_stderr:
+            print(line, file=sys.stderr, flush=True)
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
 
 async def _run(
@@ -54,6 +87,83 @@ async def _run(
             budget_dollar_seconds=budget_dollar_seconds,
         )
     return await run_azure_foundry_codegen_ablation(config=config)
+
+
+async def _run_with_watchdog(
+    coro_factory: Callable[[], Awaitable[dict[str, Any]]],
+    *,
+    telemetry: _TelemetrySink,
+    run_timeout_s: float,
+    heartbeat_interval_s: float,
+    run_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    telemetry.emit("run_started", **run_metadata)
+    task = asyncio.create_task(coro_factory())
+    heartbeat_task: asyncio.Task[None] | None = None
+    if heartbeat_interval_s > 0.0:
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(
+                task,
+                telemetry=telemetry,
+                interval_s=heartbeat_interval_s,
+                run_timeout_s=run_timeout_s,
+                run_metadata=run_metadata,
+            )
+        )
+    try:
+        if run_timeout_s > 0.0:
+            payload = await asyncio.wait_for(task, timeout=run_timeout_s)
+        else:
+            payload = await task
+    except asyncio.TimeoutError as exc:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        telemetry.emit(
+            "run_timeout",
+            timeout_s=run_timeout_s,
+            **run_metadata,
+        )
+        raise RunTimeoutError(f"foundry_run_timeout_exceeded_s={run_timeout_s}") from exc
+    except Exception as exc:
+        telemetry.emit(
+            "run_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            **run_metadata,
+        )
+        raise
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+    telemetry.emit(
+        "run_completed",
+        measurement=str(payload.get("measurement", "")),
+        ok=bool(payload.get("ok")),
+        **run_metadata,
+    )
+    return payload
+
+
+async def _heartbeat_loop(
+    task: asyncio.Task[dict[str, Any]],
+    *,
+    telemetry: _TelemetrySink,
+    interval_s: float,
+    run_timeout_s: float,
+    run_metadata: dict[str, Any],
+) -> None:
+    while not task.done():
+        await asyncio.sleep(interval_s)
+        if not task.done():
+            telemetry.emit(
+                "run_heartbeat",
+                timeout_s=run_timeout_s,
+                **run_metadata,
+            )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -133,6 +243,24 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_FOUNDRY_BUDGET_DOLLAR_SECONDS,
         help="Accounted dollar-second ceiling for --budget-race.",
     )
+    parser.add_argument(
+        "--run-timeout-s",
+        type=float,
+        default=0.0,
+        help="Overall experiment wall-clock timeout in seconds; 0 disables it.",
+    )
+    parser.add_argument(
+        "--heartbeat-interval-s",
+        type=float,
+        default=0.0,
+        help="Emit JSONL heartbeat events to stderr every N seconds; 0 disables it.",
+    )
+    parser.add_argument(
+        "--telemetry-path",
+        type=Path,
+        default=None,
+        help="Optional JSONL file for run lifecycle telemetry.",
+    )
     return parser.parse_args()
 
 
@@ -153,38 +281,62 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--verify-memory-limit-mib must be positive")
     if args.budget_dollar_seconds <= 0.0:
         raise SystemExit("--budget-dollar-seconds must be positive")
+    if args.run_timeout_s < 0.0:
+        raise SystemExit("--run-timeout-s must be non-negative")
+    if args.heartbeat_interval_s < 0.0:
+        raise SystemExit("--heartbeat-interval-s must be non-negative")
 
 
-def _error_payload(exc: Exception) -> dict[str, Any]:
+def _error_payload(exc: Exception, *, telemetry: _TelemetrySink) -> dict[str, Any]:
     return {
         "ok": False,
         "error": str(exc),
         "error_type": type(exc).__name__,
+        "elapsed_s": telemetry.elapsed_s(),
     }
 
 
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
+    telemetry = _TelemetrySink(
+        path=args.telemetry_path,
+        echo_to_stderr=args.heartbeat_interval_s > 0.0,
+    )
+    run_metadata = {
+        "budget_race": bool(args.budget_race),
+        "deployment": args.deployment,
+        "model_call_budget": args.model_call_budget,
+        "task_limit": args.task_limit,
+        "train_steps": args.train_steps,
+    }
     try:
         payload = asyncio.run(
-            _run(
-                env_path=args.env_path,
-                deployment=args.deployment,
-                max_train_steps=args.train_steps,
-                task_limit=args.task_limit,
-                model_call_budget=args.model_call_budget,
-                max_completion_tokens=args.max_completion_tokens,
-                request_dollar_seconds=args.request_dollar_seconds,
-                action_unit_dollar_seconds=args.action_unit_dollar_seconds,
-                verify_memory_limit_bytes=args.verify_memory_limit_mib * 1024 * 1024,
-                budget_race=args.budget_race,
-                budget_dollar_seconds=args.budget_dollar_seconds,
+            _run_with_watchdog(
+                lambda: _run(
+                    env_path=args.env_path,
+                    deployment=args.deployment,
+                    max_train_steps=args.train_steps,
+                    task_limit=args.task_limit,
+                    model_call_budget=args.model_call_budget,
+                    max_completion_tokens=args.max_completion_tokens,
+                    request_dollar_seconds=args.request_dollar_seconds,
+                    action_unit_dollar_seconds=args.action_unit_dollar_seconds,
+                    verify_memory_limit_bytes=args.verify_memory_limit_mib
+                    * 1024
+                    * 1024,
+                    budget_race=args.budget_race,
+                    budget_dollar_seconds=args.budget_dollar_seconds,
+                ),
+                telemetry=telemetry,
+                run_timeout_s=args.run_timeout_s,
+                heartbeat_interval_s=args.heartbeat_interval_s,
+                run_metadata=run_metadata,
             )
         )
     except Exception as exc:
         if args.json:
-            print(json.dumps(_error_payload(exc), sort_keys=True))
+            print(json.dumps(_error_payload(exc, telemetry=telemetry), sort_keys=True))
             raise SystemExit(1) from None
         raise SystemExit(str(exc)) from None
     if args.json:

@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import os
 import subprocess
@@ -21,6 +22,19 @@ from calm_puffer_art.foundry_codegen import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_foundry_cli_module():
+    spec = importlib.util.spec_from_file_location(
+        "azure_foundry_codegen_ablation_cli",
+        ROOT / "examples" / "azure_foundry_codegen_ablation.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load Foundry CLI module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -211,6 +225,7 @@ class FoundryCodegenTests(unittest.TestCase):
 
     def test_foundry_cli_json_reports_missing_env_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
+            telemetry_path = Path(directory) / "telemetry.jsonl"
             env = _subprocess_env()
             for name in (
                 "AZURE_OPENAI_API_KEY",
@@ -236,6 +251,8 @@ class FoundryCodegenTests(unittest.TestCase):
                     "0",
                     "--deployment",
                     "dry-run-placeholder",
+                    "--telemetry-path",
+                    str(telemetry_path),
                 ],
                 cwd=ROOT,
                 env=env,
@@ -244,11 +261,59 @@ class FoundryCodegenTests(unittest.TestCase):
                 check=False,
             )
 
-        payload = json.loads(completed.stdout)
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["error"], "azure_foundry_env_missing_required_keys")
-        self.assertNotIn("Traceback", completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(
+                payload["error"],
+                "azure_foundry_env_missing_required_keys",
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+            telemetry = [
+                json.loads(line)
+                for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["event"] for event in telemetry],
+                ["run_started", "run_failed"],
+            )
+            self.assertEqual(
+                telemetry[-1]["error"],
+                "azure_foundry_env_missing_required_keys",
+            )
+
+    def test_foundry_cli_watchdog_times_out_and_records_telemetry(self):
+        module = _load_foundry_cli_module()
+
+        async def slow_run():
+            await asyncio.sleep(1.0)
+            return {"ok": True, "measurement": "slow"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = module._TelemetrySink(
+                path=Path(directory) / "telemetry.jsonl",
+                echo_to_stderr=False,
+            )
+            with self.assertRaises(module.RunTimeoutError):
+                asyncio.run(
+                    module._run_with_watchdog(
+                        slow_run,
+                        telemetry=telemetry,
+                        run_timeout_s=0.01,
+                        heartbeat_interval_s=0.0,
+                        run_metadata={"deployment": "test"},
+                    )
+                )
+            events = [
+                json.loads(line)
+                for line in telemetry.path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["run_started", "run_timeout"],
+        )
+        self.assertEqual(events[-1]["timeout_s"], 0.01)
 
     def test_fake_foundry_ablation_reports_live_contract_shape(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):
