@@ -49,6 +49,7 @@ DEFAULT_FOUNDRY_MODEL_CALL_BUDGET = 4
 DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS = 700
 DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S = 120.0
 DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S = 3.0
+DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS = 2.0
 DEFAULT_FOUNDRY_MEMORY_DOLLAR_SECONDS = 0.05
 DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS = 0.04
@@ -96,6 +97,7 @@ class AzureFoundryCodegenConfig:
     max_completion_tokens: int = DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS
     request_timeout_s: float = DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S
     verify_timeout_s: float = DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S
+    verify_memory_limit_bytes: int = DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES
     request_dollar_seconds: float = DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS
     memory_dollar_seconds: float = DEFAULT_FOUNDRY_MEMORY_DOLLAR_SECONDS
     action_unit_dollar_seconds: float = DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS
@@ -110,6 +112,8 @@ class AzureFoundryCodegenConfig:
             raise ValueError("foundry_model_call_budget_must_be_non_negative")
         if self.max_completion_tokens < 1:
             raise ValueError("foundry_max_completion_tokens_must_be_positive")
+        if self.verify_memory_limit_bytes < 1:
+            raise ValueError("foundry_verify_memory_limit_bytes_must_be_positive")
         for name in (
             "request_timeout_s",
             "verify_timeout_s",
@@ -312,6 +316,7 @@ async def azure_foundry_codegen_rollout(
         task,
         generation.code,
         timeout_s=policy.config.verify_timeout_s,
+        memory_limit_bytes=policy.config.verify_memory_limit_bytes,
     )
     actions = context.action_codec.encode(generation.code)
     for action in actions:
@@ -593,9 +598,11 @@ def verify_python_solution(
     code: str,
     *,
     timeout_s: float = DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
+    memory_limit_bytes: int = DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
 ) -> VerificationResult:
     payload = {
         "code": code,
+        "memory_limit_bytes": memory_limit_bytes,
         "tests": [
             {"args": list(args), "expected": expected}
             for args, expected in task.tests
@@ -617,9 +624,14 @@ def verify_python_solution(
             tests_total=len(task.tests),
         )
     if completed.returncode != 0:
+        failure_mode = (
+            "resource_limit_exceeded"
+            if memory_limit_bytes > 0 and not completed.stderr.strip()
+            else "verifier_crashed"
+        )
         return VerificationResult(
             passed=False,
-            failure_mode="verifier_crashed",
+            failure_mode=failure_mode,
             tests_total=len(task.tests),
         )
     try:
@@ -1157,12 +1169,15 @@ def _finite_ratio(numerator: float, denominator: float) -> float | None:
 
 _VERIFY_SCRIPT = r"""
 import ast
+import ctypes
 import json
+import os
 import sys
 
 payload = json.loads(sys.stdin.read())
 code = payload.get("code", "")
 tests = payload.get("tests", [])
+memory_limit_bytes = int(payload.get("memory_limit_bytes") or 0)
 safe_builtins = {
     "abs": abs,
     "all": all,
@@ -1193,6 +1208,113 @@ def emit(passed, failure_mode, tests_passed=0):
         "tests_passed": tests_passed,
         "tests_total": len(tests),
     }))
+
+def apply_windows_memory_limit(limit_bytes):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JobObjectBasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_object_extended_limit_information = 9
+    job_object_limit_process_memory = 0x100
+    job_object_limit_kill_on_job_close = 0x2000
+
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return False
+    info = JobObjectExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = (
+        job_object_limit_process_memory | job_object_limit_kill_on_job_close
+    )
+    info.ProcessMemoryLimit = limit_bytes
+    if not kernel32.SetInformationJobObject(
+        job,
+        job_object_extended_limit_information,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        kernel32.CloseHandle(job)
+        return False
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        kernel32.CloseHandle(job)
+        return False
+    globals()["_VERIFIER_WINDOWS_JOB_HANDLE"] = job
+    return True
+
+def apply_posix_memory_limit(limit_bytes):
+    try:
+        import resource
+    except ImportError:
+        return False
+    applied = False
+    for limit_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+        limit = getattr(resource, limit_name, None)
+        if limit is None:
+            continue
+        try:
+            soft, hard = resource.getrlimit(limit)
+            capped = (
+                limit_bytes
+                if hard == resource.RLIM_INFINITY
+                else min(limit_bytes, hard)
+            )
+            resource.setrlimit(limit, (capped, hard))
+        except (OSError, ValueError):
+            continue
+        applied = True
+    return applied
+
+def apply_memory_limit(limit_bytes):
+    if limit_bytes <= 0:
+        return True
+    if os.name == "nt":
+        return apply_windows_memory_limit(limit_bytes)
+    return apply_posix_memory_limit(limit_bytes)
+
+if not apply_memory_limit(memory_limit_bytes):
+    emit(False, "resource_limit_unavailable")
+    raise SystemExit(0)
 
 try:
     tree = ast.parse(code)

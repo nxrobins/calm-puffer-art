@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "ART-shaped language-agent RL control plane with Puffer-like rollout production and CALM-like action bandwidth abstractions."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Calm Puffer ART contributors" }]
 dependencies = []
 

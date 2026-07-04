@@ -16,6 +16,7 @@ from calm_puffer_art.foundry_codegen import (
     DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS,
     DEFAULT_FOUNDRY_TASK_LIMIT,
     DEFAULT_FOUNDRY_TRAIN_STEPS,
+    DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
     AzureFoundryCodegenConfig,
     run_azure_foundry_budget_race,
     run_azure_foundry_codegen_ablation,
@@ -32,6 +33,7 @@ async def _run(
     max_completion_tokens: int,
     request_dollar_seconds: float,
     action_unit_dollar_seconds: float,
+    verify_memory_limit_bytes: int,
     budget_race: bool,
     budget_dollar_seconds: float,
 ) -> dict[str, Any]:
@@ -44,6 +46,7 @@ async def _run(
         max_completion_tokens=max_completion_tokens,
         request_dollar_seconds=request_dollar_seconds,
         action_unit_dollar_seconds=action_unit_dollar_seconds,
+        verify_memory_limit_bytes=verify_memory_limit_bytes,
     )
     if budget_race:
         return await run_azure_foundry_budget_race(
@@ -114,6 +117,12 @@ def _parse_args() -> argparse.Namespace:
         help="Cost proxy charged for each emitted action unit.",
     )
     parser.add_argument(
+        "--verify-memory-limit-mib",
+        type=int,
+        default=DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES // (1024 * 1024),
+        help="Per-candidate verifier memory limit in MiB.",
+    )
+    parser.add_argument(
         "--budget-race",
         action="store_true",
         help="Run fixed accounted-dollar budget race instead of train-step ablation.",
@@ -140,27 +149,44 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--request-dollar-seconds must be non-negative")
     if args.action_unit_dollar_seconds < 0.0:
         raise SystemExit("--action-unit-dollar-seconds must be non-negative")
+    if args.verify_memory_limit_mib < 1:
+        raise SystemExit("--verify-memory-limit-mib must be positive")
     if args.budget_dollar_seconds <= 0.0:
         raise SystemExit("--budget-dollar-seconds must be positive")
+
+
+def _error_payload(exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+    }
 
 
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
-    payload = asyncio.run(
-        _run(
-            env_path=args.env_path,
-            deployment=args.deployment,
-            max_train_steps=args.train_steps,
-            task_limit=args.task_limit,
-            model_call_budget=args.model_call_budget,
-            max_completion_tokens=args.max_completion_tokens,
-            request_dollar_seconds=args.request_dollar_seconds,
-            action_unit_dollar_seconds=args.action_unit_dollar_seconds,
-            budget_race=args.budget_race,
-            budget_dollar_seconds=args.budget_dollar_seconds,
+    try:
+        payload = asyncio.run(
+            _run(
+                env_path=args.env_path,
+                deployment=args.deployment,
+                max_train_steps=args.train_steps,
+                task_limit=args.task_limit,
+                model_call_budget=args.model_call_budget,
+                max_completion_tokens=args.max_completion_tokens,
+                request_dollar_seconds=args.request_dollar_seconds,
+                action_unit_dollar_seconds=args.action_unit_dollar_seconds,
+                verify_memory_limit_bytes=args.verify_memory_limit_mib * 1024 * 1024,
+                budget_race=args.budget_race,
+                budget_dollar_seconds=args.budget_dollar_seconds,
+            )
         )
-    )
+    except Exception as exc:
+        if args.json:
+            print(json.dumps(_error_payload(exc), sort_keys=True))
+            raise SystemExit(1) from None
+        raise SystemExit(str(exc)) from None
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
