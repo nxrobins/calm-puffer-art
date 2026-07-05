@@ -1458,11 +1458,13 @@ def _next_hypotheses_payload(
         and shared_failure_pockets.get("tasks")
         and not any(action.get("action") == "promote_candidate" for action in actions)
     ):
+        suggested_lever = _suggested_candidate_lever(shared_failure_pockets)
         actions.append(
             {
                 "action": "design_targeted_candidate",
                 "reason": "eligible_candidates_share_unsolved_heldout_pockets",
                 "candidate_scope": "new_probe_not_promotion_eligible_until_replicated",
+                "suggested_lever": suggested_lever,
                 "target_tasks": shared_failure_pockets.get("tasks", [])[:5],
                 "target_failure_tags": shared_failure_pockets.get(
                     "failure_tags",
@@ -1666,6 +1668,11 @@ def _shared_failure_rows(
             "failed_total": failed_total,
             "observations": observations,
         }
+        top_failure_modes = _combined_top_failure_modes(candidate_rows.values())
+        if top_failure_modes:
+            row["top_failure_modes"] = top_failure_modes
+            row["dominant_failure_mode"] = top_failure_modes[0]["name"]
+            row["failure_mode_class"] = _failure_mode_class(top_failure_modes)
         for metadata_key in ("family", "difficulty", "failure_tags"):
             metadata_value = next(
                 (
@@ -1687,6 +1694,66 @@ def _shared_failure_rows(
         )
     )
     return rows[:limit]
+
+
+def _combined_top_failure_modes(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        top_modes = row.get("top_failure_modes")
+        if not isinstance(top_modes, list):
+            continue
+        for mode in top_modes:
+            if not isinstance(mode, Mapping):
+                continue
+            name = mode.get("name")
+            count = mode.get("count")
+            if not isinstance(name, str) or not isinstance(count, int | float):
+                continue
+            counts[name] = counts.get(name, 0) + int(count)
+    return _top_counts(counts, limit=limit)
+
+
+def _failure_mode_class(top_failure_modes: Sequence[Mapping[str, Any]]) -> str:
+    names = {
+        str(item.get("name", ""))
+        for item in top_failure_modes
+        if isinstance(item, Mapping)
+    }
+    if not names:
+        return "unknown"
+    if names == {"missing_learned_solution"}:
+        return "coverage_gap"
+    if any(name in names for name in ("unit_test_failed", "wrong_answer")):
+        return "repair_quality_gap"
+    if any("timeout" in name for name in names):
+        return "runtime_or_verifier_gap"
+    if any("crash" in name or "syntax" in name for name in names):
+        return "output_contract_gap"
+    return "mixed_gap"
+
+
+def _suggested_candidate_lever(shared_failure_pockets: Mapping[str, Any]) -> str:
+    tasks = shared_failure_pockets.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return "inspect_failure_pockets"
+    classes = {
+        str(task.get("failure_mode_class", "unknown"))
+        for task in tasks[:5]
+        if isinstance(task, Mapping)
+    }
+    if classes == {"coverage_gap"}:
+        return "task_allocation_or_budget_coverage"
+    if "repair_quality_gap" in classes:
+        return "repair_prompt_or_verifier_feedback"
+    if "runtime_or_verifier_gap" in classes:
+        return "timeout_or_verifier_hardening"
+    if "output_contract_gap" in classes:
+        return "output_contract_hardening"
+    return "mixed_failure_mode_probe"
 
 
 def _pocket_delta_rows(

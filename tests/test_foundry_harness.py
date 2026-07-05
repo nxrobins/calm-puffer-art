@@ -767,6 +767,12 @@ class FoundryHarnessTests(unittest.TestCase):
                             "passed": 1,
                             "failed": 2,
                             "pass_rate": 1 / 3,
+                            "top_failure_modes": [
+                                {
+                                    "name": "missing_learned_solution",
+                                    "count": 2,
+                                }
+                            ],
                         }
                     ],
                     "by_family": [
@@ -800,6 +806,12 @@ class FoundryHarnessTests(unittest.TestCase):
                             "passed": 2,
                             "failed": 1,
                             "pass_rate": 2 / 3,
+                            "top_failure_modes": [
+                                {
+                                    "name": "missing_learned_solution",
+                                    "count": 1,
+                                }
+                            ],
                         }
                     ],
                     "by_family": [
@@ -860,8 +872,16 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(actions["treat_as_experimental_probe"]["candidate"], "probe")
         self.assertIn("design_targeted_candidate", actions)
         self.assertEqual(
+            actions["design_targeted_candidate"]["suggested_lever"],
+            "task_allocation_or_budget_coverage",
+        )
+        self.assertEqual(
             payload["shared_failure_pockets"]["tasks"][0]["task_id"],
             "repair_nested_defaults",
+        )
+        self.assertEqual(
+            payload["shared_failure_pockets"]["tasks"][0]["failure_mode_class"],
+            "coverage_gap",
         )
 
     def test_batch_cli_missing_env_writes_replicate_artifacts_and_summary(self):
