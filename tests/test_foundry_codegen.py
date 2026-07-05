@@ -506,6 +506,10 @@ class FoundryCodegenTests(unittest.TestCase):
             task,
             prompt_context_policy="data_model_guardrails",
         )
+        tag_guardrail_prompt = _repair_prompt(
+            task,
+            prompt_context_policy="failure_tag_guardrails",
+        )
         sequence_prompt = _repair_prompt(
             PythonRepairTask(
                 id="repair_rotate_left",
@@ -522,11 +526,16 @@ class FoundryCodegenTests(unittest.TestCase):
 
         self.assertEqual(DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY, "repair_prompt_only")
         self.assertIn("data_model_guardrails", FOUNDRY_PROMPT_CONTEXT_POLICIES)
+        self.assertIn("failure_tag_guardrails", FOUNDRY_PROMPT_CONTEXT_POLICIES)
         self.assertNotIn("Context:", base_prompt)
         self.assertIn("- family: data_model", metadata_prompt)
         self.assertIn("- failure tags: mutation, aliasing", metadata_prompt)
         self.assertIn("deep-copy nested defaults", guardrail_prompt)
         self.assertIn("deterministic input/schema order", guardrail_prompt)
+        self.assertIn("- failure-tag guardrails:", tag_guardrail_prompt)
+        self.assertIn("mutation: do not mutate caller-owned inputs", tag_guardrail_prompt)
+        self.assertIn("aliasing: avoid sharing mutable nested containers", tag_guardrail_prompt)
+        self.assertNotIn("deep-copy nested defaults", tag_guardrail_prompt)
         self.assertNotIn("Context:", sequence_prompt)
 
     def test_fake_foundry_result_records_prompt_context_policy(self):

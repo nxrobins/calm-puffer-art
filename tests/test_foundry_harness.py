@@ -94,6 +94,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(manifest.task_split, "standard")
         self.assertEqual(manifest.prompt_context_policy, "repair_prompt_only")
         self.assertTrue(manifest.budget_race)
+        self.assertTrue(manifest.promotion_eligible)
         self.assertIn("token", manifest.action_codecs)
         args = foundry_harness_child_args(
             manifest,
@@ -159,6 +160,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_baseline = load_foundry_harness_manifest("frontier_baseline")
         frontier_scheduler = load_foundry_harness_manifest("frontier_scheduler_only")
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
+        frontier_tag_guardrails = load_foundry_harness_manifest(
+            "frontier_failure_tag_guardrails"
+        )
         frontier_guardrails = load_foundry_harness_manifest(
             "frontier_data_model_guardrails"
         )
@@ -174,14 +178,23 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_baseline.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.task_split, "frontier_hard")
         self.assertEqual(frontier_full.task_split, "frontier_hard")
+        self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
+        self.assertEqual(frontier_tag_guardrails.primary_condition, "full_trinity")
+        self.assertEqual(frontier_tag_guardrails.conditions, ("full_trinity",))
+        self.assertEqual(
+            frontier_tag_guardrails.prompt_context_policy,
+            "failure_tag_guardrails",
+        )
+        self.assertFalse(frontier_tag_guardrails.promotion_eligible)
         self.assertEqual(frontier_guardrails.primary_condition, "full_trinity")
         self.assertEqual(
             frontier_guardrails.prompt_context_policy,
             "data_model_guardrails",
         )
+        self.assertFalse(frontier_guardrails.promotion_eligible)
         self.assertEqual(baseline.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
         self.assertEqual(full.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
 
@@ -394,6 +407,36 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(readiness["status"], "hold")
         self.assertEqual(decision["status"], "hold")
         self.assertIn("median_score_not_above_baseline", decision["reason"])
+
+    def test_promotion_readiness_excludes_ineligible_probe_candidates(self):
+        summaries = [
+            _summary("baseline", "static_art", 0.3, 10.0),
+            _summary("baseline", "static_art", 0.3, 10.0),
+            _summary("baseline", "static_art", 0.3, 10.0),
+            {
+                **_summary("full_trinity", "full_trinity", 0.2, 12.0),
+                "promotion_eligible": False,
+            },
+        ]
+        comparison = {
+            "candidate_aggregates": aggregate_foundry_harness_summaries(summaries),
+            "candidate_pairwise": pairwise_foundry_harness_summaries(summaries),
+        }
+
+        readiness = foundry_harness_promotion_readiness(comparison)
+
+        self.assertEqual(readiness["status"], "hold")
+        self.assertEqual(readiness["recommended_next_runs"], [])
+        self.assertEqual(readiness["decisions"], [])
+        self.assertEqual(
+            readiness["excluded_candidates"],
+            [
+                {
+                    "candidate": "full_trinity",
+                    "reason": "promotion_eligible_false",
+                }
+            ],
+        )
 
     def test_compare_cli_reads_summary_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:

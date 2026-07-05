@@ -71,6 +71,7 @@ _MANIFEST_KEYS = {
     "name",
     "output_contract",
     "primary_condition",
+    "promotion_eligible",
     "promotion_metric",
     "prompt_context_policy",
     "request_dollar_seconds",
@@ -152,6 +153,7 @@ class FoundryHarnessManifest:
     action_codecs: tuple[str, ...] = ("token", "chunk2", "chunk4")
     conditions: tuple[str, ...] = ("full_trinity",)
     promotion_metric: str = FOUNDRY_HARNESS_OBJECTIVE_METRIC
+    promotion_eligible: bool = True
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "FoundryHarnessManifest":
@@ -268,6 +270,7 @@ class FoundryHarnessManifest:
                 "promotion_metric",
                 FOUNDRY_HARNESS_OBJECTIVE_METRIC,
             ),
+            promotion_eligible=_bool_value(values, "promotion_eligible", True),
         )
         manifest.validate()
         return manifest
@@ -365,6 +368,7 @@ class FoundryHarnessManifest:
             "scheduler_mode": self.scheduler_mode,
             "action_codecs": list(self.action_codecs),
             "conditions": list(self.conditions),
+            "promotion_eligible": self.promotion_eligible,
             "promotion_metric": self.promotion_metric,
         }
 
@@ -483,6 +487,7 @@ def summarize_foundry_harness_result(
         "task_split": manifest.task_split,
         "prompt_context_policy": manifest.prompt_context_policy,
         "promotion_metric": manifest.promotion_metric,
+        "promotion_eligible": manifest.promotion_eligible,
         "objective_metric": FOUNDRY_HARNESS_OBJECTIVE_METRIC,
         "primary_score": primary_score,
         "heldout_score": heldout_score,
@@ -771,10 +776,23 @@ def foundry_harness_promotion_readiness(
         for item in comparison.get("candidate_aggregates", [])
         if isinstance(item, Mapping)
     ]
+    eligible_aggregates = [
+        aggregate
+        for aggregate in aggregates
+        if bool(aggregate.get("promotion_eligible", True))
+    ]
+    excluded_candidates = [
+        {
+            "candidate": aggregate.get("candidate"),
+            "reason": "promotion_eligible_false",
+        }
+        for aggregate in aggregates
+        if not bool(aggregate.get("promotion_eligible", True))
+    ]
     baseline = next(
         (
             aggregate
-            for aggregate in aggregates
+            for aggregate in eligible_aggregates
             if aggregate.get("primary_condition") == baseline_condition
         ),
         None,
@@ -787,7 +805,7 @@ def foundry_harness_promotion_readiness(
             min_successful_runs=min_successful_runs,
             min_pairwise_win_rate=min_pairwise_win_rate,
         )
-        for aggregate in aggregates
+        for aggregate in eligible_aggregates
         if baseline is None or aggregate.get("candidate") != baseline.get("candidate")
     ]
     promotable = [
@@ -829,6 +847,7 @@ def foundry_harness_promotion_readiness(
         "min_successful_runs": min_successful_runs,
         "min_pairwise_win_rate": min_pairwise_win_rate,
         "decisions": decisions,
+        "excluded_candidates": excluded_candidates,
         "recommended_next_runs": recommended_next_runs,
     }
 
@@ -1728,6 +1747,7 @@ def _candidate_aggregate(
         "failed_runs": runs - ok_runs,
         "failure_rate": (runs - ok_runs) / runs if runs else None,
         "primary_condition": first.get("primary_condition"),
+        "promotion_eligible": _summary_promotion_eligible(first),
         "ranking_score_source": _aggregate_score_source(ok_summaries),
         "ranking_score_mean": fmean(score_values) if score_values else None,
         "ranking_score_median": median(score_values) if score_values else None,
@@ -1863,6 +1883,19 @@ def _aggregate_score_source(summaries: Sequence[Mapping[str, Any]]) -> str | Non
     if sources == {"primary"}:
         return "primary"
     return "mixed"
+
+
+def _summary_promotion_eligible(summary: Mapping[str, Any]) -> bool:
+    value = summary.get("promotion_eligible")
+    if isinstance(value, bool):
+        return value
+    candidate = summary.get("candidate")
+    if isinstance(candidate, str) and candidate:
+        try:
+            return load_foundry_harness_manifest(candidate).promotion_eligible
+        except (OSError, ValueError):
+            return True
+    return True
 
 
 def _summary_score(summary: Mapping[str, Any]) -> float | None:

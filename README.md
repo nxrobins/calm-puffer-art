@@ -267,20 +267,23 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
 - `frontier_scheduler_only.json`: objective scheduler with token-only actions on the frontier hard ladder
 - `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
+- `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
 - `frontier_data_model_guardrails.json`: experimental full-trinity prompt-policy probe for data-model failures
 
 Each manifest selects the condition(s) to execute through `conditions`, the
 condition used for ranking through `primary_condition`, and the workload through
-`task_split`. Supported splits are `standard`, `standard_heldout`, `hard`,
-`hard_heldout`, `mixed_heldout`, `frontier_smoke`, `frontier_balanced`,
-`frontier_hard`, and `frontier_full`. Held-out splits reuse task IDs with
-stricter edge-case tests, so the harness can re-verify learned repairs without
-another model request.
+`task_split`. Experimental probes can set `promotion_eligible` to `false`, so
+they remain visible in comparisons and diagnostics without causing
+`promotion_readiness` to request more runs or recommend promotion. Supported
+splits are `standard`, `standard_heldout`, `hard`, `hard_heldout`,
+`mixed_heldout`, `frontier_smoke`, `frontier_balanced`, `frontier_hard`, and
+`frontier_full`. Held-out splits reuse task IDs with stricter edge-case tests,
+so the harness can re-verify learned repairs without another model request.
 
 `prompt_context_policy` is an explicit candidate knob. `repair_prompt_only`
 preserves the base prompt, `task_metadata` adds task family/difficulty/tags,
-and `data_model_guardrails` adds a selective checklist only for data-model
-tasks.
+`failure_tag_guardrails` adds concise checklists keyed by failure tags, and
+`data_model_guardrails` adds a selective checklist only for data-model tasks.
 
 The frontier ladder is a self-contained 40-task corpus spanning sequence,
 string parsing, intervals, state machines, graphs, data models, numeric logic,
@@ -339,10 +342,10 @@ Run the frontier hard ladder:
 python examples\foundry_harness_batch.py --candidates frontier_baseline frontier_scheduler_only frontier_full_trinity --replicates 3 --json
 ```
 
-Run the data-model prompt-policy probe separately before considering it for
-promotion:
+Run prompt-policy probes separately before considering them for promotion:
 
 ```powershell
+python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
 ```
 

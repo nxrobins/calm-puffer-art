@@ -60,6 +60,7 @@ FOUNDRY_PROMPT_CONTEXT_POLICIES = (
     "repair_prompt_only",
     "task_metadata",
     "data_model_guardrails",
+    "failure_tag_guardrails",
 )
 FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
 FOUNDRY_TASK_FAMILIES = (
@@ -73,6 +74,26 @@ FOUNDRY_TASK_FAMILIES = (
     "real_bug_pattern",
     "general",
 )
+FOUNDRY_FAILURE_TAG_GUARDRAILS = {
+    "aliasing": "avoid sharing mutable nested containers between inputs and outputs",
+    "boundary": "check empty, first, last, inclusive, and exclusive boundary cases",
+    "dedupe": "preserve the required representative and order when removing duplicates",
+    "dependency_cycle": "separate acyclic traversal from cycle detection and reporting",
+    "edge_empty": "handle empty inputs before indexing, popping, or taking extrema",
+    "modulo": "normalize rotations and wraparound with modulo after empty checks",
+    "mutation": "do not mutate caller-owned inputs unless the task explicitly requires it",
+    "none_sentinel": "distinguish missing values, None, and other falsy values",
+    "off_by_one": "check loop ranges, page boundaries, and inclusive/exclusive endpoints",
+    "ordering": "preserve deterministic input order unless the task requires sorting",
+    "parser_escape": "parse quoted or escaped separators before splitting on delimiters",
+    "parser_nesting": "track nesting depth before treating delimiters as structural",
+    "rounding": "round only at the required final precision boundary",
+    "stable_sort": "preserve original tie order when sort keys compare equal",
+    "state_eviction": "update recency or eviction state on every read and write transition",
+    "state_transition": "make each state transition explicit before updating stored state",
+    "truthiness": "test for None or missing values explicitly instead of generic truthiness",
+    "unicode": "normalize text boundaries without dropping non-ASCII semantic content",
+}
 
 
 @dataclass(frozen=True)
@@ -1616,6 +1637,12 @@ def _repair_prompt_context(
         lines.append("- failure tags: " + ", ".join(task.failure_tags))
     if prompt_context_policy == "task_metadata":
         return "\n".join(lines)
+    if prompt_context_policy == "failure_tag_guardrails":
+        guardrails = _failure_tag_guardrail_lines(task.failure_tags)
+        if guardrails:
+            lines.append("- failure-tag guardrails:")
+            lines.extend(guardrails)
+        return "\n".join(lines)
     if prompt_context_policy == "data_model_guardrails":
         if task.family != "data_model":
             return ""
@@ -1629,6 +1656,14 @@ def _repair_prompt_context(
         )
         return "\n".join(lines)
     raise ValueError("foundry_prompt_context_policy_unknown")
+
+
+def _failure_tag_guardrail_lines(failure_tags: Sequence[str]) -> list[str]:
+    return [
+        f"  - {tag}: {FOUNDRY_FAILURE_TAG_GUARDRAILS[tag]}"
+        for tag in failure_tags
+        if tag in FOUNDRY_FAILURE_TAG_GUARDRAILS
+    ]
 
 
 def _fallback_solution(task: PythonRepairTask) -> str:
