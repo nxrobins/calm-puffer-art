@@ -696,6 +696,7 @@ def analyze_foundry_harness_runs(
             for diagnostic in run_diagnostics
             if baseline is not None and diagnostic is not baseline
         ],
+        "promotion_readiness": foundry_harness_promotion_readiness(comparison),
     }
 
 
@@ -753,6 +754,189 @@ def pairwise_foundry_harness_summaries(
         )
     )
     return comparisons
+
+
+def foundry_harness_promotion_readiness(
+    comparison: Mapping[str, Any],
+    *,
+    baseline_condition: str = "static_art",
+    min_successful_runs: int = 3,
+    min_pairwise_win_rate: float = 0.6,
+) -> dict[str, Any]:
+    aggregates = [
+        dict(item)
+        for item in comparison.get("candidate_aggregates", [])
+        if isinstance(item, Mapping)
+    ]
+    baseline = next(
+        (
+            aggregate
+            for aggregate in aggregates
+            if aggregate.get("primary_condition") == baseline_condition
+        ),
+        None,
+    )
+    decisions = [
+        _promotion_decision(
+            candidate=aggregate,
+            baseline=baseline,
+            pairwise=comparison.get("candidate_pairwise", []),
+            min_successful_runs=min_successful_runs,
+            min_pairwise_win_rate=min_pairwise_win_rate,
+        )
+        for aggregate in aggregates
+        if baseline is None or aggregate.get("candidate") != baseline.get("candidate")
+    ]
+    promotable = [
+        decision
+        for decision in decisions
+        if decision.get("status") == "promote"
+    ]
+    recommended_next_runs = [
+        {
+            "candidate": decision.get("candidate"),
+            "additional_successful_runs": decision.get("additional_successful_runs"),
+        }
+        for decision in decisions
+        if (decision.get("additional_successful_runs") or 0) > 0
+    ]
+    if baseline is not None:
+        baseline_runs = int(baseline.get("ok_runs", 0) or 0)
+        baseline_needs_runs = max(0, min_successful_runs - baseline_runs)
+        if baseline_needs_runs:
+            recommended_next_runs.insert(
+                0,
+                {
+                    "candidate": baseline.get("candidate"),
+                    "additional_successful_runs": baseline_needs_runs,
+                },
+            )
+    status = "hold"
+    if baseline is None:
+        status = "needs_baseline"
+    elif recommended_next_runs:
+        status = "needs_more_evidence"
+    elif promotable:
+        status = "promote"
+    return {
+        "ok": baseline is not None,
+        "status": status,
+        "baseline_candidate": baseline.get("candidate") if baseline else None,
+        "baseline_condition": baseline_condition,
+        "min_successful_runs": min_successful_runs,
+        "min_pairwise_win_rate": min_pairwise_win_rate,
+        "decisions": decisions,
+        "recommended_next_runs": recommended_next_runs,
+    }
+
+
+def _promotion_decision(
+    *,
+    candidate: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    pairwise: Any,
+    min_successful_runs: int,
+    min_pairwise_win_rate: float,
+) -> dict[str, Any]:
+    candidate_name = str(candidate.get("candidate", ""))
+    candidate_runs = int(candidate.get("ok_runs", 0) or 0)
+    candidate_score = _optional_float(candidate.get("ranking_score_median"))
+    candidate_failure_rate = _optional_float(candidate.get("failure_rate"))
+    if candidate_failure_rate is None:
+        candidate_failure_rate = 1.0
+    if baseline is None:
+        return {
+            "candidate": candidate_name,
+            "status": "needs_baseline",
+            "reason": "no_static_baseline_candidate",
+            "candidate_ok_runs": candidate_runs,
+            "additional_successful_runs": max(0, min_successful_runs - candidate_runs),
+        }
+
+    baseline_name = str(baseline.get("candidate", ""))
+    baseline_runs = int(baseline.get("ok_runs", 0) or 0)
+    baseline_score = _optional_float(baseline.get("ranking_score_median"))
+    baseline_failure_rate = _optional_float(baseline.get("failure_rate"))
+    if baseline_failure_rate is None:
+        baseline_failure_rate = 1.0
+    pair = _pairwise_between(pairwise, candidate_name, baseline_name)
+    pairwise_win_rate = _candidate_win_rate_from_pairwise(pair, candidate_name)
+    pairwise_leader = pair.get("leader_candidate") if pair else None
+    median_delta = _optional_delta(candidate_score, baseline_score)
+    candidate_needs_runs = max(0, min_successful_runs - candidate_runs)
+    baseline_needs_runs = max(0, min_successful_runs - baseline_runs)
+    reasons: list[str] = []
+    if candidate_needs_runs:
+        reasons.append("candidate_needs_more_successful_runs")
+    if baseline_needs_runs:
+        reasons.append("baseline_needs_more_successful_runs")
+    if candidate_failure_rate > baseline_failure_rate:
+        reasons.append("candidate_failure_rate_exceeds_baseline")
+    if median_delta is None or median_delta <= 0.0:
+        reasons.append("median_score_not_above_baseline")
+    if pairwise_win_rate is None:
+        reasons.append("missing_pairwise_evidence")
+    elif pairwise_win_rate < min_pairwise_win_rate:
+        reasons.append("pairwise_win_rate_below_threshold")
+    if pairwise_leader not in (candidate_name, None) and pairwise_win_rate is not None:
+        reasons.append("pairwise_leader_is_not_candidate")
+
+    if candidate_needs_runs or baseline_needs_runs:
+        status = "needs_more_evidence"
+    elif reasons:
+        status = "hold"
+    else:
+        status = "promote"
+        reasons.append("candidate_beats_baseline_gate")
+
+    return {
+        "candidate": candidate_name,
+        "baseline": baseline_name,
+        "status": status,
+        "reason": ";".join(reasons),
+        "candidate_ok_runs": candidate_runs,
+        "baseline_ok_runs": baseline_runs,
+        "additional_successful_runs": candidate_needs_runs,
+        "baseline_additional_successful_runs": baseline_needs_runs,
+        "candidate_median_score": candidate_score,
+        "baseline_median_score": baseline_score,
+        "median_score_delta_vs_baseline": median_delta,
+        "candidate_failure_rate": candidate_failure_rate,
+        "baseline_failure_rate": baseline_failure_rate,
+        "pairwise_win_rate_vs_baseline": pairwise_win_rate,
+        "pairwise_leader": pairwise_leader,
+        "pairwise_pair_count": pair.get("pair_count") if pair else 0,
+    }
+
+
+def _pairwise_between(
+    pairwise: Any,
+    left_candidate: str,
+    right_candidate: str,
+) -> dict[str, Any]:
+    if not isinstance(pairwise, list | tuple):
+        return {}
+    for item in pairwise:
+        if not isinstance(item, Mapping):
+            continue
+        left = str(item.get("left_candidate", ""))
+        right = str(item.get("right_candidate", ""))
+        if {left, right} == {left_candidate, right_candidate}:
+            return dict(item)
+    return {}
+
+
+def _candidate_win_rate_from_pairwise(
+    pair: Mapping[str, Any],
+    candidate: str,
+) -> float | None:
+    if not pair:
+        return None
+    if pair.get("left_candidate") == candidate:
+        return _optional_float(pair.get("left_win_rate"))
+    if pair.get("right_candidate") == candidate:
+        return _optional_float(pair.get("right_win_rate"))
+    return None
 
 
 def _string_value(

@@ -21,6 +21,7 @@ from calm_puffer_art.foundry_harness import (
     compare_foundry_harness_runs,
     extract_foundry_harness_failures,
     foundry_harness_child_args,
+    foundry_harness_promotion_readiness,
     load_foundry_harness_manifest,
     pairwise_foundry_harness_summaries,
     rank_foundry_harness_summaries,
@@ -334,6 +335,65 @@ class FoundryHarnessTests(unittest.TestCase):
             ],
             -2.5,
         )
+
+    def test_promotion_readiness_promotes_only_replicated_candidate_wins(self):
+        summaries = [
+            _summary("baseline", "static_art", 0.1, 10.0),
+            _summary("baseline", "static_art", 0.1, 10.5),
+            _summary("baseline", "static_art", 0.1, 11.0),
+            _summary("full_trinity", "full_trinity", 0.2, 12.0),
+            _summary("full_trinity", "full_trinity", 0.25, 12.5),
+            _summary("full_trinity", "full_trinity", 0.3, 13.0),
+        ]
+        comparison = {
+            "candidate_aggregates": aggregate_foundry_harness_summaries(summaries),
+            "candidate_pairwise": pairwise_foundry_harness_summaries(summaries),
+        }
+
+        readiness = foundry_harness_promotion_readiness(comparison)
+
+        self.assertEqual(readiness["status"], "promote")
+        self.assertEqual(readiness["baseline_candidate"], "baseline")
+        decision = readiness["decisions"][0]
+        self.assertEqual(decision["candidate"], "full_trinity")
+        self.assertEqual(decision["status"], "promote")
+        self.assertEqual(decision["pairwise_win_rate_vs_baseline"], 1.0)
+        self.assertGreater(decision["median_score_delta_vs_baseline"], 0.0)
+
+    def test_promotion_readiness_requires_replicates_and_holds_losing_candidates(self):
+        summaries = [
+            _summary("baseline", "static_art", 0.3, 10.0),
+            _summary("baseline", "static_art", 0.2, 10.5),
+            _summary("full_trinity", "full_trinity", 0.25, 12.0),
+            _summary("full_trinity", "full_trinity", 0.1, 12.5),
+        ]
+        comparison = {
+            "candidate_aggregates": aggregate_foundry_harness_summaries(summaries),
+            "candidate_pairwise": pairwise_foundry_harness_summaries(summaries),
+        }
+
+        readiness = foundry_harness_promotion_readiness(comparison)
+        self.assertEqual(readiness["status"], "needs_more_evidence")
+        self.assertEqual(
+            readiness["recommended_next_runs"][0],
+            {
+                "candidate": "baseline",
+                "additional_successful_runs": 1,
+            },
+        )
+        decision = readiness["decisions"][0]
+        self.assertEqual(decision["status"], "needs_more_evidence")
+        self.assertEqual(decision["additional_successful_runs"], 1)
+        self.assertEqual(decision["baseline_additional_successful_runs"], 1)
+
+        readiness = foundry_harness_promotion_readiness(
+            comparison,
+            min_successful_runs=1,
+        )
+        decision = readiness["decisions"][0]
+        self.assertEqual(readiness["status"], "hold")
+        self.assertEqual(decision["status"], "hold")
+        self.assertIn("median_score_not_above_baseline", decision["reason"])
 
     def test_compare_cli_reads_summary_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
