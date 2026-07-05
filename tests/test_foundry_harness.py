@@ -564,9 +564,6 @@ class FoundryHarnessTests(unittest.TestCase):
                     },
                     {
                         "task_id": "repair_schema_errors",
-                        "family": "data_model",
-                        "difficulty": "4",
-                        "failure_tags": ["parser_escape"],
                         "passed": False,
                         "failure_mode": "unit_test_failed",
                     },
@@ -592,7 +589,6 @@ class FoundryHarnessTests(unittest.TestCase):
                         "task_id": "repair_schema_errors",
                         "family": "data_model",
                         "difficulty": "4",
-                        "failure_tags": ["parser_escape"],
                         "passed": True,
                         "failure_mode": "passed",
                     }
@@ -645,6 +641,10 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(
             full_delta["tasks_better_than_baseline"][0]["task_id"],
             "repair_schema_errors",
+        )
+        self.assertEqual(
+            full_delta["tasks_better_than_baseline"][0]["failure_tags"],
+            ["none_sentinel", "ordering"],
         )
         self.assertAlmostEqual(
             full_delta["tasks_better_than_baseline"][0]["pass_rate_delta"],

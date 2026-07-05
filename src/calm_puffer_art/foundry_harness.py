@@ -25,6 +25,7 @@ from .foundry_codegen import (
     DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
     DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
     FOUNDRY_PROMPT_CONTEXT_POLICIES,
+    foundry_task_metadata_index,
 )
 
 
@@ -969,6 +970,10 @@ def _foundry_run_diagnostics(
         _mapping_child(result.get("non_saturation"), "conditions"),
         primary_condition,
     )
+    task_results = _heldout_task_results(
+        heldout.get("heldout/task_results"),
+        metadata_index=foundry_task_metadata_index(),
+    )
     return {
         "candidate": summary.get("candidate"),
         "ok": bool(summary.get("ok")),
@@ -1001,12 +1006,8 @@ def _foundry_run_diagnostics(
         "heldout_by_family": heldout.get("heldout/by_family", {}),
         "heldout_by_difficulty": heldout.get("heldout/by_difficulty", {}),
         "heldout_by_failure_tag": heldout.get("heldout/by_failure_tag", {}),
-        "heldout_task_results": _heldout_task_results(
-            heldout.get("heldout/task_results")
-        ),
-        "heldout_task_failures": _heldout_task_failures(
-            heldout.get("heldout/task_results")
-        ),
+        "heldout_task_results": task_results,
+        "heldout_task_failures": _heldout_task_failures(task_results),
         "weakest_families": _weakest_breakdowns(heldout.get("heldout/by_family")),
         "weakest_difficulties": _weakest_breakdowns(
             heldout.get("heldout/by_difficulty")
@@ -1033,26 +1034,46 @@ def _mapping_child(value: Any, key: str) -> dict[str, Any]:
 
 
 def _heldout_task_failures(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
     return [
         item
-        for item in _heldout_task_results(value)
+        for item in value
+        if isinstance(item, Mapping)
         if item.get("passed") is not True
     ]
 
 
-def _heldout_task_results(value: Any) -> list[dict[str, Any]]:
+def _heldout_task_results(
+    value: Any,
+    *,
+    metadata_index: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     results: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, Mapping):
             continue
+        task_id = item.get("task_id")
+        metadata = (
+            metadata_index.get(str(task_id), {})
+            if task_id is not None and metadata_index is not None
+            else {}
+        )
+        family = item.get("family") or metadata.get("family")
+        difficulty = item.get("difficulty") or metadata.get("difficulty")
+        failure_tags = _string_list(item.get("failure_tags")) or _string_list(
+            metadata.get("failure_tags")
+        )
         results.append(
             {
-                "task_id": item.get("task_id"),
-                "family": item.get("family"),
-                "difficulty": item.get("difficulty"),
-                "failure_tags": _string_list(item.get("failure_tags")),
+                "task_id": task_id,
+                "family": str(family) if family is not None else None,
+                "difficulty": (
+                    str(difficulty) if difficulty is not None else None
+                ),
+                "failure_tags": failure_tags,
                 "passed": item.get("passed") is True,
                 "failure_mode": item.get("failure_mode"),
                 "tests_passed": _optional_float(item.get("tests_passed")),

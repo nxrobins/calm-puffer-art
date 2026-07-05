@@ -3704,6 +3704,18 @@ def available_foundry_corpora() -> tuple[str, ...]:
     return tuple(sorted(_FOUNDRY_CORPUS_REGISTRY))
 
 
+def foundry_task_metadata_index() -> dict[str, dict[str, Any]]:
+    return {
+        task_id: {
+            "task_id": task.id,
+            "family": task.family,
+            "difficulty": str(task.difficulty),
+            "failure_tags": list(task.failure_tags),
+        }
+        for task_id, task in _ALL_FOUNDRY_TASKS_BY_ID.items()
+    }
+
+
 def _validate_foundry_registries() -> bool:
     for name, (train_tasks, heldout_tasks) in _FOUNDRY_TASK_SPLITS.items():
         _validate_foundry_task_bank(
