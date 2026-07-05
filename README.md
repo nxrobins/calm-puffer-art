@@ -265,6 +265,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `hard_baseline.json`: static token-level budget reference on harder repair tasks
 - `hard_full_trinity.json`: full-trinity profile on harder repair tasks
 - `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
+- `frontier_scheduler_only.json`: objective scheduler with token-only actions on the frontier hard ladder
 - `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
 
 Each manifest selects the condition(s) to execute through `conditions`, the
@@ -322,7 +323,7 @@ python examples\foundry_harness_batch.py --candidates hard_baseline hard_full_tr
 Run the frontier hard ladder:
 
 ```powershell
-python examples\foundry_harness_batch.py --candidates frontier_baseline frontier_full_trinity --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_baseline frontier_scheduler_only frontier_full_trinity --replicates 3 --json
 ```
 
 For local credentials or deployment names that should not be checked into a

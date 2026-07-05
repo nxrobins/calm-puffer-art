@@ -144,6 +144,7 @@ class FoundryHarnessTests(unittest.TestCase):
         hard_baseline = load_foundry_harness_manifest("hard_baseline")
         hard_full = load_foundry_harness_manifest("hard_full_trinity")
         frontier_baseline = load_foundry_harness_manifest("frontier_baseline")
+        frontier_scheduler = load_foundry_harness_manifest("frontier_scheduler_only")
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
 
         self.assertEqual(baseline.primary_condition, "static_art")
@@ -155,7 +156,10 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(hard_baseline.task_split, "hard_heldout")
         self.assertEqual(hard_full.task_split, "hard_heldout")
         self.assertEqual(frontier_baseline.task_split, "frontier_hard")
+        self.assertEqual(frontier_scheduler.task_split, "frontier_hard")
         self.assertEqual(frontier_full.task_split, "frontier_hard")
+        self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
+        self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
         self.assertEqual(baseline.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
         self.assertEqual(full.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
 
