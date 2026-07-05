@@ -638,6 +638,7 @@ def compare_foundry_harness_runs(
     )
     ranked = rank_foundry_harness_summaries(summaries)
     aggregates = aggregate_foundry_harness_summaries(summaries)
+    pairwise = pairwise_foundry_harness_summaries(summaries)
     ok_runs = sum(1 for summary in ranked if bool(summary.get("ok")))
     return {
         "ok": bool(ranked),
@@ -650,6 +651,7 @@ def compare_foundry_harness_runs(
         "objective_metric": FOUNDRY_HARNESS_OBJECTIVE_METRIC,
         "ranking": ranked,
         "candidate_aggregates": aggregates,
+        "candidate_pairwise": pairwise,
     }
 
 
@@ -708,6 +710,42 @@ def aggregate_foundry_harness_summaries(
     for index, aggregate in enumerate(aggregates, start=1):
         aggregate["rank"] = index
     return aggregates
+
+
+def pairwise_foundry_harness_summaries(
+    summaries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    by_candidate: dict[str, list[Mapping[str, Any]]] = {}
+    for summary in summaries:
+        if not bool(summary.get("ok")):
+            continue
+        if _summary_score(summary) is None:
+            continue
+        candidate = str(summary.get("candidate", ""))
+        if not candidate:
+            continue
+        by_candidate.setdefault(candidate, []).append(summary)
+
+    candidates = sorted(by_candidate)
+    comparisons: list[dict[str, Any]] = []
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1 :]:
+            comparisons.append(
+                _candidate_pairwise_comparison(
+                    left,
+                    by_candidate[left],
+                    right,
+                    by_candidate[right],
+                )
+            )
+    comparisons.sort(
+        key=lambda item: (
+            -float(item.get("left_win_rate") or 0.0),
+            str(item.get("left_candidate", "")),
+            str(item.get("right_candidate", "")),
+        )
+    )
+    return comparisons
 
 
 def _string_value(
@@ -1089,6 +1127,94 @@ def _candidate_aggregate(
             else None
         ),
     }
+
+
+def _candidate_pairwise_comparison(
+    left: str,
+    left_summaries: Sequence[Mapping[str, Any]],
+    right: str,
+    right_summaries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    score_deltas: list[float] = []
+    spend_deltas: list[float] = []
+    left_wins = 0
+    right_wins = 0
+    ties = 0
+
+    for left_summary in left_summaries:
+        left_score = _summary_score(left_summary)
+        if left_score is None:
+            continue
+        left_spend = _optional_float(
+            left_summary.get("primary_accounted_dollar_seconds")
+        )
+        for right_summary in right_summaries:
+            right_score = _summary_score(right_summary)
+            if right_score is None:
+                continue
+            right_spend = _optional_float(
+                right_summary.get("primary_accounted_dollar_seconds")
+            )
+            score_delta = left_score - right_score
+            score_deltas.append(score_delta)
+            if left_spend is not None and right_spend is not None:
+                spend_deltas.append(left_spend - right_spend)
+            if math.isclose(score_delta, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                ties += 1
+            elif score_delta > 0.0:
+                left_wins += 1
+            else:
+                right_wins += 1
+
+    pair_count = len(score_deltas)
+    mean_score_delta = fmean(score_deltas) if score_deltas else None
+    leader = _pairwise_leader(
+        left,
+        right,
+        left_wins=left_wins,
+        right_wins=right_wins,
+        mean_score_delta=mean_score_delta,
+    )
+    return {
+        "left_candidate": left,
+        "right_candidate": right,
+        "left_runs": len(left_summaries),
+        "right_runs": len(right_summaries),
+        "pair_count": pair_count,
+        "left_wins": left_wins,
+        "right_wins": right_wins,
+        "ties": ties,
+        "left_win_rate": left_wins / pair_count if pair_count else None,
+        "right_win_rate": right_wins / pair_count if pair_count else None,
+        "tie_rate": ties / pair_count if pair_count else None,
+        "mean_score_delta_left_minus_right": mean_score_delta,
+        "mean_accounted_dollar_seconds_delta_left_minus_right": (
+            fmean(spend_deltas) if spend_deltas else None
+        ),
+        "leader_candidate": leader,
+        "leader_win_rate": (
+            max(left_wins, right_wins) / pair_count if pair_count else None
+        ),
+    }
+
+
+def _pairwise_leader(
+    left: str,
+    right: str,
+    *,
+    left_wins: int,
+    right_wins: int,
+    mean_score_delta: float | None,
+) -> str | None:
+    if left_wins > right_wins:
+        return left
+    if right_wins > left_wins:
+        return right
+    if mean_score_delta is None:
+        return None
+    if math.isclose(mean_score_delta, 0.0, rel_tol=0.0, abs_tol=1e-12):
+        return "tie"
+    return left if mean_score_delta > 0.0 else right
 
 
 def _aggregate_rank_key(aggregate: Mapping[str, Any]) -> tuple[int, float, float, str]:

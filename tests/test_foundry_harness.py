@@ -22,6 +22,7 @@ from calm_puffer_art.foundry_harness import (
     extract_foundry_harness_failures,
     foundry_harness_child_args,
     load_foundry_harness_manifest,
+    pairwise_foundry_harness_summaries,
     rank_foundry_harness_summaries,
     summarize_foundry_harness_result,
 )
@@ -273,6 +274,47 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(aggregates[1]["failed_runs"], 1)
         self.assertAlmostEqual(aggregates[1]["failure_rate"], 0.5)
 
+    def test_pairwise_comparison_reports_win_rates_and_deltas(self):
+        summaries = [
+            _summary("baseline", "static_art", 0.1, 10.0),
+            _summary("baseline", "static_art", 0.4, 12.0),
+            _summary("full_trinity", "full_trinity", 0.2, 13.0),
+            _summary("full_trinity", "full_trinity", 0.5, 14.0),
+            _summary("scheduler", "scheduler_only", 0.3, 9.0),
+            {
+                **_summary("scheduler", "scheduler_only", 0.9, 9.0),
+                "ok": False,
+            },
+        ]
+
+        pairwise = pairwise_foundry_harness_summaries(summaries)
+        payload = {
+            (item["left_candidate"], item["right_candidate"]): item
+            for item in pairwise
+        }
+
+        full_vs_scheduler = payload[("full_trinity", "scheduler")]
+        self.assertEqual(full_vs_scheduler["pair_count"], 2)
+        self.assertEqual(full_vs_scheduler["left_wins"], 1)
+        self.assertEqual(full_vs_scheduler["right_wins"], 1)
+        self.assertEqual(full_vs_scheduler["leader_candidate"], "full_trinity")
+        self.assertAlmostEqual(
+            full_vs_scheduler["mean_score_delta_left_minus_right"],
+            0.05,
+        )
+
+        baseline_vs_full = payload[("baseline", "full_trinity")]
+        self.assertEqual(baseline_vs_full["pair_count"], 4)
+        self.assertEqual(baseline_vs_full["left_wins"], 1)
+        self.assertEqual(baseline_vs_full["right_wins"], 3)
+        self.assertAlmostEqual(baseline_vs_full["right_win_rate"], 0.75)
+        self.assertAlmostEqual(
+            baseline_vs_full[
+                "mean_accounted_dollar_seconds_delta_left_minus_right"
+            ],
+            -2.5,
+        )
+
     def test_compare_cli_reads_summary_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             runs_dir = Path(directory) / "runs"
@@ -291,6 +333,10 @@ class FoundryHarnessTests(unittest.TestCase):
             self.assertEqual(payload["ranking"][0]["candidate"], "full_trinity")
             self.assertEqual(
                 payload["candidate_aggregates"][0]["candidate"],
+                "full_trinity",
+            )
+            self.assertEqual(
+                payload["candidate_pairwise"][0]["leader_candidate"],
                 "full_trinity",
             )
             prefixed = compare_foundry_harness_runs(
@@ -320,6 +366,7 @@ class FoundryHarnessTests(unittest.TestCase):
             self.assertEqual(cli_payload["ranking"][0]["candidate"], "full_trinity")
             self.assertEqual(cli_payload["runs"], 1)
             self.assertIn("candidate_aggregates", cli_payload)
+            self.assertIn("candidate_pairwise", cli_payload)
 
     def test_analyze_reads_run_artifacts_and_reports_diagnostics(self):
         metric = FOUNDRY_HARNESS_OBJECTIVE_METRIC

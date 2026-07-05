@@ -347,7 +347,9 @@ Each run directory contains:
 The comparison payload also includes `candidate_aggregates`, which groups run
 summaries by candidate and reports successful runs, failure rate, mean/median
 ranking score, best score, worst score, mean accounted spend, and the best
-artifact directory.
+artifact directory. For repeated batches, `candidate_pairwise` reports all
+successful candidate pairs with win/tie/loss counts, win rates, mean score
+delta, and mean accounted-spend delta.
 
 The fixed-budget profile is the sharper test when asking whether a candidate
 wins on both performance and cost. It stops each selected condition on the same

@@ -87,6 +87,25 @@ def _print_table(payload: Mapping[str, Any]) -> None:
             f"{_score_text(item.get('ranking_score_best')):<10}  "
             f"{_score_text(item.get('primary_accounted_dollar_seconds_mean')):<10}"
         )
+    pairwise = payload.get("candidate_pairwise", [])
+    if not pairwise:
+        return
+    print()
+    print("candidate pairwise")
+    print("left           right          pairs  L/R/T       leader         mean_delta")
+    print("-------------  -------------  -----  ----------  -------------  ----------")
+    for item in pairwise:
+        record = dict(item)
+        print(
+            f"{str(record.get('left_candidate', ''))[:13]:<13}  "
+            f"{str(record.get('right_candidate', ''))[:13]:<13}  "
+            f"{record.get('pair_count', 0):<5}  "
+            f"{record.get('left_wins', 0)}/"
+            f"{record.get('right_wins', 0)}/"
+            f"{record.get('ties', 0):<6}  "
+            f"{str(record.get('leader_candidate', ''))[:13]:<13}  "
+            f"{_score_text(record.get('mean_score_delta_left_minus_right')):<10}"
+        )
 
 
 def _score_text(value: Any) -> str:
