@@ -23,6 +23,7 @@ from calm_puffer_art.foundry_harness import (
     foundry_harness_child_args,
     foundry_harness_promotion_readiness,
     load_foundry_harness_manifest,
+    _next_hypotheses_payload,
     pairwise_foundry_harness_summaries,
     rank_foundry_harness_summaries,
     summarize_foundry_harness_result,
@@ -692,6 +693,164 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertAlmostEqual(
             full_delta["tasks_better_than_baseline"][0]["pass_rate_delta"],
             1.0,
+        )
+        next_hypotheses = payload["next_hypotheses"]
+        self.assertEqual(next_hypotheses["status"], "needs_more_evidence")
+        self.assertEqual(
+            next_hypotheses["actions"][0]["action"],
+            "run_additional_replicates",
+        )
+
+    def test_next_hypotheses_reports_unstable_lift_and_shared_pockets(self):
+        comparison = {
+            "candidate_aggregates": [
+                {
+                    "candidate": "baseline",
+                    "primary_condition": "static_art",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.2,
+                },
+                {
+                    "candidate": "full",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.25,
+                },
+                {
+                    "candidate": "probe",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": False,
+                    "ok_runs": 1,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.1,
+                },
+            ],
+            "candidate_pairwise": [
+                {
+                    "left_candidate": "baseline",
+                    "right_candidate": "full",
+                    "pair_count": 9,
+                    "left_win_rate": 0.5555555555555556,
+                    "right_win_rate": 0.4444444444444444,
+                    "leader_candidate": "baseline",
+                }
+            ],
+        }
+        readiness = foundry_harness_promotion_readiness(comparison)
+        failure_pockets = {
+            "baseline_candidate": "baseline",
+            "by_candidate": [
+                {
+                    "candidate": "baseline",
+                    "by_task": [
+                        {
+                            "task_id": "repair_nested_defaults",
+                            "family": "data_model",
+                            "difficulty": "4",
+                            "failure_tags": ["mutation", "none_sentinel"],
+                            "observations": 3,
+                            "passed": 1,
+                            "failed": 2,
+                            "pass_rate": 1 / 3,
+                        }
+                    ],
+                    "by_family": [
+                        {
+                            "name": "data_model",
+                            "observations": 3,
+                            "passed": 1,
+                            "failed": 2,
+                            "pass_rate": 1 / 3,
+                        }
+                    ],
+                    "by_failure_tag": [
+                        {
+                            "name": "none_sentinel",
+                            "observations": 3,
+                            "passed": 1,
+                            "failed": 2,
+                            "pass_rate": 1 / 3,
+                        }
+                    ],
+                },
+                {
+                    "candidate": "full",
+                    "by_task": [
+                        {
+                            "task_id": "repair_nested_defaults",
+                            "family": "data_model",
+                            "difficulty": "4",
+                            "failure_tags": ["mutation", "none_sentinel"],
+                            "observations": 3,
+                            "passed": 2,
+                            "failed": 1,
+                            "pass_rate": 2 / 3,
+                        }
+                    ],
+                    "by_family": [
+                        {
+                            "name": "data_model",
+                            "observations": 3,
+                            "passed": 2,
+                            "failed": 1,
+                            "pass_rate": 2 / 3,
+                        }
+                    ],
+                    "by_failure_tag": [
+                        {
+                            "name": "none_sentinel",
+                            "observations": 3,
+                            "passed": 2,
+                            "failed": 1,
+                            "pass_rate": 2 / 3,
+                        }
+                    ],
+                },
+            ],
+            "deltas_vs_baseline": [
+                {
+                    "candidate": "full",
+                    "tasks_better_than_baseline": [
+                        {
+                            "task_id": "repair_nested_defaults",
+                            "pass_rate_delta": 1 / 3,
+                        }
+                    ],
+                    "tasks_worse_than_baseline": [],
+                },
+                {
+                    "candidate": "probe",
+                    "tasks_better_than_baseline": [],
+                    "tasks_worse_than_baseline": [
+                        {
+                            "task_id": "repair_query_params",
+                            "pass_rate_delta": -1.0,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        payload = _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            readiness,
+        )
+
+        actions = {action["action"]: action for action in payload["actions"]}
+        self.assertEqual(payload["status"], "hold")
+        self.assertIn("study_unstable_lift", actions)
+        self.assertEqual(actions["study_unstable_lift"]["candidate"], "full")
+        self.assertIn("treat_as_experimental_probe", actions)
+        self.assertEqual(actions["treat_as_experimental_probe"]["candidate"], "probe")
+        self.assertIn("design_targeted_candidate", actions)
+        self.assertEqual(
+            payload["shared_failure_pockets"]["tasks"][0]["task_id"],
+            "repair_nested_defaults",
         )
 
     def test_batch_cli_missing_env_writes_replicate_artifacts_and_summary(self):

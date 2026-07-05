@@ -689,6 +689,7 @@ def analyze_foundry_harness_runs(
         None,
     )
     failure_pockets = _failure_pocket_payload(run_diagnostics, baseline)
+    promotion_readiness = foundry_harness_promotion_readiness(comparison)
     return {
         "ok": bool(run_diagnostics),
         "runs_dir": str(runs_dir),
@@ -704,7 +705,12 @@ def analyze_foundry_harness_runs(
             if baseline is not None and diagnostic is not baseline
         ],
         "failure_pockets": failure_pockets,
-        "promotion_readiness": foundry_harness_promotion_readiness(comparison),
+        "promotion_readiness": promotion_readiness,
+        "next_hypotheses": _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            promotion_readiness,
+        ),
     }
 
 
@@ -1350,6 +1356,337 @@ def _failure_pocket_deltas_vs_baseline(
             }
         )
     return deltas
+
+
+def _next_hypotheses_payload(
+    comparison: Mapping[str, Any],
+    failure_pockets: Mapping[str, Any],
+    promotion_readiness: Mapping[str, Any],
+) -> dict[str, Any]:
+    actions: list[dict[str, Any]] = []
+    status = str(promotion_readiness.get("status") or "unknown")
+    aggregates = [
+        dict(item)
+        for item in comparison.get("candidate_aggregates", [])
+        if isinstance(item, Mapping)
+    ]
+    aggregate_by_candidate = {
+        str(item.get("candidate", "")): item
+        for item in aggregates
+        if item.get("candidate")
+    }
+
+    if status == "promote":
+        actions.extend(_promotion_actions(promotion_readiness))
+    elif status == "needs_more_evidence":
+        actions.extend(_replicate_actions(promotion_readiness))
+
+    for decision in promotion_readiness.get("decisions", []):
+        if not isinstance(decision, Mapping):
+            continue
+        candidate = str(decision.get("candidate", ""))
+        reason = str(decision.get("reason", ""))
+        median_delta = _optional_float(decision.get("median_score_delta_vs_baseline"))
+        if (
+            decision.get("status") == "hold"
+            and "pairwise_win_rate" in reason
+            and median_delta is not None
+            and median_delta > 0.0
+        ):
+            actions.append(
+                {
+                    "action": "study_unstable_lift",
+                    "candidate": candidate,
+                    "reason": reason,
+                    "pairwise_win_rate_vs_baseline": _optional_float(
+                        decision.get("pairwise_win_rate_vs_baseline")
+                    ),
+                    "median_score_delta_vs_baseline": _optional_float(
+                        decision.get("median_score_delta_vs_baseline")
+                    ),
+                    "positive_task_pockets": _positive_task_pockets(
+                        failure_pockets,
+                        candidate,
+                    ),
+                }
+            )
+        elif decision.get("status") == "hold":
+            actions.append(
+                {
+                    "action": "do_not_promote",
+                    "candidate": candidate,
+                    "reason": reason,
+                    "median_score_delta_vs_baseline": _optional_float(
+                        decision.get("median_score_delta_vs_baseline")
+                    ),
+                }
+            )
+
+    for excluded in promotion_readiness.get("excluded_candidates", []):
+        if not isinstance(excluded, Mapping):
+            continue
+        candidate = str(excluded.get("candidate", ""))
+        aggregate = aggregate_by_candidate.get(candidate, {})
+        actions.append(
+            {
+                "action": "treat_as_experimental_probe",
+                "candidate": candidate,
+                "reason": excluded.get("reason"),
+                "ranking_score_median": _optional_float(
+                    aggregate.get("ranking_score_median")
+                ),
+                "ok_runs": int(aggregate.get("ok_runs", 0) or 0),
+                "negative_task_pockets": _negative_task_pockets(
+                    failure_pockets,
+                    candidate,
+                ),
+            }
+        )
+
+    baseline_candidate = promotion_readiness.get("baseline_candidate")
+    eligible_candidates = [
+        str(item.get("candidate", ""))
+        for item in aggregates
+        if bool(item.get("promotion_eligible", True)) and item.get("candidate")
+    ]
+    shared_failure_pockets = _shared_failure_pockets(
+        failure_pockets,
+        eligible_candidates,
+    )
+    if (
+        status == "hold"
+        and shared_failure_pockets.get("tasks")
+        and not any(action.get("action") == "promote_candidate" for action in actions)
+    ):
+        actions.append(
+            {
+                "action": "design_targeted_candidate",
+                "reason": "eligible_candidates_share_unsolved_heldout_pockets",
+                "candidate_scope": "new_probe_not_promotion_eligible_until_replicated",
+                "target_tasks": shared_failure_pockets.get("tasks", [])[:5],
+                "target_failure_tags": shared_failure_pockets.get(
+                    "failure_tags",
+                    [],
+                )[:5],
+            }
+        )
+
+    if status == "hold" and not actions:
+        actions.append(
+            {
+                "action": "hold",
+                "reason": "no_promotable_candidate_and_no_specific_followup",
+            }
+        )
+
+    return {
+        "status": status,
+        "baseline_candidate": baseline_candidate,
+        "actions": actions,
+        "shared_failure_pockets": shared_failure_pockets,
+    }
+
+
+def _promotion_actions(
+    promotion_readiness: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for decision in promotion_readiness.get("decisions", []):
+        if not isinstance(decision, Mapping):
+            continue
+        if decision.get("status") != "promote":
+            continue
+        actions.append(
+            {
+                "action": "promote_candidate",
+                "candidate": decision.get("candidate"),
+                "reason": decision.get("reason"),
+                "pairwise_win_rate_vs_baseline": _optional_float(
+                    decision.get("pairwise_win_rate_vs_baseline")
+                ),
+                "median_score_delta_vs_baseline": _optional_float(
+                    decision.get("median_score_delta_vs_baseline")
+                ),
+            }
+        )
+    return actions
+
+
+def _replicate_actions(
+    promotion_readiness: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for item in promotion_readiness.get("recommended_next_runs", []):
+        if not isinstance(item, Mapping):
+            continue
+        actions.append(
+            {
+                "action": "run_additional_replicates",
+                "candidate": item.get("candidate"),
+                "additional_successful_runs": int(
+                    item.get("additional_successful_runs", 0) or 0
+                ),
+            }
+        )
+    return actions
+
+
+def _positive_task_pockets(
+    failure_pockets: Mapping[str, Any],
+    candidate: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    delta = _failure_pocket_delta_for_candidate(failure_pockets, candidate)
+    rows = delta.get("tasks_better_than_baseline")
+    return [dict(row) for row in rows[:limit]] if isinstance(rows, list) else []
+
+
+def _negative_task_pockets(
+    failure_pockets: Mapping[str, Any],
+    candidate: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    delta = _failure_pocket_delta_for_candidate(failure_pockets, candidate)
+    rows = delta.get("tasks_worse_than_baseline")
+    return [dict(row) for row in rows[:limit]] if isinstance(rows, list) else []
+
+
+def _failure_pocket_delta_for_candidate(
+    failure_pockets: Mapping[str, Any],
+    candidate: str,
+) -> dict[str, Any]:
+    deltas = failure_pockets.get("deltas_vs_baseline")
+    if not isinstance(deltas, list):
+        return {}
+    for item in deltas:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("candidate") == candidate:
+            return dict(item)
+    return {}
+
+
+def _shared_failure_pockets(
+    failure_pockets: Mapping[str, Any],
+    candidates: Sequence[str],
+) -> dict[str, Any]:
+    by_candidate = failure_pockets.get("by_candidate")
+    if not isinstance(by_candidate, list):
+        return {"candidates": [], "tasks": [], "families": [], "failure_tags": []}
+    pocket_by_candidate = {
+        str(item.get("candidate", "")): item
+        for item in by_candidate
+        if isinstance(item, Mapping) and item.get("candidate")
+    }
+    selected = [
+        candidate
+        for candidate in candidates
+        if candidate in pocket_by_candidate
+    ]
+    return {
+        "candidates": selected,
+        "tasks": _shared_failure_rows(
+            pocket_by_candidate,
+            selected,
+            section="by_task",
+            name_key="task_id",
+        ),
+        "families": _shared_failure_rows(
+            pocket_by_candidate,
+            selected,
+            section="by_family",
+            name_key="name",
+        ),
+        "failure_tags": _shared_failure_rows(
+            pocket_by_candidate,
+            selected,
+            section="by_failure_tag",
+            name_key="name",
+        ),
+    }
+
+
+def _shared_failure_rows(
+    pocket_by_candidate: Mapping[str, Mapping[str, Any]],
+    candidates: Sequence[str],
+    *,
+    section: str,
+    name_key: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    rows_by_candidate = {
+        candidate: _rows_by_name(
+            pocket_by_candidate[candidate].get(section),
+            name_key=name_key,
+        )
+        for candidate in candidates
+        if candidate in pocket_by_candidate
+    }
+    if not rows_by_candidate:
+        return []
+    shared_names = set.intersection(
+        *(set(rows) for rows in rows_by_candidate.values())
+    )
+    rows: list[dict[str, Any]] = []
+    for name in sorted(shared_names):
+        candidate_rows = {
+            candidate: rows[name]
+            for candidate, rows in rows_by_candidate.items()
+            if name in rows
+        }
+        failed_total = sum(
+            int(row.get("failed", 0) or 0)
+            for row in candidate_rows.values()
+        )
+        if failed_total <= 0:
+            continue
+        pass_rates = [
+            value
+            for value in (
+                _optional_float(row.get("pass_rate"))
+                for row in candidate_rows.values()
+            )
+            if value is not None
+        ]
+        observations = sum(
+            int(row.get("observations", 0) or 0)
+            for row in candidate_rows.values()
+        )
+        row = {
+            name_key: name,
+            "candidate_pass_rates": {
+                candidate: _optional_float(candidate_row.get("pass_rate"))
+                for candidate, candidate_row in sorted(candidate_rows.items())
+            },
+            "mean_pass_rate": fmean(pass_rates) if pass_rates else None,
+            "failed_total": failed_total,
+            "observations": observations,
+        }
+        for metadata_key in ("family", "difficulty", "failure_tags"):
+            metadata_value = next(
+                (
+                    candidate_row.get(metadata_key)
+                    for candidate_row in candidate_rows.values()
+                    if candidate_row.get(metadata_key)
+                ),
+                None,
+            )
+            if metadata_value is not None:
+                row[metadata_key] = metadata_value
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            row["mean_pass_rate"] if row["mean_pass_rate"] is not None else 1.0,
+            -int(row["failed_total"]),
+            -int(row["observations"]),
+            str(row.get(name_key, "")),
+        )
+    )
+    return rows[:limit]
 
 
 def _pocket_delta_rows(
