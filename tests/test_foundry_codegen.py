@@ -12,7 +12,10 @@ from types import SimpleNamespace
 from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
     DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
+    DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
+    FOUNDRY_PROMPT_CONTEXT_POLICIES,
     PythonRepairTask,
+    _repair_prompt,
     _selected_foundry_task_selection,
     _validate_foundry_task_bank,
     available_foundry_corpora,
@@ -82,7 +85,8 @@ def solve(value, low, high):
 
 class _FakeClient:
     def __init__(self) -> None:
-        self.chat = SimpleNamespace(completions=_FakeCompletions())
+        self.completions = _FakeCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
 
 
 class FoundryCodegenTests(unittest.TestCase):
@@ -461,6 +465,8 @@ class FoundryCodegenTests(unittest.TestCase):
     def test_frontier_invalid_split_and_duplicate_task_ids_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "task_split"):
             AzureFoundryCodegenConfig(task_split="missing").validate()
+        with self.assertRaisesRegex(ValueError, "prompt_context_policy"):
+            AzureFoundryCodegenConfig(prompt_context_policy="missing").validate()
 
         task = PythonRepairTask(
             id="duplicate",
@@ -478,6 +484,81 @@ class FoundryCodegenTests(unittest.TestCase):
                 train_tasks=(task, task),
                 heldout_tasks=(),
             )
+
+    def test_prompt_context_policy_adds_metadata_and_data_model_guardrails(self):
+        task = PythonRepairTask(
+            id="repair_nested_defaults",
+            prompt="Deep-fill missing dictionary keys from defaults.",
+            signature="def solve(data, defaults)",
+            buggy_code="def solve(data, defaults):\n    return data\n",
+            tests=((({}, {"a": 1}), {"a": 1}),),
+            family="data_model",
+            difficulty=4,
+            failure_tags=("mutation", "aliasing"),
+        )
+
+        base_prompt = _repair_prompt(task)
+        metadata_prompt = _repair_prompt(
+            task,
+            prompt_context_policy="task_metadata",
+        )
+        guardrail_prompt = _repair_prompt(
+            task,
+            prompt_context_policy="data_model_guardrails",
+        )
+        sequence_prompt = _repair_prompt(
+            PythonRepairTask(
+                id="repair_rotate_left",
+                prompt="Rotate a list left.",
+                signature="def solve(items, n)",
+                buggy_code="def solve(items, n):\n    return items\n",
+                tests=((([1, 2, 3], 1), [2, 3, 1]),),
+                family="sequence",
+                difficulty=2,
+                failure_tags=("off_by_one",),
+            ),
+            prompt_context_policy="data_model_guardrails",
+        )
+
+        self.assertEqual(DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY, "repair_prompt_only")
+        self.assertIn("data_model_guardrails", FOUNDRY_PROMPT_CONTEXT_POLICIES)
+        self.assertNotIn("Context:", base_prompt)
+        self.assertIn("- family: data_model", metadata_prompt)
+        self.assertIn("- failure tags: mutation, aliasing", metadata_prompt)
+        self.assertIn("deep-copy nested defaults", guardrail_prompt)
+        self.assertIn("deterministic input/schema order", guardrail_prompt)
+        self.assertNotIn("Context:", sequence_prompt)
+
+    def test_fake_foundry_result_records_prompt_context_policy(self):
+        fake_clients: list[_FakeClient] = []
+
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            del name
+            self.assertEqual(config.prompt_context_policy, "data_model_guardrails")
+            client = _FakeClient()
+            fake_clients.append(client)
+            return client
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=1,
+                    task_limit=1,
+                    task_split="frontier_hard",
+                    model_call_budget=1,
+                    max_completion_tokens=64,
+                    prompt_context_policy="data_model_guardrails",
+                ),
+                budget_dollar_seconds=40.0,
+                conditions=("static_art",),
+                client_factory=client_factory,
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["prompt_context_policy"], "data_model_guardrails")
+        prompt = fake_clients[0].completions.calls[0]["messages"][1]["content"]
+        self.assertIn("Repair this Python function.", prompt)
 
     def test_fake_foundry_frontier_smoke_reports_coverage_and_non_saturation(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):

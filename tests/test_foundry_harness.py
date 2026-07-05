@@ -91,6 +91,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(manifest.primary_condition, "full_trinity")
         self.assertEqual(manifest.conditions, ("full_trinity",))
         self.assertEqual(manifest.task_split, "standard")
+        self.assertEqual(manifest.prompt_context_policy, "repair_prompt_only")
         self.assertTrue(manifest.budget_race)
         self.assertIn("token", manifest.action_codecs)
         args = foundry_harness_child_args(
@@ -99,6 +100,8 @@ class FoundryHarnessTests(unittest.TestCase):
         )
         self.assertIn("--budget-race", args)
         self.assertIn("--task-split", args)
+        self.assertIn("--prompt-context-policy", args)
+        self.assertIn("repair_prompt_only", args)
         self.assertIn("--conditions", args)
         self.assertIn("full_trinity", args)
         self.assertIn("--request-timeout-s", args)
@@ -138,6 +141,14 @@ class FoundryHarnessTests(unittest.TestCase):
                     "conditions": ["static_art"],
                 }
             )
+        with self.assertRaisesRegex(ValueError, "prompt_context_policy"):
+            FoundryHarnessManifest.from_mapping(
+                {
+                    "name": "bad",
+                    "deployment": "dry-run-placeholder",
+                    "prompt_context_policy": "missing",
+                }
+            )
 
     def test_public_candidate_manifests_parse(self):
         baseline = load_foundry_harness_manifest("baseline")
@@ -147,6 +158,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_baseline = load_foundry_harness_manifest("frontier_baseline")
         frontier_scheduler = load_foundry_harness_manifest("frontier_scheduler_only")
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
+        frontier_guardrails = load_foundry_harness_manifest(
+            "frontier_data_model_guardrails"
+        )
 
         self.assertEqual(baseline.primary_condition, "static_art")
         self.assertEqual(full.primary_condition, "full_trinity")
@@ -159,8 +173,14 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_baseline.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.task_split, "frontier_hard")
         self.assertEqual(frontier_full.task_split, "frontier_hard")
+        self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
+        self.assertEqual(frontier_guardrails.primary_condition, "full_trinity")
+        self.assertEqual(
+            frontier_guardrails.prompt_context_policy,
+            "data_model_guardrails",
+        )
         self.assertEqual(baseline.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
         self.assertEqual(full.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
 
@@ -386,6 +406,7 @@ class FoundryHarnessTests(unittest.TestCase):
                 **_summary(candidate, condition, score, 10.0),
                 "output_dir": str(path),
                 "task_split": "frontier_hard",
+                "prompt_context_policy": "data_model_guardrails",
                 "ranking_score_source": "heldout",
                 "heldout_score": score,
                 "ranking_score": score,
@@ -498,6 +519,7 @@ class FoundryHarnessTests(unittest.TestCase):
             if run["candidate"] == "frontier_full_trinity"
         )
         self.assertTrue(full_diag["budget_exhausted"])
+        self.assertEqual(full_diag["prompt_context_policy"], "data_model_guardrails")
         self.assertEqual(
             full_diag["heldout_task_failures"][0]["task_id"],
             "repair_none_sentinel",

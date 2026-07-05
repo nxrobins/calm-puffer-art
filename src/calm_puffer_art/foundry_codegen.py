@@ -55,6 +55,12 @@ DEFAULT_FOUNDRY_MEMORY_DOLLAR_SECONDS = 0.05
 DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS = 0.04
 DEFAULT_FOUNDRY_BUDGET_DOLLAR_SECONDS = 150.0
 DEFAULT_FOUNDRY_TASK_SPLIT = "standard"
+DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY = "repair_prompt_only"
+FOUNDRY_PROMPT_CONTEXT_POLICIES = (
+    "repair_prompt_only",
+    "task_metadata",
+    "data_model_guardrails",
+)
 FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
 FOUNDRY_TASK_FAMILIES = (
     "sequence",
@@ -136,6 +142,7 @@ class AzureFoundryCodegenConfig:
     action_unit_dollar_seconds: float = DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS
     trainer_dollar_seconds: float = 0.35
     task_split: str = DEFAULT_FOUNDRY_TASK_SPLIT
+    prompt_context_policy: str = DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY
 
     def validate(self) -> None:
         if self.max_train_steps < 1:
@@ -161,6 +168,8 @@ class AzureFoundryCodegenConfig:
                 raise ValueError(f"{name}_must_be_finite_non_negative")
         if self.task_split not in _FOUNDRY_TASK_SPLITS:
             raise ValueError("foundry_task_split_unknown")
+        if self.prompt_context_policy not in FOUNDRY_PROMPT_CONTEXT_POLICIES:
+            raise ValueError("foundry_prompt_context_policy_unknown")
 
 
 class AzureFoundryCodegenPolicy:
@@ -251,7 +260,13 @@ class AzureFoundryCodegenPolicy:
                         "classes, or top-level test code."
                     ),
                 },
-                {"role": "user", "content": _repair_prompt(task)},
+                {
+                    "role": "user",
+                    "content": _repair_prompt(
+                        task,
+                        prompt_context_policy=self.config.prompt_context_policy,
+                    ),
+                },
             ],
         }
         if self.config.deployment.startswith("gpt-5"):
@@ -395,7 +410,15 @@ async def azure_foundry_codegen_rollout(
     return Trajectory(
         scenario_id=scenario.id,
         policy_step=context.policy_step,
-        messages=[Message(role="user", content=_repair_prompt(task))],
+        messages=[
+            Message(
+                role="user",
+                content=_repair_prompt(
+                    task,
+                    prompt_context_policy=policy.config.prompt_context_policy,
+                ),
+            )
+        ],
         actions=actions,
         reward=1.0 if verification.passed else 0.0,
         metrics={
@@ -442,6 +465,7 @@ async def run_azure_foundry_codegen_ablation(
         "api_version": resolved.api_version,
         "env_path": str(resolved.env_path),
         "task_split": selection.split,
+        "prompt_context_policy": resolved.prompt_context_policy,
         "tasks": len(selection.train),
         "heldout_tasks": len(selection.heldout),
         "train_task_ids": [task.id for task in selection.train],
@@ -518,6 +542,7 @@ async def run_azure_foundry_budget_race(
         "api_version": resolved.api_version,
         "env_path": str(resolved.env_path),
         "task_split": selection.split,
+        "prompt_context_policy": resolved.prompt_context_policy,
         "tasks": len(selection.train),
         "heldout_tasks": len(selection.heldout),
         "train_task_ids": [task.id for task in selection.train],
@@ -1509,11 +1534,17 @@ def _foundry_task_for_scenario(scenario: Scenario) -> PythonRepairTask:
     raise ValueError(f"unknown_foundry_codegen_scenario: {scenario.id}")
 
 
-def _repair_prompt(task: PythonRepairTask) -> str:
+def _repair_prompt(
+    task: PythonRepairTask,
+    *,
+    prompt_context_policy: str = DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
+) -> str:
     tests = "\n".join(
         f"- solve{args!r} == {expected!r}"
         for args, expected in task.tests
     )
+    context = _repair_prompt_context(task, prompt_context_policy)
+    context_block = f"\n\nContext:\n{context}" if context else ""
     return textwrap.dedent(
         f"""
         Repair this Python function.
@@ -1525,7 +1556,7 @@ def _repair_prompt(task: PythonRepairTask) -> str:
         - Do not import modules or perform IO.
 
         Task:
-        {task.prompt}
+        {task.prompt}{context_block}
 
         Buggy code:
         {task.buggy_code.strip()}
@@ -1534,6 +1565,35 @@ def _repair_prompt(task: PythonRepairTask) -> str:
         {tests}
         """
     ).strip()
+
+
+def _repair_prompt_context(
+    task: PythonRepairTask,
+    prompt_context_policy: str,
+) -> str:
+    if prompt_context_policy == "repair_prompt_only":
+        return ""
+    lines = [
+        f"- family: {task.family}",
+        f"- difficulty: {task.difficulty}",
+    ]
+    if task.failure_tags:
+        lines.append("- failure tags: " + ", ".join(task.failure_tags))
+    if prompt_context_policy == "task_metadata":
+        return "\n".join(lines)
+    if prompt_context_policy == "data_model_guardrails":
+        if task.family != "data_model":
+            return ""
+        lines.extend(
+            [
+                "- preserve input objects unless the task explicitly asks to mutate",
+                "- deep-copy nested defaults before filling missing dictionary keys",
+                "- distinguish missing keys, None values, and other falsy values",
+                "- report schema errors in deterministic input/schema order",
+            ]
+        )
+        return "\n".join(lines)
+    raise ValueError("foundry_prompt_context_policy_unknown")
 
 
 def _fallback_solution(task: PythonRepairTask) -> str:

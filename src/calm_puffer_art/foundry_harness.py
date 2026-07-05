@@ -16,6 +16,7 @@ from .foundry_codegen import (
     DEFAULT_FOUNDRY_ENV_PATH,
     DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS,
     DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
+    DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
     DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS,
     DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S,
     DEFAULT_FOUNDRY_TASK_LIMIT,
@@ -23,6 +24,7 @@ from .foundry_codegen import (
     DEFAULT_FOUNDRY_TRAIN_STEPS,
     DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
     DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
+    FOUNDRY_PROMPT_CONTEXT_POLICIES,
 )
 
 
@@ -140,7 +142,7 @@ class FoundryHarnessManifest:
     run_timeout_s: float = 3600.0
     heartbeat_interval_s: float = 30.0
     telemetry_filename: str = "telemetry.jsonl"
-    prompt_context_policy: str = "repair_prompt_only"
+    prompt_context_policy: str = DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY
     output_contract: str = "python_solve_function_only"
     verifier: str = "isolated_subprocess_unit_tests"
     retry_policy: str = "none"
@@ -231,7 +233,7 @@ class FoundryHarnessManifest:
             prompt_context_policy=_string_value(
                 values,
                 "prompt_context_policy",
-                "repair_prompt_only",
+                DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
             ),
             output_contract=_string_value(
                 values,
@@ -330,6 +332,8 @@ class FoundryHarnessManifest:
         ):
             if not str(getattr(self, name)):
                 raise ValueError(f"foundry_harness_{name}_required")
+        if self.prompt_context_policy not in FOUNDRY_PROMPT_CONTEXT_POLICIES:
+            raise ValueError("foundry_harness_prompt_context_policy_unknown")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -407,6 +411,8 @@ def foundry_harness_child_args(
         str(manifest.task_limit),
         "--task-split",
         manifest.task_split,
+        "--prompt-context-policy",
+        manifest.prompt_context_policy,
         "--conditions",
         *manifest.conditions,
         "--model-call-budget",
@@ -474,6 +480,7 @@ def summarize_foundry_harness_result(
         "primary_condition": manifest.primary_condition,
         "conditions_selected": list(manifest.conditions),
         "task_split": manifest.task_split,
+        "prompt_context_policy": manifest.prompt_context_policy,
         "promotion_metric": manifest.promotion_metric,
         "objective_metric": FOUNDRY_HARNESS_OBJECTIVE_METRIC,
         "primary_score": primary_score,
@@ -765,6 +772,7 @@ def _foundry_run_diagnostics(
 ) -> dict[str, Any]:
     result = _read_json_object(output_dir / FOUNDRY_HARNESS_ARTIFACT_FILES["result"])
     failures = _read_json_object(output_dir / FOUNDRY_HARNESS_ARTIFACT_FILES["failures"])
+    manifest = _read_json_object(output_dir / FOUNDRY_HARNESS_ARTIFACT_FILES["manifest"])
     primary_condition = str(summary.get("primary_condition", ""))
     condition = _mapping_child(result.get("conditions"), primary_condition)
     heldout = _mapping_child(
@@ -781,6 +789,9 @@ def _foundry_run_diagnostics(
         "output_dir": str(output_dir),
         "primary_condition": primary_condition,
         "task_split": summary.get("task_split") or result.get("task_split"),
+        "prompt_context_policy": summary.get("prompt_context_policy")
+        or result.get("prompt_context_policy")
+        or manifest.get("prompt_context_policy"),
         "ranking_score": _optional_float(summary.get("ranking_score")),
         "ranking_score_source": summary.get("ranking_score_source"),
         "heldout_pass_rate": _optional_float(heldout.get("heldout/pass_rate")),
