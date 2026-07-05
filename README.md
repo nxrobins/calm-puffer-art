@@ -106,6 +106,10 @@ AZURE_OPENAI_API_VERSION=...
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
+| Foundry harness candidate run | `python examples\foundry_harness_run.py --candidate full_trinity --output-dir .codex\foundry-runs\trial --json` |
+| Foundry harness replicate batch | `python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --json` |
+| Foundry harness comparison | `python examples\foundry_harness_compare.py --runs .codex\foundry-runs --json` |
+| Foundry harness diagnostics | `python examples\foundry_harness_analyze.py --runs .codex\foundry-runs --run-prefix frontier-live --json` |
 
 ## Architecture
 
@@ -151,6 +155,7 @@ unsafe, stale, rejected, or expensive samples remain in the denominator.
 | `calm_puffer_art.chunk_encoder` | Optional torch learned chunk codec smoke |
 | `calm_puffer_art.codegen_ablation` | Deterministic Python codegen verifier experiments |
 | `calm_puffer_art.foundry_codegen` | Optional live Azure Foundry Python repair workload |
+| `calm_puffer_art.foundry_harness` | Foundry candidate manifests, artifacts, failure taxonomy, and comparison |
 | `calm_puffer_art.objective_ablation` | Synthetic and torch-gated scheduler ablations |
 | `calm_puffer_art.scalability` | Scheduler scale/readiness profiler |
 
@@ -238,9 +243,114 @@ Heartbeat events are written to stderr so stdout remains parseable JSON. The
 telemetry file records `run_started`, `run_heartbeat`, `run_completed`,
 `run_failed`, or `run_timeout` events with elapsed time and run settings.
 
-The fixed-budget race is the sharper test when asking whether the system wins on
-both performance and cost. It stops every condition on the same accounted
-dollar-second ceiling and reports:
+### Foundry Harness Lab
+
+The harness layer is a reproducible artifact shell around executable Foundry
+candidate profiles. It keeps candidate editing manual while making every run
+inspectable and comparable.
+
+True north: maximize held-out, verifier-confirmed repair improvement per
+accounted dollar-second on task splits that are hard enough not to saturate.
+The primary comparison key is
+`north_star/accounted_published_policy_reward_improving_experience_per_dollar_second`,
+with held-out reward preferred whenever a run includes held-out verification.
+A candidate is better only when its durable artifacts show that it is more
+reliable, more efficient, or more generalizing than the baseline, and the
+diagnostics explain where the gain came from or why it failed.
+
+Checked-in candidates live in `harnesses/foundry/`:
+
+- `baseline.json`: static token-level budget reference on the standard held-out split
+- `full_trinity.json`: objective scheduler plus adaptive token/chunk actions on the standard held-out split
+- `hard_baseline.json`: static token-level budget reference on harder repair tasks
+- `hard_full_trinity.json`: full-trinity profile on harder repair tasks
+- `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
+- `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
+
+Each manifest selects the condition(s) to execute through `conditions`, the
+condition used for ranking through `primary_condition`, and the workload through
+`task_split`. Supported splits are `standard`, `standard_heldout`, `hard`,
+`hard_heldout`, `mixed_heldout`, `frontier_smoke`, `frontier_balanced`,
+`frontier_hard`, and `frontier_full`. Held-out splits reuse task IDs with
+stricter edge-case tests, so the harness can re-verify learned repairs without
+another model request.
+
+The frontier ladder is a self-contained 40-task corpus spanning sequence,
+string parsing, intervals, state machines, graphs, data models, numeric logic,
+and real bug patterns. Each task carries family, difficulty, and failure-tag
+metadata; result payloads summarize coverage, held-out pass rate by
+family/difficulty, and saturation indicators.
+
+Run one candidate:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\foundry_harness_run.py --candidate full_trinity --output-dir .codex\foundry-runs\trial --json
+```
+
+Compare saved runs:
+
+```powershell
+python examples\foundry_harness_compare.py --runs .codex\foundry-runs --json
+```
+
+Add `--run-prefix <prefix>` when comparing only one batch from a shared runs
+directory.
+
+Analyze why a saved batch won or failed:
+
+```powershell
+python examples\foundry_harness_analyze.py --runs .codex\foundry-runs --run-prefix frontier-live --json
+```
+
+Diagnostics include winner, deltas versus the static baseline, budget exhaustion,
+weakest held-out families/difficulties, non-saturation state, and exact held-out
+task failures when the run artifact includes per-task results.
+
+Run a small replicate batch:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --json
+```
+
+Run the harder held-out comparison:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates hard_baseline hard_full_trinity --replicates 3 --json
+```
+
+Run the frontier hard ladder:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates frontier_baseline frontier_full_trinity --replicates 3 --json
+```
+
+For local credentials or deployment names that should not be checked into a
+manifest, use runtime overrides:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --env-path .env --deployment your-deployment-name --json
+```
+
+Run outputs are written under `.codex/foundry-runs/`, which is ignored by git.
+Each run directory contains:
+
+- `manifest.json`: resolved candidate manifest copy
+- `result.json`: parsed Foundry experiment payload or parseable failure payload
+- `telemetry.jsonl`: watchdog lifecycle events
+- `stdout.txt` and `stderr.txt`: captured child process streams
+- `summary.json`: condition metrics and ranking score
+- `failures.json`: setup, timeout, model, verifier, parse, answer, budget, and
+  scheduler/control failure categories
+
+The comparison payload also includes `candidate_aggregates`, which groups run
+summaries by candidate and reports successful runs, failure rate, mean/median
+ranking score, best score, worst score, mean accounted spend, and the best
+artifact directory.
+
+The fixed-budget profile is the sharper test when asking whether a candidate
+wins on both performance and cost. It stops each selected condition on the same
+accounted dollar-second ceiling and reports:
 
 - learned verified repairs
 - accounted dollar-seconds
@@ -249,11 +359,14 @@ dollar-second ceiling and reports:
 - verifier passes
 - token/chunk pulls
 - semantic bandwidth
+- held-out pass rate and held-out north-star score when the split provides
+  hidden edge-case tasks
 
-Current empirical caveat: on the 17-task Foundry workload, full-trinity found a
-qualified performance-plus-cost win versus `scheduler_only` at one sampled budget,
-but did not beat the static round-robin baseline overall. The task bank still
-saturates too easily for a broad performance claim.
+Current empirical caveat: the original 17-task Foundry workload saturated too
+easily. Use `frontier_hard` or `frontier_full` before making claims about
+full-trinity lift. Optional future corpus adapters are reserved for EvalPlus,
+BigCodeBench, QuixBugs, BugsInPy, SWE-bench, and LiveCodeBench; default CI does
+not download or depend on them.
 
 ## Metrics To Watch
 
@@ -268,6 +381,9 @@ Useful run-summary keys:
 | `scheduler/arm/*/total_improvement_per_dollar_second` | Arm-level value signal |
 | `action_space/active_codecs` | Count of currently active action codecs |
 | `foundry/learned_solutions` | Verified repair tasks stored by the Foundry trainer |
+| `heldout/pass_rate` | Fraction of hidden edge-case task variants passed by learned repairs |
+| `task_coverage.train.families` | Train task family counts for the selected split |
+| `non_saturation.conditions.*.learned_fraction` | Learned task fraction for each executed condition |
 | `foundry/codec/*/pulls` | Foundry workload pulls by action codec |
 
 ## Development

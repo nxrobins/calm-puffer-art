@@ -11,7 +11,12 @@ from types import SimpleNamespace
 
 from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
+    DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
     PythonRepairTask,
+    _selected_foundry_task_selection,
+    _validate_foundry_task_bank,
+    available_foundry_corpora,
+    available_foundry_task_splits,
     _env_first,
     extract_python_solution,
     load_env_file,
@@ -381,6 +386,137 @@ class FoundryCodegenTests(unittest.TestCase):
         for condition in result["conditions"].values():
             self.assertIn("scheduler/budget/max_accounted_dollar_seconds", condition)
             self.assertIn("foundry/learned_solutions", condition)
+
+    def test_fake_foundry_budget_race_supports_single_condition_heldout_split(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=1,
+                    task_limit=1,
+                    task_split="standard_heldout",
+                    model_call_budget=1,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=25.0,
+                conditions=("static_art",),
+                client_factory=client_factory,
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["task_split"], "standard_heldout")
+        self.assertEqual(result["selected_conditions"], ["static_art"])
+        self.assertEqual(sorted(result["conditions"]), ["static_art"])
+        self.assertEqual(result["heldout_tasks"], 1)
+        self.assertEqual(result["heldout"]["task_ids"], ["repair_clamp"])
+        heldout_static = result["heldout"]["conditions"]["static_art"]
+        self.assertEqual(heldout_static["heldout/passed"], 1.0)
+        self.assertGreater(
+            heldout_static[
+                "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second"
+            ],
+            0.0,
+        )
+
+    def test_frontier_task_splits_have_expected_sizes_and_metadata(self):
+        self.assertIn("frontier_ladder_v1", available_foundry_corpora())
+        self.assertIn("frontier_full", available_foundry_task_splits())
+
+        expected_sizes = {
+            "frontier_smoke": 8,
+            "frontier_balanced": 24,
+            "frontier_hard": 32,
+            "frontier_full": 40,
+        }
+        for split, expected_size in expected_sizes.items():
+            selection = _selected_foundry_task_selection(999, split)
+            self.assertEqual(len(selection.train), expected_size)
+            self.assertEqual(len(selection.heldout), expected_size)
+            self.assertEqual(
+                {task.id for task in selection.train},
+                {task.id for task in selection.heldout},
+            )
+            self.assertTrue(all(task.family != "general" for task in selection.train))
+            self.assertTrue(all(1 <= task.difficulty <= 5 for task in selection.train))
+            self.assertTrue(all(task.failure_tags for task in selection.train))
+
+        smoke = _selected_foundry_task_selection(999, "frontier_smoke")
+        self.assertEqual(
+            {task.family for task in smoke.train},
+            {
+                "sequence",
+                "string_parse",
+                "interval",
+                "state_machine",
+                "graph",
+                "data_model",
+                "numeric",
+                "real_bug_pattern",
+            },
+        )
+
+    def test_frontier_invalid_split_and_duplicate_task_ids_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "task_split"):
+            AzureFoundryCodegenConfig(task_split="missing").validate()
+
+        task = PythonRepairTask(
+            id="duplicate",
+            prompt="Return x.",
+            signature="def solve(x)",
+            buggy_code="def solve(x):\n    return None\n",
+            tests=(((1,), 1),),
+            family="sequence",
+            difficulty=1,
+            failure_tags=("ordering",),
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate_train_ids"):
+            _validate_foundry_task_bank(
+                "bad",
+                train_tasks=(task, task),
+                heldout_tasks=(),
+            )
+
+    def test_fake_foundry_frontier_smoke_reports_coverage_and_non_saturation(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=2,
+                    task_limit=8,
+                    task_split="frontier_smoke",
+                    model_call_budget=8,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=80.0,
+                conditions=("static_art",),
+                client_factory=client_factory,
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["task_split"], "frontier_smoke")
+        self.assertEqual(result["task_coverage"]["train"]["tasks"], 8)
+        self.assertEqual(
+            len(result["task_coverage"]["train"]["families"]),
+            8,
+        )
+        saturation = result["non_saturation"]["conditions"]["static_art"]
+        self.assertLess(saturation["learned_fraction"], 1.0)
+        self.assertFalse(saturation["saturated"])
+        heldout_static = result["heldout"]["conditions"]["static_art"]
+        self.assertIn("heldout/by_family", heldout_static)
+        self.assertIn("heldout/by_difficulty", heldout_static)
+
+    def test_frontier_hard_is_larger_than_default_model_call_budget(self):
+        selection = _selected_foundry_task_selection(999, "frontier_hard")
+
+        self.assertGreater(len(selection.train), DEFAULT_FOUNDRY_MODEL_CALL_BUDGET)
+        self.assertEqual(len(selection.train), 32)
 
 
 if __name__ == "__main__":
