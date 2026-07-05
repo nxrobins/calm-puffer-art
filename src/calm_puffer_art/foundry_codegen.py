@@ -1267,6 +1267,7 @@ def _heldout_task_result(
         "task_id": task.id,
         "family": task.family,
         "difficulty": str(task.difficulty),
+        "failure_tags": list(task.failure_tags),
         "passed": passed,
         "failure_mode": failure_mode,
         "tests_passed": tests_passed,
@@ -1280,6 +1281,7 @@ def _heldout_breakdown_metrics(
     return {
         "heldout/by_family": _heldout_breakdown(task_results, "family"),
         "heldout/by_difficulty": _heldout_breakdown(task_results, "difficulty"),
+        "heldout/by_failure_tag": _heldout_failure_tag_breakdown(task_results),
     }
 
 
@@ -1303,6 +1305,39 @@ def _heldout_breakdown(
         values["passed"] += 1.0 if result.get("passed") is True else 0.0
         values["tests_passed"] += _mapping_float(result, "tests_passed")
         values["tests_total"] += _mapping_float(result, "tests_total")
+    for values in buckets.values():
+        tasks = values["tasks"]
+        tests_total = values["tests_total"]
+        values["pass_rate"] = values["passed"] / tasks if tasks else 0.0
+        values["tests_pass_rate"] = (
+            values["tests_passed"] / tests_total if tests_total else 0.0
+        )
+    return buckets
+
+
+def _heldout_failure_tag_breakdown(
+    task_results: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, float]]:
+    buckets: dict[str, dict[str, float]] = {}
+    for result in task_results:
+        tags = result.get("failure_tags")
+        if not isinstance(tags, list | tuple) or not tags:
+            tags = ("unknown",)
+        for tag in tags:
+            bucket = str(tag) or "unknown"
+            values = buckets.setdefault(
+                bucket,
+                {
+                    "tasks": 0.0,
+                    "passed": 0.0,
+                    "tests_passed": 0.0,
+                    "tests_total": 0.0,
+                },
+            )
+            values["tasks"] += 1.0
+            values["passed"] += 1.0 if result.get("passed") is True else 0.0
+            values["tests_passed"] += _mapping_float(result, "tests_passed")
+            values["tests_total"] += _mapping_float(result, "tests_total")
     for values in buckets.values():
         tasks = values["tasks"]
         tests_total = values["tests_total"]

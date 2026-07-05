@@ -682,6 +682,7 @@ def analyze_foundry_harness_runs(
         ),
         None,
     )
+    failure_pockets = _failure_pocket_payload(run_diagnostics, baseline)
     return {
         "ok": bool(run_diagnostics),
         "runs_dir": str(runs_dir),
@@ -696,6 +697,7 @@ def analyze_foundry_harness_runs(
             for diagnostic in run_diagnostics
             if baseline is not None and diagnostic is not baseline
         ],
+        "failure_pockets": failure_pockets,
         "promotion_readiness": foundry_harness_promotion_readiness(comparison),
     }
 
@@ -998,12 +1000,19 @@ def _foundry_run_diagnostics(
         "task_coverage": result.get("task_coverage", {}),
         "heldout_by_family": heldout.get("heldout/by_family", {}),
         "heldout_by_difficulty": heldout.get("heldout/by_difficulty", {}),
+        "heldout_by_failure_tag": heldout.get("heldout/by_failure_tag", {}),
+        "heldout_task_results": _heldout_task_results(
+            heldout.get("heldout/task_results")
+        ),
         "heldout_task_failures": _heldout_task_failures(
             heldout.get("heldout/task_results")
         ),
         "weakest_families": _weakest_breakdowns(heldout.get("heldout/by_family")),
         "weakest_difficulties": _weakest_breakdowns(
             heldout.get("heldout/by_difficulty")
+        ),
+        "weakest_failure_tags": _weakest_breakdowns(
+            heldout.get("heldout/by_failure_tag")
         ),
     }
 
@@ -1024,21 +1033,405 @@ def _mapping_child(value: Any, key: str) -> dict[str, Any]:
 
 
 def _heldout_task_failures(value: Any) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _heldout_task_results(value)
+        if item.get("passed") is not True
+    ]
+
+
+def _heldout_task_results(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
-    failures: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, Mapping) or item.get("passed") is True:
+        if not isinstance(item, Mapping):
             continue
-        failures.append(
+        results.append(
             {
                 "task_id": item.get("task_id"),
                 "family": item.get("family"),
                 "difficulty": item.get("difficulty"),
+                "failure_tags": _string_list(item.get("failure_tags")),
+                "passed": item.get("passed") is True,
                 "failure_mode": item.get("failure_mode"),
+                "tests_passed": _optional_float(item.get("tests_passed")),
+                "tests_total": _optional_float(item.get("tests_total")),
             }
         )
-    return failures
+    return results
+
+
+def _failure_pocket_payload(
+    run_diagnostics: Sequence[Mapping[str, Any]],
+    baseline: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    by_candidate = _candidate_failure_pockets(run_diagnostics)
+    baseline_candidate = baseline.get("candidate") if baseline else None
+    return {
+        "baseline_candidate": baseline_candidate,
+        "by_candidate": by_candidate,
+        "deltas_vs_baseline": _failure_pocket_deltas_vs_baseline(
+            by_candidate,
+            str(baseline_candidate) if baseline_candidate else None,
+        ),
+    }
+
+
+def _candidate_failure_pockets(
+    run_diagnostics: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    collectors: dict[str, dict[str, Any]] = {}
+    for diagnostic in run_diagnostics:
+        candidate = str(diagnostic.get("candidate", ""))
+        task_results = diagnostic.get("heldout_task_results")
+        if not candidate or not isinstance(task_results, list):
+            continue
+        collector = collectors.setdefault(candidate, _new_failure_pocket(candidate))
+        collector["runs_with_task_results"] += 1
+        for result in task_results:
+            if not isinstance(result, Mapping):
+                continue
+            _record_failure_pocket_observation(collector, result)
+
+    pockets = [
+        _finalize_failure_pocket(collector)
+        for collector in collectors.values()
+    ]
+    pockets.sort(key=lambda item: str(item.get("candidate", "")))
+    return pockets
+
+
+def _new_failure_pocket(candidate: str) -> dict[str, Any]:
+    return {
+        "candidate": candidate,
+        "runs_with_task_results": 0,
+        "task_observations": 0,
+        "passed_observations": 0,
+        "failed_observations": 0,
+        "failure_modes": {},
+        "by_task": {},
+        "by_family": {},
+        "by_difficulty": {},
+        "by_failure_tag": {},
+        "missing_failure_tag_observations": 0,
+    }
+
+
+def _record_failure_pocket_observation(
+    collector: dict[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    task_id = str(result.get("task_id") or "unknown")
+    family = str(result.get("family") or "unknown")
+    difficulty = str(result.get("difficulty") or "unknown")
+    failure_tags = tuple(_string_list(result.get("failure_tags")))
+    passed = result.get("passed") is True
+    failure_mode = str(
+        result.get("failure_mode") or ("passed" if passed else "unknown")
+    )
+    collector["task_observations"] += 1
+    if passed:
+        collector["passed_observations"] += 1
+    else:
+        collector["failed_observations"] += 1
+        _increment_count(collector["failure_modes"], failure_mode)
+
+    _record_pocket_row(
+        collector["by_task"],
+        task_id,
+        passed=passed,
+        failure_mode=failure_mode,
+        metadata={
+            "family": family,
+            "difficulty": difficulty,
+            "failure_tags": list(failure_tags),
+        },
+    )
+    _record_pocket_row(
+        collector["by_family"],
+        family,
+        passed=passed,
+        failure_mode=failure_mode,
+    )
+    _record_pocket_row(
+        collector["by_difficulty"],
+        difficulty,
+        passed=passed,
+        failure_mode=failure_mode,
+    )
+    if not failure_tags:
+        collector["missing_failure_tag_observations"] += 1
+    for tag in failure_tags:
+        _record_pocket_row(
+            collector["by_failure_tag"],
+            tag,
+            passed=passed,
+            failure_mode=failure_mode,
+        )
+
+
+def _record_pocket_row(
+    bucket: dict[str, dict[str, Any]],
+    name: str,
+    *,
+    passed: bool,
+    failure_mode: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    row = bucket.setdefault(
+        name,
+        {
+            "name": name,
+            "observations": 0,
+            "passed": 0,
+            "failed": 0,
+            "failure_modes": {},
+        },
+    )
+    row["observations"] += 1
+    if metadata:
+        for key, value in metadata.items():
+            if key not in row or not row[key]:
+                row[key] = value
+    if passed:
+        row["passed"] += 1
+    else:
+        row["failed"] += 1
+        _increment_count(row["failure_modes"], failure_mode)
+
+
+def _finalize_failure_pocket(collector: Mapping[str, Any]) -> dict[str, Any]:
+    task_observations = int(collector.get("task_observations", 0) or 0)
+    passed_observations = int(collector.get("passed_observations", 0) or 0)
+    failed_observations = int(collector.get("failed_observations", 0) or 0)
+    by_task = _finalize_pocket_rows(
+        collector.get("by_task"),
+        name_key="task_id",
+    )
+    by_family = _finalize_pocket_rows(collector.get("by_family"))
+    by_difficulty = _finalize_pocket_rows(collector.get("by_difficulty"))
+    by_failure_tag = _finalize_pocket_rows(collector.get("by_failure_tag"))
+    return {
+        "candidate": collector.get("candidate"),
+        "runs_with_task_results": int(
+            collector.get("runs_with_task_results", 0) or 0
+        ),
+        "task_observations": task_observations,
+        "passed_observations": passed_observations,
+        "failed_observations": failed_observations,
+        "pass_rate": (
+            passed_observations / task_observations
+            if task_observations
+            else None
+        ),
+        "top_failure_modes": _top_counts(collector.get("failure_modes")),
+        "missing_failure_tag_observations": int(
+            collector.get("missing_failure_tag_observations", 0) or 0
+        ),
+        "by_task": by_task,
+        "weakest_tasks": by_task[:10],
+        "strongest_tasks": _strongest_pocket_rows(by_task)[:10],
+        "by_family": by_family,
+        "by_difficulty": by_difficulty,
+        "by_failure_tag": by_failure_tag,
+    }
+
+
+def _finalize_pocket_rows(value: Any, *, name_key: str = "name") -> list[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in value.values():
+        if not isinstance(row, Mapping):
+            continue
+        observations = int(row.get("observations", 0) or 0)
+        passed = int(row.get("passed", 0) or 0)
+        failed = int(row.get("failed", 0) or 0)
+        name = str(row.get("name", ""))
+        finalized = {
+            name_key: name,
+            "observations": observations,
+            "passed": passed,
+            "failed": failed,
+            "pass_rate": passed / observations if observations else None,
+            "failure_rate": failed / observations if observations else None,
+            "top_failure_modes": _top_counts(row.get("failure_modes")),
+        }
+        for key in ("family", "difficulty", "failure_tags"):
+            if key in row:
+                finalized[key] = row[key]
+        rows.append(finalized)
+    rows.sort(key=_weakest_pocket_key)
+    return rows
+
+
+def _failure_pocket_deltas_vs_baseline(
+    by_candidate: Sequence[Mapping[str, Any]],
+    baseline_candidate: str | None,
+) -> list[dict[str, Any]]:
+    if baseline_candidate is None:
+        return []
+    pockets = {
+        str(pocket.get("candidate", "")): pocket
+        for pocket in by_candidate
+        if isinstance(pocket, Mapping)
+    }
+    baseline = pockets.get(baseline_candidate)
+    if baseline is None:
+        return []
+    deltas: list[dict[str, Any]] = []
+    for candidate, pocket in sorted(pockets.items()):
+        if candidate == baseline_candidate:
+            continue
+        task_deltas = _pocket_delta_rows(
+            pocket.get("by_task"),
+            baseline.get("by_task"),
+            name_key="task_id",
+        )
+        deltas.append(
+            {
+                "candidate": candidate,
+                "baseline": baseline_candidate,
+                "tasks_worse_than_baseline": _lowest_delta_rows(task_deltas)[:10],
+                "tasks_better_than_baseline": _highest_delta_rows(task_deltas)[:10],
+                "by_family": _pocket_delta_rows(
+                    pocket.get("by_family"),
+                    baseline.get("by_family"),
+                ),
+                "by_difficulty": _pocket_delta_rows(
+                    pocket.get("by_difficulty"),
+                    baseline.get("by_difficulty"),
+                ),
+                "by_failure_tag": _pocket_delta_rows(
+                    pocket.get("by_failure_tag"),
+                    baseline.get("by_failure_tag"),
+                ),
+            }
+        )
+    return deltas
+
+
+def _pocket_delta_rows(
+    candidate_rows: Any,
+    baseline_rows: Any,
+    *,
+    name_key: str = "name",
+) -> list[dict[str, Any]]:
+    candidate_by_name = _rows_by_name(candidate_rows, name_key=name_key)
+    baseline_by_name = _rows_by_name(baseline_rows, name_key=name_key)
+    rows: list[dict[str, Any]] = []
+    for name in sorted(set(candidate_by_name) | set(baseline_by_name)):
+        candidate = candidate_by_name.get(name, {})
+        baseline = baseline_by_name.get(name, {})
+        candidate_rate = _optional_float(candidate.get("pass_rate"))
+        baseline_rate = _optional_float(baseline.get("pass_rate"))
+        row = {
+            name_key: name,
+            "candidate_pass_rate": candidate_rate,
+            "baseline_pass_rate": baseline_rate,
+            "pass_rate_delta": _optional_delta(candidate_rate, baseline_rate),
+            "candidate_observations": int(candidate.get("observations", 0) or 0),
+            "baseline_observations": int(baseline.get("observations", 0) or 0),
+            "candidate_failed": int(candidate.get("failed", 0) or 0),
+            "baseline_failed": int(baseline.get("failed", 0) or 0),
+        }
+        for key in ("family", "difficulty", "failure_tags"):
+            if key in candidate:
+                row[key] = candidate[key]
+            elif key in baseline:
+                row[key] = baseline[key]
+        rows.append(row)
+    rows.sort(key=_pocket_delta_key)
+    return rows
+
+
+def _rows_by_name(value: Any, *, name_key: str) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return {}
+    rows: dict[str, Mapping[str, Any]] = {}
+    for row in value:
+        if not isinstance(row, Mapping):
+            continue
+        name = row.get(name_key)
+        if name is not None:
+            rows[str(name)] = row
+    return rows
+
+
+def _weakest_pocket_key(row: Mapping[str, Any]) -> tuple[float, int, int, str]:
+    pass_rate = _optional_float(row.get("pass_rate"))
+    if pass_rate is None:
+        pass_rate = 1.0
+    return (
+        pass_rate,
+        -int(row.get("failed", 0) or 0),
+        -int(row.get("observations", 0) or 0),
+        str(row.get("task_id") or row.get("name") or ""),
+    )
+
+
+def _strongest_pocket_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            -(_optional_float(row.get("pass_rate")) or 0.0),
+            -int(row.get("observations", 0) or 0),
+            str(row.get("task_id") or row.get("name") or ""),
+        ),
+    )
+
+
+def _lowest_delta_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in rows
+        if _optional_float(row.get("pass_rate_delta")) is not None
+        and (_optional_float(row.get("pass_rate_delta")) or 0.0) < 0.0
+    ]
+
+
+def _highest_delta_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            dict(row)
+            for row in rows
+            if _optional_float(row.get("pass_rate_delta")) is not None
+            and (_optional_float(row.get("pass_rate_delta")) or 0.0) > 0.0
+        ),
+        key=lambda row: (
+            -(_optional_float(row.get("pass_rate_delta")) or 0.0),
+            -int(row.get("candidate_observations", 0) or 0),
+            str(row.get("task_id") or row.get("name") or ""),
+        ),
+    )
+
+
+def _pocket_delta_key(row: Mapping[str, Any]) -> tuple[float, int, str]:
+    delta = _optional_float(row.get("pass_rate_delta"))
+    if delta is None:
+        delta = 0.0
+    return (
+        delta,
+        -int(row.get("candidate_observations", 0) or 0),
+        str(row.get("task_id") or row.get("name") or ""),
+    )
+
+
+def _top_counts(value: Any, *, limit: int = 5) -> list[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return []
+    rows = [
+        {"name": str(name), "count": int(count)}
+        for name, count in value.items()
+        if isinstance(count, int | float) and count > 0
+    ]
+    rows.sort(key=lambda row: (-int(row["count"]), str(row["name"])))
+    return rows[:limit]
+
+
+def _increment_count(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
 
 
 def _weakest_breakdowns(value: Any, *, limit: int = 3) -> list[dict[str, Any]]:
@@ -1147,6 +1540,12 @@ def _string_tuple_value(
     if not all(isinstance(item, str) for item in value):
         raise ValueError(f"foundry_harness_{key}_must_be_string_list")
     return tuple(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
 
 
 def _is_safe_candidate_name(value: str) -> bool:

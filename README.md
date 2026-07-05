@@ -311,9 +311,12 @@ python examples\foundry_harness_analyze.py --runs .codex\foundry-runs --run-pref
 ```
 
 Diagnostics include winner, deltas versus the static baseline, budget exhaustion,
-weakest held-out families/difficulties, non-saturation state, and exact held-out
-task failures when the run artifact includes per-task results. They also include
-`promotion_readiness`, which defaults to holding a candidate unless it has at
+weakest held-out families/difficulties/failure tags, non-saturation state, and
+exact held-out task failures when the run artifact includes per-task results.
+They also include `failure_pockets`, which aggregates repeated runs by task,
+family, difficulty, and failure tag, then reports which tasks got better or
+worse versus the static baseline. `promotion_readiness` defaults to holding a
+candidate unless it has at
 least three successful runs, beats the static baseline median score, and leads
 the baseline pairwise comparison by at least 60%.
 

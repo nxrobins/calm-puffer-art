@@ -501,6 +501,13 @@ class FoundryHarnessTests(unittest.TestCase):
                                     "tasks": 8.0,
                                 }
                             },
+                            "heldout/by_failure_tag": {
+                                "none_sentinel": {
+                                    "pass_rate": pass_rate,
+                                    "passed": pass_rate * 2.0,
+                                    "tasks": 2.0,
+                                }
+                            },
                             "heldout/task_results": task_results or [],
                         }
                     }
@@ -546,6 +553,24 @@ class FoundryHarnessTests(unittest.TestCase):
                 score=0.3,
                 pass_rate=0.9,
                 exhausted=0.0,
+                task_results=[
+                    {
+                        "task_id": "repair_none_sentinel",
+                        "family": "real_bug_pattern",
+                        "difficulty": "2",
+                        "failure_tags": ["none_sentinel"],
+                        "passed": True,
+                        "failure_mode": "passed",
+                    },
+                    {
+                        "task_id": "repair_schema_errors",
+                        "family": "data_model",
+                        "difficulty": "4",
+                        "failure_tags": ["parser_escape"],
+                        "passed": False,
+                        "failure_mode": "unit_test_failed",
+                    },
+                ],
             )
             write_run(
                 runs_dir / "frontier-full",
@@ -559,8 +584,17 @@ class FoundryHarnessTests(unittest.TestCase):
                         "task_id": "repair_none_sentinel",
                         "family": "real_bug_pattern",
                         "difficulty": "2",
+                        "failure_tags": ["none_sentinel"],
                         "passed": False,
                         "failure_mode": "unit_test_failed",
+                    },
+                    {
+                        "task_id": "repair_schema_errors",
+                        "family": "data_model",
+                        "difficulty": "4",
+                        "failure_tags": ["parser_escape"],
+                        "passed": True,
+                        "failure_mode": "passed",
                     }
                 ],
             )
@@ -583,6 +617,38 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(
             full_diag["heldout_task_failures"][0]["task_id"],
             "repair_none_sentinel",
+        )
+        self.assertEqual(
+            full_diag["heldout_task_failures"][0]["failure_tags"],
+            ["none_sentinel"],
+        )
+        self.assertEqual(full_diag["weakest_failure_tags"][0]["name"], "none_sentinel")
+        pockets = payload["failure_pockets"]
+        self.assertEqual(pockets["baseline_candidate"], "frontier_baseline")
+        full_pocket = next(
+            item
+            for item in pockets["by_candidate"]
+            if item["candidate"] == "frontier_full_trinity"
+        )
+        self.assertEqual(full_pocket["task_observations"], 2)
+        self.assertEqual(full_pocket["by_failure_tag"][0]["name"], "none_sentinel")
+        full_delta = pockets["deltas_vs_baseline"][0]
+        self.assertEqual(full_delta["candidate"], "frontier_full_trinity")
+        self.assertEqual(
+            full_delta["tasks_worse_than_baseline"][0]["task_id"],
+            "repair_none_sentinel",
+        )
+        self.assertAlmostEqual(
+            full_delta["tasks_worse_than_baseline"][0]["pass_rate_delta"],
+            -1.0,
+        )
+        self.assertEqual(
+            full_delta["tasks_better_than_baseline"][0]["task_id"],
+            "repair_schema_errors",
+        )
+        self.assertAlmostEqual(
+            full_delta["tasks_better_than_baseline"][0]["pass_rate_delta"],
+            1.0,
         )
 
     def test_batch_cli_missing_env_writes_replicate_artifacts_and_summary(self):
