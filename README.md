@@ -267,6 +267,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
 - `frontier_scheduler_only.json`: objective scheduler with token-only actions on the frontier hard ladder
 - `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
+- `frontier_task_metadata.json`: experimental full-trinity prompt-policy probe with metadata only
 - `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
 - `frontier_data_model_guardrails.json`: experimental full-trinity prompt-policy probe for data-model failures
 
@@ -348,6 +349,7 @@ python examples\foundry_harness_batch.py --candidates frontier_baseline frontier
 Run prompt-policy probes separately before considering them for promotion:
 
 ```powershell
+python examples\foundry_harness_batch.py --candidates frontier_task_metadata --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
 ```

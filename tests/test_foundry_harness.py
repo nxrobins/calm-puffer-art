@@ -161,6 +161,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_baseline = load_foundry_harness_manifest("frontier_baseline")
         frontier_scheduler = load_foundry_harness_manifest("frontier_scheduler_only")
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
+        frontier_task_metadata = load_foundry_harness_manifest(
+            "frontier_task_metadata"
+        )
         frontier_tag_guardrails = load_foundry_harness_manifest(
             "frontier_failure_tag_guardrails"
         )
@@ -179,10 +182,18 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_baseline.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.task_split, "frontier_hard")
         self.assertEqual(frontier_full.task_split, "frontier_hard")
+        self.assertEqual(frontier_task_metadata.task_split, "frontier_hard")
         self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
+        self.assertEqual(frontier_task_metadata.primary_condition, "full_trinity")
+        self.assertEqual(frontier_task_metadata.conditions, ("full_trinity",))
+        self.assertEqual(
+            frontier_task_metadata.prompt_context_policy,
+            "task_metadata",
+        )
+        self.assertFalse(frontier_task_metadata.promotion_eligible)
         self.assertEqual(frontier_tag_guardrails.primary_condition, "full_trinity")
         self.assertEqual(frontier_tag_guardrails.conditions, ("full_trinity",))
         self.assertEqual(
