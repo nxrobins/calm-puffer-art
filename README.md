@@ -217,6 +217,7 @@ generated code in a separate timeout-bounded subprocess. It compares:
 
 - `static_art`: fixed token-level round-robin baseline
 - `scheduler_only`: objective scheduler with token actions
+- `chunk2_only`: objective scheduler with token and chunk2 actions
 - `full_trinity`: objective scheduler plus token/chunk semantic action units
 
 Train-step ablation:
@@ -266,6 +267,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `hard_full_trinity.json`: full-trinity profile on harder repair tasks
 - `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
 - `frontier_scheduler_only.json`: objective scheduler with token-only actions on the frontier hard ladder
+- `frontier_chunk2_only.json`: experimental objective scheduler probe with token and chunk2 actions only
 - `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
 - `frontier_task_metadata.json`: experimental full-trinity prompt-policy probe with metadata only
 - `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
@@ -333,8 +335,8 @@ baseline pairwise comparison by at least 60%. `next_hypotheses` converts those
 same artifacts into deterministic follow-up actions such as running missing
 replicates, studying unstable lift, keeping failed probes out of promotion,
 running the existing coverage-gap allocation probe, rejecting replicated probes
-that underperform baseline, or designing a new probe around shared unsolved
-held-out pockets. Shared-pocket
+that underperform baseline, running codec-stability probes for unstable lift, or
+designing a new probe around shared unsolved held-out pockets. Shared-pocket
 diagnostics include dominant failure modes and classify whether the next probe
 should focus on task allocation/coverage, repair quality, output contracts, or
 runtime/verifier hardening.
@@ -364,6 +366,7 @@ python examples\foundry_harness_batch.py --candidates frontier_task_metadata --r
 python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_coverage_gap_first --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_chunk2_only --replicates 3 --json
 ```
 
 For local credentials or deployment names that should not be checked into a

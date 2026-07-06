@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
+    DEFAULT_FOUNDRY_CONDITIONS,
     DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
     DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
     DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
@@ -351,6 +352,10 @@ class FoundryCodegenTests(unittest.TestCase):
             sorted(result["conditions"]),
             ["full_trinity", "scheduler_only", "static_art"],
         )
+        self.assertEqual(
+            DEFAULT_FOUNDRY_CONDITIONS,
+            ("static_art", "scheduler_only", "full_trinity"),
+        )
         self.assertIn("winning_condition_by_accounted_north_star", result)
         for condition in result["conditions"].values():
             self.assertIn(
@@ -361,6 +366,34 @@ class FoundryCodegenTests(unittest.TestCase):
             self.assertIn("foundry/codec/token/pulls", condition)
             self.assertIn("foundry/codec/chunk2/pulls", condition)
             self.assertIn("foundry/codec/chunk4/pulls", condition)
+
+    def test_fake_foundry_chunk2_only_condition_omits_chunk4_pulls(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            self.assertEqual(name, "chunk2_only")
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=2,
+                    task_limit=1,
+                    model_call_budget=2,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=25.0,
+                conditions=("chunk2_only",),
+                client_factory=client_factory,
+            )
+        )
+
+        condition = result["conditions"]["chunk2_only"]
+        self.assertTrue(result["ok"])
+        self.assertGreater(condition["foundry/codec/chunk2/pulls"], 0.0)
+        self.assertEqual(condition["foundry/codec/chunk4/pulls"], 0.0)
+        self.assertEqual(
+            result["winning_condition_by_accounted_north_star"],
+            "chunk2_only",
+        )
 
     def test_fake_foundry_budget_race_reports_performance_and_cost_contract(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):

@@ -172,6 +172,7 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_baseline = load_foundry_harness_manifest("frontier_baseline")
         frontier_scheduler = load_foundry_harness_manifest("frontier_scheduler_only")
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
+        frontier_chunk2 = load_foundry_harness_manifest("frontier_chunk2_only")
         frontier_task_metadata = load_foundry_harness_manifest(
             "frontier_task_metadata"
         )
@@ -196,12 +197,17 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_baseline.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.task_split, "frontier_hard")
         self.assertEqual(frontier_full.task_split, "frontier_hard")
+        self.assertEqual(frontier_chunk2.task_split, "frontier_hard")
         self.assertEqual(frontier_task_metadata.task_split, "frontier_hard")
         self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_coverage_gap.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
+        self.assertEqual(frontier_chunk2.primary_condition, "chunk2_only")
+        self.assertEqual(frontier_chunk2.conditions, ("chunk2_only",))
+        self.assertEqual(frontier_chunk2.action_codecs, ("token", "chunk2"))
+        self.assertFalse(frontier_chunk2.promotion_eligible)
         self.assertEqual(frontier_task_metadata.primary_condition, "full_trinity")
         self.assertEqual(frontier_task_metadata.conditions, ("full_trinity",))
         self.assertEqual(
@@ -1000,6 +1006,11 @@ class FoundryHarnessTests(unittest.TestCase):
         )
 
         actions = {action["action"]: action for action in payload["actions"]}
+        self.assertIn("run_existing_stability_candidate", actions)
+        self.assertEqual(
+            actions["run_existing_stability_candidate"]["candidate"],
+            "frontier_chunk2_only",
+        )
         self.assertIn("reject_existing_targeted_candidate", actions)
         rejection = actions["reject_existing_targeted_candidate"]
         self.assertEqual(rejection["candidate"], "frontier_coverage_gap_first")
@@ -1007,6 +1018,69 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(
             rejection["reason"],
             "coverage_gap_probe_underperformed_baseline",
+        )
+        self.assertLess(rejection["median_score_delta_vs_baseline"], 0.0)
+
+    def test_next_hypotheses_rejects_replicated_chunk2_probe_below_baseline(self):
+        comparison = {
+            "candidate_aggregates": [
+                {
+                    "candidate": "frontier_baseline",
+                    "primary_condition": "static_art",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.2,
+                },
+                {
+                    "candidate": "frontier_full_trinity",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.25,
+                },
+                {
+                    "candidate": "frontier_chunk2_only",
+                    "primary_condition": "chunk2_only",
+                    "promotion_eligible": False,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.1,
+                },
+            ],
+            "candidate_pairwise": [
+                {
+                    "left_candidate": "frontier_baseline",
+                    "right_candidate": "frontier_full_trinity",
+                    "pair_count": 9,
+                    "left_win_rate": 0.5555555555555556,
+                    "right_win_rate": 0.4444444444444444,
+                    "leader_candidate": "frontier_baseline",
+                }
+            ],
+        }
+        readiness = foundry_harness_promotion_readiness(comparison)
+        failure_pockets = {
+            "baseline_candidate": "frontier_baseline",
+            "by_candidate": [],
+            "deltas_vs_baseline": [],
+        }
+
+        payload = _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            readiness,
+        )
+
+        actions = {action["action"]: action for action in payload["actions"]}
+        self.assertIn("reject_existing_stability_candidate", actions)
+        rejection = actions["reject_existing_stability_candidate"]
+        self.assertEqual(rejection["candidate"], "frontier_chunk2_only")
+        self.assertEqual(rejection["baseline"], "frontier_baseline")
+        self.assertEqual(
+            rejection["reason"],
+            "chunk2_only_probe_underperformed_baseline",
         )
         self.assertLess(rejection["median_score_delta_vs_baseline"], 0.0)
 

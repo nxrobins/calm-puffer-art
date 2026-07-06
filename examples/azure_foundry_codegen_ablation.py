@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 from calm_puffer_art.foundry_codegen import (
     DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS,
     DEFAULT_FOUNDRY_BUDGET_DOLLAR_SECONDS,
+    DEFAULT_FOUNDRY_CONDITIONS,
     DEFAULT_FOUNDRY_DEPLOYMENT,
     DEFAULT_FOUNDRY_ENV_PATH,
     DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS,
@@ -249,7 +250,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conditions",
         nargs="+",
-        default=list(FOUNDRY_CONDITIONS),
+        default=list(DEFAULT_FOUNDRY_CONDITIONS),
         choices=FOUNDRY_CONDITIONS,
         help="Condition preset(s) to execute.",
     )

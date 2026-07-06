@@ -57,8 +57,9 @@ FOUNDRY_HARNESS_FAILURE_CATEGORIES = (
     "scheduler_control_failure",
 )
 FOUNDRY_COVERAGE_GAP_CANDIDATE = "frontier_coverage_gap_first"
+FOUNDRY_CHUNK2_ONLY_CANDIDATE = "frontier_chunk2_only"
 
-_CONDITION_ORDER = ("static_art", "scheduler_only", "full_trinity")
+_CONDITION_ORDER = ("static_art", "scheduler_only", "chunk2_only", "full_trinity")
 _MANIFEST_KEYS = {
     "action_codecs",
     "action_unit_dollar_seconds",
@@ -1430,6 +1431,13 @@ def _next_hypotheses_payload(
                     ),
                 }
             )
+            if candidate == "frontier_full_trinity":
+                actions.append(
+                    _stability_candidate_action(
+                        aggregate_by_candidate,
+                        str(promotion_readiness.get("baseline_candidate") or ""),
+                    )
+                )
         elif decision.get("status") == "hold":
             actions.append(
                 {
@@ -1594,6 +1602,77 @@ def _targeted_candidate_action(
         "baseline_ranking_score_median": baseline_median,
         "target_tasks": target_tasks,
         "target_failure_tags": target_failure_tags,
+    }
+
+
+def _stability_candidate_action(
+    aggregate_by_candidate: Mapping[str, Mapping[str, Any]],
+    baseline_candidate: str,
+) -> dict[str, Any]:
+    aggregate = aggregate_by_candidate.get(FOUNDRY_CHUNK2_ONLY_CANDIDATE)
+    if not aggregate:
+        return {
+            "action": "run_existing_stability_candidate",
+            "candidate": FOUNDRY_CHUNK2_ONLY_CANDIDATE,
+            "reason": "full_trinity_unstable_lift_probe_without_successful_runs",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "codec_action_space_stability",
+            "recommended_successful_runs": 3,
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_CHUNK2_ONLY_CANDIDATE} --replicates 3 --json"
+            ),
+        }
+
+    ok_runs = int(aggregate.get("ok_runs", 0) or 0)
+    if ok_runs < 3:
+        return {
+            "action": "replicate_existing_stability_candidate",
+            "candidate": FOUNDRY_CHUNK2_ONLY_CANDIDATE,
+            "reason": "chunk2_only_probe_needs_replicates",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "codec_action_space_stability",
+            "ok_runs": ok_runs,
+            "additional_successful_runs": max(0, 3 - ok_runs),
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_CHUNK2_ONLY_CANDIDATE} --replicates "
+                f"{max(0, 3 - ok_runs)} --json"
+            ),
+        }
+
+    candidate_median = _optional_float(aggregate.get("ranking_score_median"))
+    baseline_aggregate = aggregate_by_candidate.get(baseline_candidate, {})
+    baseline_median = _optional_float(
+        baseline_aggregate.get("ranking_score_median")
+    )
+    if (
+        candidate_median is not None
+        and baseline_median is not None
+        and candidate_median <= baseline_median
+    ):
+        return {
+            "action": "reject_existing_stability_candidate",
+            "candidate": FOUNDRY_CHUNK2_ONLY_CANDIDATE,
+            "baseline": baseline_candidate,
+            "reason": "chunk2_only_probe_underperformed_baseline",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "codec_action_space_stability",
+            "ok_runs": ok_runs,
+            "ranking_score_median": candidate_median,
+            "baseline_ranking_score_median": baseline_median,
+            "median_score_delta_vs_baseline": candidate_median - baseline_median,
+        }
+
+    return {
+        "action": "study_existing_stability_candidate",
+        "candidate": FOUNDRY_CHUNK2_ONLY_CANDIDATE,
+        "reason": "chunk2_only_probe_has_replicates",
+        "candidate_scope": "experimental_not_promotion_eligible",
+        "suggested_lever": "codec_action_space_stability",
+        "ok_runs": ok_runs,
+        "ranking_score_median": candidate_median,
+        "baseline_ranking_score_median": baseline_median,
     }
 
 

@@ -75,7 +75,13 @@ FOUNDRY_COVERAGE_GAP_TASK_IDS = (
     "repair_topological_layers",
     "repair_lru_cache_trace",
 )
-FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
+DEFAULT_FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
+FOUNDRY_CONDITIONS = (
+    "static_art",
+    "scheduler_only",
+    "chunk2_only",
+    "full_trinity",
+)
 FOUNDRY_TASK_FAMILIES = (
     "sequence",
     "string_parse",
@@ -821,6 +827,19 @@ async def _run_foundry_named_condition(
             action_codecs=[TokenActionCodec()],
             client_factory=client_factory,
         )
+    if name == "chunk2_only":
+        return await _run_foundry_condition(
+            name=name,
+            config=config,
+            tasks=tasks,
+            scheduler=_foundry_scheduler(budget_dollar_seconds),
+            action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=2),
+            action_codecs=[
+                TokenActionCodec(),
+                ChunkActionCodec(chunk_size=2),
+            ],
+            client_factory=client_factory,
+        )
     if name == "full_trinity":
         return await _run_foundry_condition(
             name=name,
@@ -1054,7 +1073,7 @@ def _normalize_foundry_conditions(
     conditions: Sequence[str] | None,
 ) -> tuple[str, ...]:
     if conditions is None:
-        return FOUNDRY_CONDITIONS
+        return DEFAULT_FOUNDRY_CONDITIONS
     normalized: list[str] = []
     for condition in conditions:
         name = str(condition)
