@@ -85,6 +85,7 @@ FOUNDRY_CONDITIONS = (
     "static_art",
     "scheduler_only",
     "chunk2_only",
+    "chunk4_only",
     "full_trinity",
 )
 FOUNDRY_TASK_FAMILIES = (
@@ -842,6 +843,19 @@ async def _run_foundry_named_condition(
             action_codecs=[
                 TokenActionCodec(),
                 ChunkActionCodec(chunk_size=2),
+            ],
+            client_factory=client_factory,
+        )
+    if name == "chunk4_only":
+        return await _run_foundry_condition(
+            name=name,
+            config=config,
+            tasks=tasks,
+            scheduler=_foundry_scheduler(budget_dollar_seconds),
+            action_space=AdaptiveActionSpace(min_chunk_size=4, max_chunk_size=4),
+            action_codecs=[
+                TokenActionCodec(),
+                ChunkActionCodec(chunk_size=4),
             ],
             client_factory=client_factory,
         )

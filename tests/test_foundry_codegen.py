@@ -396,6 +396,34 @@ class FoundryCodegenTests(unittest.TestCase):
             "chunk2_only",
         )
 
+    def test_fake_foundry_chunk4_only_condition_omits_chunk2_pulls(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            self.assertEqual(name, "chunk4_only")
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=2,
+                    task_limit=1,
+                    model_call_budget=2,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=25.0,
+                conditions=("chunk4_only",),
+                client_factory=client_factory,
+            )
+        )
+
+        condition = result["conditions"]["chunk4_only"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(condition["foundry/codec/chunk2/pulls"], 0.0)
+        self.assertGreater(condition["foundry/codec/chunk4/pulls"], 0.0)
+        self.assertEqual(
+            result["winning_condition_by_accounted_north_star"],
+            "chunk4_only",
+        )
+
     def test_fake_foundry_budget_race_reports_performance_and_cost_contract(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):
             return _FakeClient()
