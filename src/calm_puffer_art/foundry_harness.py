@@ -56,6 +56,7 @@ FOUNDRY_HARNESS_FAILURE_CATEGORIES = (
     "scheduler_stale_batch",
     "scheduler_control_failure",
 )
+FOUNDRY_COVERAGE_GAP_CANDIDATE = "frontier_coverage_gap_first"
 
 _CONDITION_ORDER = ("static_art", "scheduler_only", "full_trinity")
 _MANIFEST_KEYS = {
@@ -1479,17 +1480,11 @@ def _next_hypotheses_payload(
     ):
         suggested_lever = _suggested_candidate_lever(shared_failure_pockets)
         actions.append(
-            {
-                "action": "design_targeted_candidate",
-                "reason": "eligible_candidates_share_unsolved_heldout_pockets",
-                "candidate_scope": "new_probe_not_promotion_eligible_until_replicated",
-                "suggested_lever": suggested_lever,
-                "target_tasks": shared_failure_pockets.get("tasks", [])[:5],
-                "target_failure_tags": shared_failure_pockets.get(
-                    "failure_tags",
-                    [],
-                )[:5],
-            }
+            _targeted_candidate_action(
+                suggested_lever,
+                shared_failure_pockets,
+                aggregate_by_candidate,
+            )
         )
 
     if status == "hold" and not actions:
@@ -1505,6 +1500,74 @@ def _next_hypotheses_payload(
         "baseline_candidate": baseline_candidate,
         "actions": actions,
         "shared_failure_pockets": shared_failure_pockets,
+    }
+
+
+def _targeted_candidate_action(
+    suggested_lever: str,
+    shared_failure_pockets: Mapping[str, Any],
+    aggregate_by_candidate: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    target_tasks = shared_failure_pockets.get("tasks", [])[:5]
+    target_failure_tags = shared_failure_pockets.get("failure_tags", [])[:5]
+    if suggested_lever != "task_allocation_or_budget_coverage":
+        return {
+            "action": "design_targeted_candidate",
+            "reason": "eligible_candidates_share_unsolved_heldout_pockets",
+            "candidate_scope": "new_probe_not_promotion_eligible_until_replicated",
+            "suggested_lever": suggested_lever,
+            "target_tasks": target_tasks,
+            "target_failure_tags": target_failure_tags,
+        }
+
+    aggregate = aggregate_by_candidate.get(FOUNDRY_COVERAGE_GAP_CANDIDATE)
+    if not aggregate:
+        return {
+            "action": "run_existing_targeted_candidate",
+            "candidate": FOUNDRY_COVERAGE_GAP_CANDIDATE,
+            "reason": "coverage_gap_probe_exists_without_successful_runs",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": suggested_lever,
+            "recommended_successful_runs": 3,
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_COVERAGE_GAP_CANDIDATE} --replicates 3 --json"
+            ),
+            "target_tasks": target_tasks,
+            "target_failure_tags": target_failure_tags,
+        }
+
+    ok_runs = int(aggregate.get("ok_runs", 0) or 0)
+    if ok_runs < 3:
+        return {
+            "action": "replicate_existing_targeted_candidate",
+            "candidate": FOUNDRY_COVERAGE_GAP_CANDIDATE,
+            "reason": "coverage_gap_probe_needs_replicates",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": suggested_lever,
+            "ok_runs": ok_runs,
+            "additional_successful_runs": max(0, 3 - ok_runs),
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_COVERAGE_GAP_CANDIDATE} --replicates "
+                f"{max(0, 3 - ok_runs)} --json"
+            ),
+            "target_tasks": target_tasks,
+            "target_failure_tags": target_failure_tags,
+        }
+
+    return {
+        "action": "study_existing_targeted_candidate",
+        "candidate": FOUNDRY_COVERAGE_GAP_CANDIDATE,
+        "reason": "coverage_gap_probe_has_replicates",
+        "candidate_scope": "experimental_not_promotion_eligible",
+        "suggested_lever": suggested_lever,
+        "ok_runs": ok_runs,
+        "ranking_score_median": _optional_float(
+            aggregate.get("ranking_score_median")
+        ),
+        "target_tasks": target_tasks,
+        "target_failure_tags": target_failure_tags,
     }
 
 

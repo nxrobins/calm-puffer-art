@@ -896,10 +896,18 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(actions["study_unstable_lift"]["candidate"], "full")
         self.assertIn("treat_as_experimental_probe", actions)
         self.assertEqual(actions["treat_as_experimental_probe"]["candidate"], "probe")
-        self.assertIn("design_targeted_candidate", actions)
+        self.assertIn("run_existing_targeted_candidate", actions)
         self.assertEqual(
-            actions["design_targeted_candidate"]["suggested_lever"],
+            actions["run_existing_targeted_candidate"]["candidate"],
+            "frontier_coverage_gap_first",
+        )
+        self.assertEqual(
+            actions["run_existing_targeted_candidate"]["suggested_lever"],
             "task_allocation_or_budget_coverage",
+        )
+        self.assertIn(
+            "frontier_coverage_gap_first",
+            actions["run_existing_targeted_candidate"]["command"],
         )
         self.assertEqual(
             payload["shared_failure_pockets"]["tasks"][0]["task_id"],
