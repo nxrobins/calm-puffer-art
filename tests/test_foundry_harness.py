@@ -174,6 +174,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_full = load_foundry_harness_manifest("frontier_full_trinity")
         frontier_chunk2 = load_foundry_harness_manifest("frontier_chunk2_only")
         frontier_chunk4 = load_foundry_harness_manifest("frontier_chunk4_only")
+        frontier_no_demote = load_foundry_harness_manifest(
+            "frontier_full_trinity_no_demote"
+        )
         frontier_task_metadata = load_foundry_harness_manifest(
             "frontier_task_metadata"
         )
@@ -203,6 +206,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_full.task_split, "frontier_hard")
         self.assertEqual(frontier_chunk2.task_split, "frontier_hard")
         self.assertEqual(frontier_chunk4.task_split, "frontier_hard")
+        self.assertEqual(frontier_no_demote.task_split, "frontier_hard")
         self.assertEqual(frontier_task_metadata.task_split, "frontier_hard")
         self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
@@ -218,6 +222,16 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_chunk4.conditions, ("chunk4_only",))
         self.assertEqual(frontier_chunk4.action_codecs, ("token", "chunk4"))
         self.assertFalse(frontier_chunk4.promotion_eligible)
+        self.assertEqual(
+            frontier_no_demote.primary_condition,
+            "full_trinity_no_demote",
+        )
+        self.assertEqual(frontier_no_demote.conditions, ("full_trinity_no_demote",))
+        self.assertEqual(
+            frontier_no_demote.action_codecs,
+            ("token", "chunk2", "chunk4"),
+        )
+        self.assertFalse(frontier_no_demote.promotion_eligible)
         self.assertEqual(frontier_task_metadata.primary_condition, "full_trinity")
         self.assertEqual(frontier_task_metadata.conditions, ("full_trinity",))
         self.assertEqual(
@@ -1238,6 +1252,80 @@ class FoundryHarnessTests(unittest.TestCase):
             "codec_action_space_chunk4_ablation",
         )
         self.assertIn("frontier_chunk4_only", action["command"])
+
+    def test_next_hypotheses_recommends_no_demote_after_chunk4_evidence(self):
+        comparison = {
+            "candidate_aggregates": [
+                {
+                    "candidate": "frontier_baseline",
+                    "primary_condition": "static_art",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.2,
+                },
+                {
+                    "candidate": "frontier_full_trinity",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.25,
+                },
+                {
+                    "candidate": "frontier_chunk2_only",
+                    "primary_condition": "chunk2_only",
+                    "promotion_eligible": False,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.1,
+                },
+                {
+                    "candidate": "frontier_chunk4_only",
+                    "primary_condition": "chunk4_only",
+                    "promotion_eligible": False,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.19,
+                },
+            ],
+            "candidate_pairwise": [
+                {
+                    "left_candidate": "frontier_baseline",
+                    "right_candidate": "frontier_full_trinity",
+                    "pair_count": 9,
+                    "left_win_rate": 0.5555555555555556,
+                    "right_win_rate": 0.4444444444444444,
+                    "leader_candidate": "frontier_baseline",
+                }
+            ],
+        }
+        readiness = foundry_harness_promotion_readiness(comparison)
+        failure_pockets = {
+            "baseline_candidate": "frontier_baseline",
+            "by_candidate": [],
+            "deltas_vs_baseline": [],
+        }
+
+        payload = _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            readiness,
+        )
+
+        actions = {action["action"]: action for action in payload["actions"]}
+        self.assertIn("run_existing_no_demote_candidate", actions)
+        action = actions["run_existing_no_demote_candidate"]
+        self.assertEqual(action["candidate"], "frontier_full_trinity_no_demote")
+        self.assertEqual(
+            action["reason"],
+            "full_trinity_unstable_lift_after_chunk4_probe",
+        )
+        self.assertEqual(
+            action["suggested_lever"],
+            "adaptive_action_space_demotion_ablation",
+        )
+        self.assertIn("frontier_full_trinity_no_demote", action["command"])
 
     def test_batch_cli_missing_env_writes_replicate_artifacts_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:

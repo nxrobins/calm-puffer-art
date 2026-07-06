@@ -87,6 +87,7 @@ FOUNDRY_CONDITIONS = (
     "chunk2_only",
     "chunk4_only",
     "full_trinity",
+    "full_trinity_no_demote",
 )
 FOUNDRY_TASK_FAMILIES = (
     "sequence",
@@ -866,6 +867,24 @@ async def _run_foundry_named_condition(
             tasks=tasks,
             scheduler=_foundry_scheduler(budget_dollar_seconds),
             action_space=AdaptiveActionSpace(min_chunk_size=2, max_chunk_size=4),
+            action_codecs=[
+                TokenActionCodec(),
+                ChunkActionCodec(chunk_size=2),
+                ChunkActionCodec(chunk_size=4),
+            ],
+            client_factory=client_factory,
+        )
+    if name == "full_trinity_no_demote":
+        return await _run_foundry_condition(
+            name=name,
+            config=config,
+            tasks=tasks,
+            scheduler=_foundry_scheduler(budget_dollar_seconds),
+            action_space=AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=1_000_000,
+            ),
             action_codecs=[
                 TokenActionCodec(),
                 ChunkActionCodec(chunk_size=2),

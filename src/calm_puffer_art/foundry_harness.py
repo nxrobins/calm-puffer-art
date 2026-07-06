@@ -59,6 +59,7 @@ FOUNDRY_HARNESS_FAILURE_CATEGORIES = (
 FOUNDRY_COVERAGE_GAP_CANDIDATE = "frontier_coverage_gap_first"
 FOUNDRY_CHUNK2_ONLY_CANDIDATE = "frontier_chunk2_only"
 FOUNDRY_CHUNK4_ONLY_CANDIDATE = "frontier_chunk4_only"
+FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE = "frontier_full_trinity_no_demote"
 FOUNDRY_LIFT_POCKET_CANDIDATE = "frontier_lift_pocket_first"
 
 _CONDITION_ORDER = (
@@ -67,6 +68,7 @@ _CONDITION_ORDER = (
     "chunk2_only",
     "chunk4_only",
     "full_trinity",
+    "full_trinity_no_demote",
 )
 _MANIFEST_KEYS = {
     "action_codecs",
@@ -1453,6 +1455,12 @@ def _next_hypotheses_payload(
                 )
                 if chunk4_action is not None:
                     actions.append(chunk4_action)
+                no_demote_action = _no_demote_candidate_action(
+                    aggregate_by_candidate,
+                    str(promotion_readiness.get("baseline_candidate") or ""),
+                )
+                if no_demote_action is not None:
+                    actions.append(no_demote_action)
                 if positive_task_pockets:
                     actions.append(
                         _lift_pocket_candidate_action(
@@ -1768,6 +1776,81 @@ def _chunk4_candidate_action(
         "reason": "chunk4_only_probe_has_replicates",
         "candidate_scope": "experimental_not_promotion_eligible",
         "suggested_lever": "codec_action_space_chunk4_ablation",
+        "ok_runs": ok_runs,
+        "ranking_score_median": candidate_median,
+        "baseline_ranking_score_median": baseline_median,
+    }
+
+
+def _no_demote_candidate_action(
+    aggregate_by_candidate: Mapping[str, Mapping[str, Any]],
+    baseline_candidate: str,
+) -> dict[str, Any] | None:
+    chunk4_aggregate = aggregate_by_candidate.get(FOUNDRY_CHUNK4_ONLY_CANDIDATE)
+    if not chunk4_aggregate or int(chunk4_aggregate.get("ok_runs", 0) or 0) < 3:
+        return None
+
+    aggregate = aggregate_by_candidate.get(FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE)
+    if not aggregate:
+        return {
+            "action": "run_existing_no_demote_candidate",
+            "candidate": FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE,
+            "reason": "full_trinity_unstable_lift_after_chunk4_probe",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "adaptive_action_space_demotion_ablation",
+            "recommended_successful_runs": 3,
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE} --replicates 3 --json"
+            ),
+        }
+
+    ok_runs = int(aggregate.get("ok_runs", 0) or 0)
+    if ok_runs < 3:
+        return {
+            "action": "replicate_existing_no_demote_candidate",
+            "candidate": FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE,
+            "reason": "no_demote_probe_needs_replicates",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "adaptive_action_space_demotion_ablation",
+            "ok_runs": ok_runs,
+            "additional_successful_runs": max(0, 3 - ok_runs),
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE} --replicates "
+                f"{max(0, 3 - ok_runs)} --json"
+            ),
+        }
+
+    candidate_median = _optional_float(aggregate.get("ranking_score_median"))
+    baseline_aggregate = aggregate_by_candidate.get(baseline_candidate, {})
+    baseline_median = _optional_float(
+        baseline_aggregate.get("ranking_score_median")
+    )
+    if (
+        candidate_median is not None
+        and baseline_median is not None
+        and candidate_median <= baseline_median
+    ):
+        return {
+            "action": "reject_existing_no_demote_candidate",
+            "candidate": FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE,
+            "baseline": baseline_candidate,
+            "reason": "no_demote_probe_underperformed_baseline",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "adaptive_action_space_demotion_ablation",
+            "ok_runs": ok_runs,
+            "ranking_score_median": candidate_median,
+            "baseline_ranking_score_median": baseline_median,
+            "median_score_delta_vs_baseline": candidate_median - baseline_median,
+        }
+
+    return {
+        "action": "study_existing_no_demote_candidate",
+        "candidate": FOUNDRY_FULL_TRINITY_NO_DEMOTE_CANDIDATE,
+        "reason": "no_demote_probe_has_replicates",
+        "candidate_scope": "experimental_not_promotion_eligible",
+        "suggested_lever": "adaptive_action_space_demotion_ablation",
         "ok_runs": ok_runs,
         "ranking_score_median": candidate_median,
         "baseline_ranking_score_median": baseline_median,
