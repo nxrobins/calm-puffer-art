@@ -66,6 +66,7 @@ FOUNDRY_PROMPT_CONTEXT_POLICIES = (
 FOUNDRY_TASK_ORDER_POLICIES = (
     "split_order",
     "coverage_gap_first",
+    "lift_pocket_first",
 )
 FOUNDRY_COVERAGE_GAP_TASK_IDS = (
     "repair_nested_defaults",
@@ -74,6 +75,10 @@ FOUNDRY_COVERAGE_GAP_TASK_IDS = (
     "repair_query_params",
     "repair_topological_layers",
     "repair_lru_cache_trace",
+)
+FOUNDRY_LIFT_POCKET_TASK_IDS = (
+    "repair_schedule_conflicts",
+    "repair_query_params",
 )
 DEFAULT_FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
 FOUNDRY_CONDITIONS = (
@@ -1620,22 +1625,31 @@ def _ordered_foundry_tasks(
     if task_order_policy == "split_order":
         return tuple(tasks)
     if task_order_policy == "coverage_gap_first":
-        target_rank = {
-            task_id: index
-            for index, task_id in enumerate(FOUNDRY_COVERAGE_GAP_TASK_IDS)
-        }
-        fallback_rank = len(target_rank)
-        return tuple(
-            task
-            for _, task in sorted(
-                enumerate(tasks),
-                key=lambda item: (
-                    target_rank.get(item[1].id, fallback_rank),
-                    item[0],
-                ),
-            )
-        )
+        return _priority_ordered_foundry_tasks(tasks, FOUNDRY_COVERAGE_GAP_TASK_IDS)
+    if task_order_policy == "lift_pocket_first":
+        return _priority_ordered_foundry_tasks(tasks, FOUNDRY_LIFT_POCKET_TASK_IDS)
     raise ValueError("foundry_task_order_policy_unknown")
+
+
+def _priority_ordered_foundry_tasks(
+    tasks: Sequence[PythonRepairTask],
+    priority_task_ids: Sequence[str],
+) -> tuple[PythonRepairTask, ...]:
+    target_rank = {
+        task_id: index
+        for index, task_id in enumerate(priority_task_ids)
+    }
+    fallback_rank = len(target_rank)
+    return tuple(
+        task
+        for _, task in sorted(
+            enumerate(tasks),
+            key=lambda item: (
+                target_rank.get(item[1].id, fallback_rank),
+                item[0],
+            ),
+        )
+    )
 
 
 def _limit_foundry_tasks(

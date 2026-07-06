@@ -185,6 +185,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_coverage_gap = load_foundry_harness_manifest(
             "frontier_coverage_gap_first"
         )
+        frontier_lift_pocket = load_foundry_harness_manifest(
+            "frontier_lift_pocket_first"
+        )
 
         self.assertEqual(baseline.primary_condition, "static_art")
         self.assertEqual(full.primary_condition, "full_trinity")
@@ -202,6 +205,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_coverage_gap.task_split, "frontier_hard")
+        self.assertEqual(frontier_lift_pocket.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
         self.assertEqual(frontier_chunk2.primary_condition, "chunk2_only")
@@ -237,6 +241,12 @@ class FoundryHarnessTests(unittest.TestCase):
             "repair_prompt_only",
         )
         self.assertFalse(frontier_coverage_gap.promotion_eligible)
+        self.assertEqual(
+            frontier_lift_pocket.task_order_policy,
+            "lift_pocket_first",
+        )
+        self.assertEqual(frontier_lift_pocket.primary_condition, "full_trinity")
+        self.assertFalse(frontier_lift_pocket.promotion_eligible)
         self.assertEqual(baseline.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
         self.assertEqual(full.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
 
@@ -1020,6 +1030,79 @@ class FoundryHarnessTests(unittest.TestCase):
             "coverage_gap_probe_underperformed_baseline",
         )
         self.assertLess(rejection["median_score_delta_vs_baseline"], 0.0)
+
+    def test_next_hypotheses_recommends_lift_pocket_replay_probe(self):
+        comparison = {
+            "candidate_aggregates": [
+                {
+                    "candidate": "frontier_baseline",
+                    "primary_condition": "static_art",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.2,
+                },
+                {
+                    "candidate": "frontier_full_trinity",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.25,
+                },
+            ],
+            "candidate_pairwise": [
+                {
+                    "left_candidate": "frontier_baseline",
+                    "right_candidate": "frontier_full_trinity",
+                    "pair_count": 9,
+                    "left_win_rate": 0.5555555555555556,
+                    "right_win_rate": 0.4444444444444444,
+                    "leader_candidate": "frontier_baseline",
+                }
+            ],
+        }
+        readiness = foundry_harness_promotion_readiness(comparison)
+        failure_pockets = {
+            "baseline_candidate": "frontier_baseline",
+            "by_candidate": [],
+            "deltas_vs_baseline": [
+                {
+                    "candidate": "frontier_full_trinity",
+                    "tasks_better_than_baseline": [
+                        {
+                            "task_id": "repair_schedule_conflicts",
+                            "pass_rate_delta": 1.0,
+                        },
+                        {
+                            "task_id": "repair_query_params",
+                            "pass_rate_delta": 0.5,
+                        },
+                    ],
+                    "tasks_worse_than_baseline": [],
+                }
+            ],
+        }
+
+        payload = _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            readiness,
+        )
+
+        actions = {action["action"]: action for action in payload["actions"]}
+        self.assertIn("run_existing_lift_pocket_candidate", actions)
+        action = actions["run_existing_lift_pocket_candidate"]
+        self.assertEqual(action["candidate"], "frontier_lift_pocket_first")
+        self.assertEqual(
+            action["reason"],
+            "full_trinity_unstable_lift_has_positive_task_pockets",
+        )
+        self.assertEqual(
+            action["target_tasks"],
+            ["repair_schedule_conflicts", "repair_query_params"],
+        )
+        self.assertIn("frontier_lift_pocket_first", action["command"])
 
     def test_next_hypotheses_rejects_replicated_chunk2_probe_below_baseline(self):
         comparison = {

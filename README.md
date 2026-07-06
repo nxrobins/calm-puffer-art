@@ -273,6 +273,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
 - `frontier_data_model_guardrails.json`: experimental full-trinity prompt-policy probe for data-model failures
 - `frontier_coverage_gap_first.json`: experimental full-trinity allocation probe that attempts shared coverage-gap tasks first
+- `frontier_lift_pocket_first.json`: experimental full-trinity allocation probe that replays observed positive lift pockets first
 
 Each manifest selects the condition(s) to execute through `conditions`, the
 condition used for ranking through `primary_condition`, and the workload through
@@ -289,10 +290,11 @@ preserves the base prompt, `task_metadata` adds task family/difficulty/tags,
 `failure_tag_guardrails` adds concise checklists keyed by failure tags, and
 `data_model_guardrails` adds a selective checklist only for data-model tasks.
 `task_order_policy` is a separate allocation knob. `split_order` preserves the
-checked-in split order, while `coverage_gap_first` moves the currently shared
-held-out coverage-gap tasks to the front before `task_limit` truncation and
-scenario scheduling. Coverage-gap-first candidates are experimental by default
-because they are derived from existing artifacts, not a stable promotion rule.
+checked-in split order, `coverage_gap_first` moves the currently shared held-out
+coverage-gap tasks to the front, and `lift_pocket_first` replays tasks where
+full-trinity has shown positive lift over baseline. Allocation probes are
+experimental by default because they are derived from existing artifacts, not a
+stable promotion rule.
 
 The frontier ladder is a self-contained 40-task corpus spanning sequence,
 string parsing, intervals, state machines, graphs, data models, numeric logic,
@@ -335,11 +337,12 @@ baseline pairwise comparison by at least 60%. `next_hypotheses` converts those
 same artifacts into deterministic follow-up actions such as running missing
 replicates, studying unstable lift, keeping failed probes out of promotion,
 running the existing coverage-gap allocation probe, rejecting replicated probes
-that underperform baseline, running codec-stability probes for unstable lift, or
-designing a new probe around shared unsolved held-out pockets. Shared-pocket
-diagnostics include dominant failure modes and classify whether the next probe
-should focus on task allocation/coverage, repair quality, output contracts, or
-runtime/verifier hardening.
+that underperform baseline, running codec-stability probes for unstable lift,
+running positive-lift replay probes, or designing a new probe around shared
+unsolved held-out pockets. Shared-pocket diagnostics include dominant failure
+modes and classify whether the next probe should focus on task
+allocation/coverage, repair quality, output contracts, or runtime/verifier
+hardening.
 
 Run a small replicate batch:
 
@@ -367,6 +370,7 @@ python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guard
 python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_coverage_gap_first --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_chunk2_only --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_lift_pocket_first --replicates 3 --json
 ```
 
 For local credentials or deployment names that should not be checked into a

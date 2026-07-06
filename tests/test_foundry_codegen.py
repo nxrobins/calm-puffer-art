@@ -16,6 +16,7 @@ from calm_puffer_art.foundry_codegen import (
     DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
     DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
     FOUNDRY_COVERAGE_GAP_TASK_IDS,
+    FOUNDRY_LIFT_POCKET_TASK_IDS,
     FOUNDRY_PROMPT_CONTEXT_POLICIES,
     FOUNDRY_TASK_ORDER_POLICIES,
     PythonRepairTask,
@@ -501,6 +502,7 @@ class FoundryCodegenTests(unittest.TestCase):
     def test_task_order_policy_reorders_coverage_gaps_without_changing_split(self):
         self.assertEqual(DEFAULT_FOUNDRY_TASK_ORDER_POLICY, "split_order")
         self.assertIn("coverage_gap_first", FOUNDRY_TASK_ORDER_POLICIES)
+        self.assertIn("lift_pocket_first", FOUNDRY_TASK_ORDER_POLICIES)
 
         default_selection = _selected_foundry_task_selection(
             999,
@@ -532,6 +534,32 @@ class FoundryCodegenTests(unittest.TestCase):
         self.assertEqual(
             {task.id for task in reordered_selection.heldout},
             {task.id for task in reordered_selection.train},
+        )
+
+        lift_reordered_selection = _selected_foundry_task_selection(
+            999,
+            "frontier_hard",
+            "lift_pocket_first",
+        )
+        lift_target_ids = [
+            task_id
+            for task_id in FOUNDRY_LIFT_POCKET_TASK_IDS
+            if task_id in {task.id for task in default_selection.train}
+        ]
+        self.assertEqual(
+            {task.id for task in lift_reordered_selection.train},
+            {task.id for task in default_selection.train},
+        )
+        self.assertEqual(
+            [
+                task.id
+                for task in lift_reordered_selection.train[: len(lift_target_ids)]
+            ],
+            lift_target_ids,
+        )
+        self.assertNotEqual(
+            [task.id for task in default_selection.train[: len(lift_target_ids)]],
+            lift_target_ids,
         )
 
     def test_frontier_invalid_split_and_duplicate_task_ids_are_rejected(self):

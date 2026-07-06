@@ -58,6 +58,7 @@ FOUNDRY_HARNESS_FAILURE_CATEGORIES = (
 )
 FOUNDRY_COVERAGE_GAP_CANDIDATE = "frontier_coverage_gap_first"
 FOUNDRY_CHUNK2_ONLY_CANDIDATE = "frontier_chunk2_only"
+FOUNDRY_LIFT_POCKET_CANDIDATE = "frontier_lift_pocket_first"
 
 _CONDITION_ORDER = ("static_art", "scheduler_only", "chunk2_only", "full_trinity")
 _MANIFEST_KEYS = {
@@ -1414,6 +1415,10 @@ def _next_hypotheses_payload(
             and median_delta is not None
             and median_delta > 0.0
         ):
+            positive_task_pockets = _positive_task_pockets(
+                failure_pockets,
+                candidate,
+            )
             actions.append(
                 {
                     "action": "study_unstable_lift",
@@ -1425,10 +1430,7 @@ def _next_hypotheses_payload(
                     "median_score_delta_vs_baseline": _optional_float(
                         decision.get("median_score_delta_vs_baseline")
                     ),
-                    "positive_task_pockets": _positive_task_pockets(
-                        failure_pockets,
-                        candidate,
-                    ),
+                    "positive_task_pockets": positive_task_pockets,
                 }
             )
             if candidate == "frontier_full_trinity":
@@ -1438,6 +1440,14 @@ def _next_hypotheses_payload(
                         str(promotion_readiness.get("baseline_candidate") or ""),
                     )
                 )
+                if positive_task_pockets:
+                    actions.append(
+                        _lift_pocket_candidate_action(
+                            aggregate_by_candidate,
+                            str(promotion_readiness.get("baseline_candidate") or ""),
+                            positive_task_pockets,
+                        )
+                    )
         elif decision.get("status") == "hold":
             actions.append(
                 {
@@ -1673,6 +1683,87 @@ def _stability_candidate_action(
         "ok_runs": ok_runs,
         "ranking_score_median": candidate_median,
         "baseline_ranking_score_median": baseline_median,
+    }
+
+
+def _lift_pocket_candidate_action(
+    aggregate_by_candidate: Mapping[str, Mapping[str, Any]],
+    baseline_candidate: str,
+    positive_task_pockets: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    target_tasks = [
+        str(pocket.get("task_id"))
+        for pocket in positive_task_pockets[:5]
+        if pocket.get("task_id")
+    ]
+    aggregate = aggregate_by_candidate.get(FOUNDRY_LIFT_POCKET_CANDIDATE)
+    if not aggregate:
+        return {
+            "action": "run_existing_lift_pocket_candidate",
+            "candidate": FOUNDRY_LIFT_POCKET_CANDIDATE,
+            "reason": "full_trinity_unstable_lift_has_positive_task_pockets",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "task_allocation_lift_replay",
+            "recommended_successful_runs": 3,
+            "target_tasks": target_tasks,
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_LIFT_POCKET_CANDIDATE} --replicates 3 --json"
+            ),
+        }
+
+    ok_runs = int(aggregate.get("ok_runs", 0) or 0)
+    if ok_runs < 3:
+        return {
+            "action": "replicate_existing_lift_pocket_candidate",
+            "candidate": FOUNDRY_LIFT_POCKET_CANDIDATE,
+            "reason": "lift_pocket_probe_needs_replicates",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "task_allocation_lift_replay",
+            "ok_runs": ok_runs,
+            "additional_successful_runs": max(0, 3 - ok_runs),
+            "target_tasks": target_tasks,
+            "command": (
+                "python examples\\foundry_harness_batch.py --candidates "
+                f"{FOUNDRY_LIFT_POCKET_CANDIDATE} --replicates "
+                f"{max(0, 3 - ok_runs)} --json"
+            ),
+        }
+
+    candidate_median = _optional_float(aggregate.get("ranking_score_median"))
+    baseline_aggregate = aggregate_by_candidate.get(baseline_candidate, {})
+    baseline_median = _optional_float(
+        baseline_aggregate.get("ranking_score_median")
+    )
+    if (
+        candidate_median is not None
+        and baseline_median is not None
+        and candidate_median <= baseline_median
+    ):
+        return {
+            "action": "reject_existing_lift_pocket_candidate",
+            "candidate": FOUNDRY_LIFT_POCKET_CANDIDATE,
+            "baseline": baseline_candidate,
+            "reason": "lift_pocket_probe_underperformed_baseline",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": "task_allocation_lift_replay",
+            "ok_runs": ok_runs,
+            "ranking_score_median": candidate_median,
+            "baseline_ranking_score_median": baseline_median,
+            "median_score_delta_vs_baseline": candidate_median - baseline_median,
+            "target_tasks": target_tasks,
+        }
+
+    return {
+        "action": "study_existing_lift_pocket_candidate",
+        "candidate": FOUNDRY_LIFT_POCKET_CANDIDATE,
+        "reason": "lift_pocket_probe_has_replicates",
+        "candidate_scope": "experimental_not_promotion_eligible",
+        "suggested_lever": "task_allocation_lift_replay",
+        "ok_runs": ok_runs,
+        "ranking_score_median": candidate_median,
+        "baseline_ranking_score_median": baseline_median,
+        "target_tasks": target_tasks,
     }
 
 
