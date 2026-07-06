@@ -453,6 +453,35 @@ class FoundryCodegenTests(unittest.TestCase):
             "full_trinity_no_demote",
         )
 
+    def test_fake_foundry_full_trinity_patient_demote_reports_threshold(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            self.assertEqual(name, "full_trinity_patient_demote")
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=3,
+                    task_limit=1,
+                    model_call_budget=3,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=35.0,
+                conditions=("full_trinity_patient_demote",),
+                client_factory=client_factory,
+            )
+        )
+
+        condition = result["conditions"]["full_trinity_patient_demote"]
+        self.assertTrue(result["ok"])
+        self.assertGreater(condition["foundry/codec/chunk2/pulls"], 0.0)
+        self.assertGreater(condition["foundry/codec/chunk4/pulls"], 0.0)
+        self.assertEqual(condition["action_space/demotion_min_pulls"], 4.0)
+        self.assertEqual(
+            result["winning_condition_by_accounted_north_star"],
+            "full_trinity_patient_demote",
+        )
+
     def test_fake_foundry_budget_race_reports_performance_and_cost_contract(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):
             return _FakeClient()

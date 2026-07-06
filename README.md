@@ -220,6 +220,7 @@ generated code in a separate timeout-bounded subprocess. It compares:
 - `chunk2_only`: objective scheduler with token and chunk2 actions
 - `chunk4_only`: objective scheduler with token and chunk4 actions
 - `full_trinity`: objective scheduler plus token/chunk semantic action units
+- `full_trinity_patient_demote`: full-trinity with chunk demotion delayed until four pulls
 - `full_trinity_no_demote`: full-trinity with adaptive chunk demotion disabled
 
 Train-step ablation:
@@ -272,6 +273,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `frontier_chunk2_only.json`: experimental objective scheduler probe with token and chunk2 actions only
 - `frontier_chunk4_only.json`: experimental objective scheduler probe with token and chunk4 actions only
 - `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
+- `frontier_full_trinity_patient_demote.json`: experimental full-trinity profile with adaptive chunk demotion delayed until four pulls
 - `frontier_full_trinity_no_demote.json`: experimental full-trinity profile with adaptive chunk demotion disabled
 - `frontier_task_metadata.json`: experimental full-trinity prompt-policy probe with metadata only
 - `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
@@ -344,6 +346,7 @@ running the existing coverage-gap allocation probe, rejecting replicated probes
 that underperform baseline, running codec-stability probes for unstable lift,
 running chunk4 codec ablations after replicated chunk2 evidence, running
 adaptive demotion ablations after replicated chunk4 evidence, running
+patient-demotion threshold probes after disabling demotion fails, running
 positive-lift replay probes, or designing a new probe around shared unsolved
 held-out pockets. Shared-pocket diagnostics include dominant failure modes and
 classify whether the next probe should focus on task allocation/coverage, repair
@@ -377,6 +380,7 @@ python examples\foundry_harness_batch.py --candidates frontier_coverage_gap_firs
 python examples\foundry_harness_batch.py --candidates frontier_chunk2_only --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_chunk4_only --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_full_trinity_no_demote --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_full_trinity_patient_demote --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_lift_pocket_first --replicates 3 --json
 ```
 

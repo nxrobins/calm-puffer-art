@@ -1403,6 +1403,7 @@ class AdaptiveActionSpace:
             "action_space/demotion_decision_min_observations": float(
                 self.demotion_decision_min_observations
             ),
+            "action_space/demotion_min_pulls": float(self.demotion_min_pulls),
             "action_space/demote_on_stale_feedback": (
                 1.0 if self.demote_on_stale_feedback else 0.0
             ),

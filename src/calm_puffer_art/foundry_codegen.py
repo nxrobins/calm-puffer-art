@@ -87,6 +87,7 @@ FOUNDRY_CONDITIONS = (
     "chunk2_only",
     "chunk4_only",
     "full_trinity",
+    "full_trinity_patient_demote",
     "full_trinity_no_demote",
 )
 FOUNDRY_TASK_FAMILIES = (
@@ -874,6 +875,24 @@ async def _run_foundry_named_condition(
             ],
             client_factory=client_factory,
         )
+    if name == "full_trinity_patient_demote":
+        return await _run_foundry_condition(
+            name=name,
+            config=config,
+            tasks=tasks,
+            scheduler=_foundry_scheduler(budget_dollar_seconds),
+            action_space=AdaptiveActionSpace(
+                min_chunk_size=2,
+                max_chunk_size=4,
+                demotion_min_pulls=4,
+            ),
+            action_codecs=[
+                TokenActionCodec(),
+                ChunkActionCodec(chunk_size=2),
+                ChunkActionCodec(chunk_size=4),
+            ],
+            client_factory=client_factory,
+        )
     if name == "full_trinity_no_demote":
         return await _run_foundry_condition(
             name=name,
@@ -918,6 +937,7 @@ def _foundry_summary_metrics(
         "action_space/active_codecs",
         "action_space/promotions",
         "action_space/demotions",
+        "action_space/demotion_min_pulls",
         "action_space/codec/chunk_chunk_size_2/active",
         "action_space/codec/chunk_chunk_size_4/active",
         "action_space/codec/chunk_chunk_size_4/disabled",
