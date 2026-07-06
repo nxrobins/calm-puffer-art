@@ -918,6 +918,98 @@ class FoundryHarnessTests(unittest.TestCase):
             "coverage_gap",
         )
 
+    def test_next_hypotheses_rejects_replicated_coverage_probe_below_baseline(self):
+        comparison = {
+            "candidate_aggregates": [
+                {
+                    "candidate": "frontier_baseline",
+                    "primary_condition": "static_art",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.2,
+                },
+                {
+                    "candidate": "frontier_full_trinity",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": True,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.25,
+                },
+                {
+                    "candidate": "frontier_coverage_gap_first",
+                    "primary_condition": "full_trinity",
+                    "promotion_eligible": False,
+                    "ok_runs": 3,
+                    "failure_rate": 0.0,
+                    "ranking_score_median": 0.1,
+                },
+            ],
+            "candidate_pairwise": [
+                {
+                    "left_candidate": "frontier_baseline",
+                    "right_candidate": "frontier_full_trinity",
+                    "pair_count": 9,
+                    "left_win_rate": 0.5555555555555556,
+                    "right_win_rate": 0.4444444444444444,
+                    "leader_candidate": "frontier_baseline",
+                }
+            ],
+        }
+        readiness = foundry_harness_promotion_readiness(comparison)
+        shared_task = {
+            "task_id": "repair_nested_defaults",
+            "family": "data_model",
+            "difficulty": "4",
+            "failure_tags": ["mutation", "aliasing"],
+            "observations": 3,
+            "passed": 0,
+            "failed": 3,
+            "pass_rate": 0.0,
+            "top_failure_modes": [
+                {
+                    "name": "missing_learned_solution",
+                    "count": 3,
+                }
+            ],
+        }
+        failure_pockets = {
+            "baseline_candidate": "frontier_baseline",
+            "by_candidate": [
+                {
+                    "candidate": "frontier_baseline",
+                    "by_task": [shared_task],
+                    "by_family": [],
+                    "by_failure_tag": [],
+                },
+                {
+                    "candidate": "frontier_full_trinity",
+                    "by_task": [shared_task],
+                    "by_family": [],
+                    "by_failure_tag": [],
+                },
+            ],
+            "deltas_vs_baseline": [],
+        }
+
+        payload = _next_hypotheses_payload(
+            comparison,
+            failure_pockets,
+            readiness,
+        )
+
+        actions = {action["action"]: action for action in payload["actions"]}
+        self.assertIn("reject_existing_targeted_candidate", actions)
+        rejection = actions["reject_existing_targeted_candidate"]
+        self.assertEqual(rejection["candidate"], "frontier_coverage_gap_first")
+        self.assertEqual(rejection["baseline"], "frontier_baseline")
+        self.assertEqual(
+            rejection["reason"],
+            "coverage_gap_probe_underperformed_baseline",
+        )
+        self.assertLess(rejection["median_score_delta_vs_baseline"], 0.0)
+
     def test_batch_cli_missing_env_writes_replicate_artifacts_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

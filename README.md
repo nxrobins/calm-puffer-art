@@ -332,8 +332,9 @@ three successful runs, beats the static baseline median score, and leads the
 baseline pairwise comparison by at least 60%. `next_hypotheses` converts those
 same artifacts into deterministic follow-up actions such as running missing
 replicates, studying unstable lift, keeping failed probes out of promotion,
-running the existing coverage-gap allocation probe, or designing a new probe
-around shared unsolved held-out pockets. Shared-pocket
+running the existing coverage-gap allocation probe, rejecting replicated probes
+that underperform baseline, or designing a new probe around shared unsolved
+held-out pockets. Shared-pocket
 diagnostics include dominant failure modes and classify whether the next probe
 should focus on task allocation/coverage, repair quality, output contracts, or
 runtime/verifier hardening.

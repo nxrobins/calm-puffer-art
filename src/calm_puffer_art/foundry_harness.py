@@ -1484,6 +1484,7 @@ def _next_hypotheses_payload(
                 suggested_lever,
                 shared_failure_pockets,
                 aggregate_by_candidate,
+                str(baseline_candidate or ""),
             )
         )
 
@@ -1507,6 +1508,7 @@ def _targeted_candidate_action(
     suggested_lever: str,
     shared_failure_pockets: Mapping[str, Any],
     aggregate_by_candidate: Mapping[str, Mapping[str, Any]],
+    baseline_candidate: str,
 ) -> dict[str, Any]:
     target_tasks = shared_failure_pockets.get("tasks", [])[:5]
     target_failure_tags = shared_failure_pockets.get("failure_tags", [])[:5]
@@ -1556,6 +1558,31 @@ def _targeted_candidate_action(
             "target_failure_tags": target_failure_tags,
         }
 
+    candidate_median = _optional_float(aggregate.get("ranking_score_median"))
+    baseline_aggregate = aggregate_by_candidate.get(baseline_candidate, {})
+    baseline_median = _optional_float(
+        baseline_aggregate.get("ranking_score_median")
+    )
+    if (
+        candidate_median is not None
+        and baseline_median is not None
+        and candidate_median <= baseline_median
+    ):
+        return {
+            "action": "reject_existing_targeted_candidate",
+            "candidate": FOUNDRY_COVERAGE_GAP_CANDIDATE,
+            "baseline": baseline_candidate,
+            "reason": "coverage_gap_probe_underperformed_baseline",
+            "candidate_scope": "experimental_not_promotion_eligible",
+            "suggested_lever": suggested_lever,
+            "ok_runs": ok_runs,
+            "ranking_score_median": candidate_median,
+            "baseline_ranking_score_median": baseline_median,
+            "median_score_delta_vs_baseline": candidate_median - baseline_median,
+            "target_tasks": target_tasks,
+            "target_failure_tags": target_failure_tags,
+        }
+
     return {
         "action": "study_existing_targeted_candidate",
         "candidate": FOUNDRY_COVERAGE_GAP_CANDIDATE,
@@ -1563,9 +1590,8 @@ def _targeted_candidate_action(
         "candidate_scope": "experimental_not_promotion_eligible",
         "suggested_lever": suggested_lever,
         "ok_runs": ok_runs,
-        "ranking_score_median": _optional_float(
-            aggregate.get("ranking_score_median")
-        ),
+        "ranking_score_median": candidate_median,
+        "baseline_ranking_score_median": baseline_median,
         "target_tasks": target_tasks,
         "target_failure_tags": target_failure_tags,
     }
