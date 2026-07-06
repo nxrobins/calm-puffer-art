@@ -20,11 +20,13 @@ from .foundry_codegen import (
     DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS,
     DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S,
     DEFAULT_FOUNDRY_TASK_LIMIT,
+    DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
     DEFAULT_FOUNDRY_TASK_SPLIT,
     DEFAULT_FOUNDRY_TRAIN_STEPS,
     DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
     DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
     FOUNDRY_PROMPT_CONTEXT_POLICIES,
+    FOUNDRY_TASK_ORDER_POLICIES,
     foundry_task_metadata_index,
 )
 
@@ -80,6 +82,7 @@ _MANIFEST_KEYS = {
     "run_timeout_s",
     "scheduler_mode",
     "task_limit",
+    "task_order_policy",
     "task_split",
     "telemetry_filename",
     "train_steps",
@@ -149,6 +152,7 @@ class FoundryHarnessManifest:
     verifier: str = "isolated_subprocess_unit_tests"
     retry_policy: str = "none"
     task_split: str = DEFAULT_FOUNDRY_TASK_SPLIT
+    task_order_policy: str = DEFAULT_FOUNDRY_TASK_ORDER_POLICY
     scheduler_mode: str = "full_trinity"
     action_codecs: tuple[str, ...] = ("token", "chunk2", "chunk4")
     conditions: tuple[str, ...] = ("full_trinity",)
@@ -254,6 +258,11 @@ class FoundryHarnessManifest:
                 "task_split",
                 DEFAULT_FOUNDRY_TASK_SPLIT,
             ),
+            task_order_policy=_string_value(
+                values,
+                "task_order_policy",
+                DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
+            ),
             scheduler_mode=_string_value(values, "scheduler_mode", "full_trinity"),
             action_codecs=_string_tuple_value(
                 values,
@@ -331,6 +340,7 @@ class FoundryHarnessManifest:
             "verifier",
             "retry_policy",
             "task_split",
+            "task_order_policy",
             "scheduler_mode",
             "promotion_metric",
         ):
@@ -338,6 +348,8 @@ class FoundryHarnessManifest:
                 raise ValueError(f"foundry_harness_{name}_required")
         if self.prompt_context_policy not in FOUNDRY_PROMPT_CONTEXT_POLICIES:
             raise ValueError("foundry_harness_prompt_context_policy_unknown")
+        if self.task_order_policy not in FOUNDRY_TASK_ORDER_POLICIES:
+            raise ValueError("foundry_harness_task_order_policy_unknown")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -365,6 +377,7 @@ class FoundryHarnessManifest:
             "verifier": self.verifier,
             "retry_policy": self.retry_policy,
             "task_split": self.task_split,
+            "task_order_policy": self.task_order_policy,
             "scheduler_mode": self.scheduler_mode,
             "action_codecs": list(self.action_codecs),
             "conditions": list(self.conditions),
@@ -416,6 +429,8 @@ def foundry_harness_child_args(
         str(manifest.task_limit),
         "--task-split",
         manifest.task_split,
+        "--task-order-policy",
+        manifest.task_order_policy,
         "--prompt-context-policy",
         manifest.prompt_context_policy,
         "--conditions",
@@ -486,6 +501,7 @@ def summarize_foundry_harness_result(
         "conditions_selected": list(manifest.conditions),
         "task_split": manifest.task_split,
         "prompt_context_policy": manifest.prompt_context_policy,
+        "task_order_policy": manifest.task_order_policy,
         "promotion_metric": manifest.promotion_metric,
         "promotion_eligible": manifest.promotion_eligible,
         "objective_metric": FOUNDRY_HARNESS_OBJECTIVE_METRIC,
@@ -1008,6 +1024,9 @@ def _foundry_run_diagnostics(
         "prompt_context_policy": summary.get("prompt_context_policy")
         or result.get("prompt_context_policy")
         or manifest.get("prompt_context_policy"),
+        "task_order_policy": summary.get("task_order_policy")
+        or result.get("task_order_policy")
+        or manifest.get("task_order_policy"),
         "ranking_score": _optional_float(summary.get("ranking_score")),
         "ranking_score_source": summary.get("ranking_score_source"),
         "heldout_pass_rate": _optional_float(heldout.get("heldout/pass_rate")),

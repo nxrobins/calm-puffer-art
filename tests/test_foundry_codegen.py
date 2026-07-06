@@ -13,7 +13,10 @@ from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
     DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
     DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
+    DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
+    FOUNDRY_COVERAGE_GAP_TASK_IDS,
     FOUNDRY_PROMPT_CONTEXT_POLICIES,
+    FOUNDRY_TASK_ORDER_POLICIES,
     PythonRepairTask,
     _repair_prompt,
     _selected_foundry_task_selection,
@@ -462,11 +465,51 @@ class FoundryCodegenTests(unittest.TestCase):
             },
         )
 
+    def test_task_order_policy_reorders_coverage_gaps_without_changing_split(self):
+        self.assertEqual(DEFAULT_FOUNDRY_TASK_ORDER_POLICY, "split_order")
+        self.assertIn("coverage_gap_first", FOUNDRY_TASK_ORDER_POLICIES)
+
+        default_selection = _selected_foundry_task_selection(
+            999,
+            "frontier_hard",
+        )
+        reordered_selection = _selected_foundry_task_selection(
+            999,
+            "frontier_hard",
+            "coverage_gap_first",
+        )
+        target_ids = [
+            task_id
+            for task_id in FOUNDRY_COVERAGE_GAP_TASK_IDS
+            if task_id in {task.id for task in default_selection.train}
+        ]
+
+        self.assertEqual(
+            {task.id for task in reordered_selection.train},
+            {task.id for task in default_selection.train},
+        )
+        self.assertEqual(
+            [task.id for task in reordered_selection.train[: len(target_ids)]],
+            target_ids,
+        )
+        self.assertNotEqual(
+            [task.id for task in default_selection.train[: len(target_ids)]],
+            target_ids,
+        )
+        self.assertEqual(
+            {task.id for task in reordered_selection.heldout},
+            {task.id for task in reordered_selection.train},
+        )
+
     def test_frontier_invalid_split_and_duplicate_task_ids_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "task_split"):
             AzureFoundryCodegenConfig(task_split="missing").validate()
         with self.assertRaisesRegex(ValueError, "prompt_context_policy"):
             AzureFoundryCodegenConfig(prompt_context_policy="missing").validate()
+        with self.assertRaisesRegex(ValueError, "task_order_policy"):
+            AzureFoundryCodegenConfig(task_order_policy="missing").validate()
+        with self.assertRaisesRegex(ValueError, "task_order_policy"):
+            _selected_foundry_task_selection(1, "frontier_hard", "missing")
 
         task = PythonRepairTask(
             id="duplicate",
@@ -568,6 +611,36 @@ class FoundryCodegenTests(unittest.TestCase):
         self.assertEqual(result["prompt_context_policy"], "data_model_guardrails")
         prompt = fake_clients[0].completions.calls[0]["messages"][1]["content"]
         self.assertIn("Repair this Python function.", prompt)
+
+    def test_fake_foundry_result_records_task_order_policy(self):
+        def client_factory(name: str, config: AzureFoundryCodegenConfig):
+            del name
+            self.assertEqual(config.task_order_policy, "coverage_gap_first")
+            return _FakeClient()
+
+        result = asyncio.run(
+            run_azure_foundry_budget_race(
+                config=AzureFoundryCodegenConfig(
+                    max_train_steps=1,
+                    task_limit=4,
+                    task_split="frontier_hard",
+                    task_order_policy="coverage_gap_first",
+                    model_call_budget=4,
+                    max_completion_tokens=64,
+                ),
+                budget_dollar_seconds=40.0,
+                conditions=("static_art",),
+                client_factory=client_factory,
+            )
+        )
+
+        target_ids = [
+            task_id
+            for task_id in FOUNDRY_COVERAGE_GAP_TASK_IDS
+            if task_id in result["train_task_ids"]
+        ]
+        self.assertEqual(result["task_order_policy"], "coverage_gap_first")
+        self.assertEqual(result["train_task_ids"][: len(target_ids)], target_ids)
 
     def test_fake_foundry_frontier_smoke_reports_coverage_and_non_saturation(self):
         def client_factory(name: str, config: AzureFoundryCodegenConfig):

@@ -56,11 +56,24 @@ DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS = 0.04
 DEFAULT_FOUNDRY_BUDGET_DOLLAR_SECONDS = 150.0
 DEFAULT_FOUNDRY_TASK_SPLIT = "standard"
 DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY = "repair_prompt_only"
+DEFAULT_FOUNDRY_TASK_ORDER_POLICY = "split_order"
 FOUNDRY_PROMPT_CONTEXT_POLICIES = (
     "repair_prompt_only",
     "task_metadata",
     "data_model_guardrails",
     "failure_tag_guardrails",
+)
+FOUNDRY_TASK_ORDER_POLICIES = (
+    "split_order",
+    "coverage_gap_first",
+)
+FOUNDRY_COVERAGE_GAP_TASK_IDS = (
+    "repair_nested_defaults",
+    "repair_schema_errors",
+    "repair_schedule_conflicts",
+    "repair_query_params",
+    "repair_topological_layers",
+    "repair_lru_cache_trace",
 )
 FOUNDRY_CONDITIONS = ("static_art", "scheduler_only", "full_trinity")
 FOUNDRY_TASK_FAMILIES = (
@@ -164,6 +177,7 @@ class AzureFoundryCodegenConfig:
     trainer_dollar_seconds: float = 0.35
     task_split: str = DEFAULT_FOUNDRY_TASK_SPLIT
     prompt_context_policy: str = DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY
+    task_order_policy: str = DEFAULT_FOUNDRY_TASK_ORDER_POLICY
 
     def validate(self) -> None:
         if self.max_train_steps < 1:
@@ -191,6 +205,8 @@ class AzureFoundryCodegenConfig:
             raise ValueError("foundry_task_split_unknown")
         if self.prompt_context_policy not in FOUNDRY_PROMPT_CONTEXT_POLICIES:
             raise ValueError("foundry_prompt_context_policy_unknown")
+        if self.task_order_policy not in FOUNDRY_TASK_ORDER_POLICIES:
+            raise ValueError("foundry_task_order_policy_unknown")
 
 
 class AzureFoundryCodegenPolicy:
@@ -461,6 +477,7 @@ async def run_azure_foundry_codegen_ablation(
     selection = _selected_foundry_task_selection(
         resolved.task_limit,
         resolved.task_split,
+        resolved.task_order_policy,
     )
     selected_conditions = _normalize_foundry_conditions(conditions)
     summaries: dict[str, RunSummary] = {}
@@ -487,6 +504,7 @@ async def run_azure_foundry_codegen_ablation(
         "env_path": str(resolved.env_path),
         "task_split": selection.split,
         "prompt_context_policy": resolved.prompt_context_policy,
+        "task_order_policy": resolved.task_order_policy,
         "tasks": len(selection.train),
         "heldout_tasks": len(selection.heldout),
         "train_task_ids": [task.id for task in selection.train],
@@ -537,6 +555,7 @@ async def run_azure_foundry_budget_race(
     selection = _selected_foundry_task_selection(
         resolved.task_limit,
         resolved.task_split,
+        resolved.task_order_policy,
     )
     selected_conditions = _normalize_foundry_conditions(conditions)
     summaries: dict[str, RunSummary] = {}
@@ -564,6 +583,7 @@ async def run_azure_foundry_budget_race(
         "env_path": str(resolved.env_path),
         "task_split": selection.split,
         "prompt_context_policy": resolved.prompt_context_policy,
+        "task_order_policy": resolved.task_order_policy,
         "tasks": len(selection.train),
         "heldout_tasks": len(selection.heldout),
         "train_task_ids": [task.id for task in selection.train],
@@ -1549,20 +1569,54 @@ def _foundry_rollout_dollar_seconds(
 def _selected_foundry_tasks(
     task_limit: int,
     task_split: str = DEFAULT_FOUNDRY_TASK_SPLIT,
+    task_order_policy: str = DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
 ) -> tuple[PythonRepairTask, ...]:
-    return _selected_foundry_task_selection(task_limit, task_split).train
+    return _selected_foundry_task_selection(
+        task_limit,
+        task_split,
+        task_order_policy,
+    ).train
 
 
 def _selected_foundry_task_selection(
     task_limit: int,
     task_split: str = DEFAULT_FOUNDRY_TASK_SPLIT,
+    task_order_policy: str = DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
 ) -> FoundryTaskSelection:
     if task_split not in _FOUNDRY_TASK_SPLITS:
         raise ValueError("foundry_task_split_unknown")
+    if task_order_policy not in FOUNDRY_TASK_ORDER_POLICIES:
+        raise ValueError("foundry_task_order_policy_unknown")
     train_bank, heldout_bank = _FOUNDRY_TASK_SPLITS[task_split]
-    train = _limit_foundry_tasks(train_bank, task_limit)
+    ordered_train_bank = _ordered_foundry_tasks(train_bank, task_order_policy)
+    train = _limit_foundry_tasks(ordered_train_bank, task_limit)
     heldout = _heldout_for_train(heldout_bank, train)
     return FoundryTaskSelection(split=task_split, train=train, heldout=heldout)
+
+
+def _ordered_foundry_tasks(
+    tasks: Sequence[PythonRepairTask],
+    task_order_policy: str,
+) -> tuple[PythonRepairTask, ...]:
+    if task_order_policy == "split_order":
+        return tuple(tasks)
+    if task_order_policy == "coverage_gap_first":
+        target_rank = {
+            task_id: index
+            for index, task_id in enumerate(FOUNDRY_COVERAGE_GAP_TASK_IDS)
+        }
+        fallback_rank = len(target_rank)
+        return tuple(
+            task
+            for _, task in sorted(
+                enumerate(tasks),
+                key=lambda item: (
+                    target_rank.get(item[1].id, fallback_rank),
+                    item[0],
+                ),
+            )
+        )
+    raise ValueError("foundry_task_order_policy_unknown")
 
 
 def _limit_foundry_tasks(

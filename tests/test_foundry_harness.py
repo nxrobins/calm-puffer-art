@@ -94,6 +94,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(manifest.conditions, ("full_trinity",))
         self.assertEqual(manifest.task_split, "standard")
         self.assertEqual(manifest.prompt_context_policy, "repair_prompt_only")
+        self.assertEqual(manifest.task_order_policy, "split_order")
         self.assertTrue(manifest.budget_race)
         self.assertTrue(manifest.promotion_eligible)
         self.assertIn("token", manifest.action_codecs)
@@ -105,6 +106,8 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertIn("--task-split", args)
         self.assertIn("--prompt-context-policy", args)
         self.assertIn("repair_prompt_only", args)
+        self.assertIn("--task-order-policy", args)
+        self.assertIn("split_order", args)
         self.assertIn("--conditions", args)
         self.assertIn("full_trinity", args)
         self.assertIn("--request-timeout-s", args)
@@ -152,6 +155,14 @@ class FoundryHarnessTests(unittest.TestCase):
                     "prompt_context_policy": "missing",
                 }
             )
+        with self.assertRaisesRegex(ValueError, "task_order_policy"):
+            FoundryHarnessManifest.from_mapping(
+                {
+                    "name": "bad",
+                    "deployment": "dry-run-placeholder",
+                    "task_order_policy": "missing",
+                }
+            )
 
     def test_public_candidate_manifests_parse(self):
         baseline = load_foundry_harness_manifest("baseline")
@@ -170,6 +181,9 @@ class FoundryHarnessTests(unittest.TestCase):
         frontier_guardrails = load_foundry_harness_manifest(
             "frontier_data_model_guardrails"
         )
+        frontier_coverage_gap = load_foundry_harness_manifest(
+            "frontier_coverage_gap_first"
+        )
 
         self.assertEqual(baseline.primary_condition, "static_art")
         self.assertEqual(full.primary_condition, "full_trinity")
@@ -185,6 +199,7 @@ class FoundryHarnessTests(unittest.TestCase):
         self.assertEqual(frontier_task_metadata.task_split, "frontier_hard")
         self.assertEqual(frontier_tag_guardrails.task_split, "frontier_hard")
         self.assertEqual(frontier_guardrails.task_split, "frontier_hard")
+        self.assertEqual(frontier_coverage_gap.task_split, "frontier_hard")
         self.assertEqual(frontier_scheduler.primary_condition, "scheduler_only")
         self.assertEqual(frontier_scheduler.conditions, ("scheduler_only",))
         self.assertEqual(frontier_task_metadata.primary_condition, "full_trinity")
@@ -207,6 +222,15 @@ class FoundryHarnessTests(unittest.TestCase):
             "data_model_guardrails",
         )
         self.assertFalse(frontier_guardrails.promotion_eligible)
+        self.assertEqual(
+            frontier_coverage_gap.task_order_policy,
+            "coverage_gap_first",
+        )
+        self.assertEqual(
+            frontier_coverage_gap.prompt_context_policy,
+            "repair_prompt_only",
+        )
+        self.assertFalse(frontier_coverage_gap.promotion_eligible)
         self.assertEqual(baseline.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
         self.assertEqual(full.promotion_metric, FOUNDRY_HARNESS_OBJECTIVE_METRIC)
 
@@ -522,6 +546,7 @@ class FoundryHarnessTests(unittest.TestCase):
                 "output_dir": str(path),
                 "task_split": "frontier_hard",
                 "prompt_context_policy": "data_model_guardrails",
+                "task_order_policy": "coverage_gap_first",
                 "ranking_score_source": "heldout",
                 "heldout_score": score,
                 "ranking_score": score,
@@ -665,6 +690,7 @@ class FoundryHarnessTests(unittest.TestCase):
         )
         self.assertTrue(full_diag["budget_exhausted"])
         self.assertEqual(full_diag["prompt_context_policy"], "data_model_guardrails")
+        self.assertEqual(full_diag["task_order_policy"], "coverage_gap_first")
         self.assertEqual(
             full_diag["heldout_task_failures"][0]["task_id"],
             "repair_none_sentinel",

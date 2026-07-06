@@ -270,6 +270,7 @@ Checked-in candidates live in `harnesses/foundry/`:
 - `frontier_task_metadata.json`: experimental full-trinity prompt-policy probe with metadata only
 - `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
 - `frontier_data_model_guardrails.json`: experimental full-trinity prompt-policy probe for data-model failures
+- `frontier_coverage_gap_first.json`: experimental full-trinity allocation probe that attempts shared coverage-gap tasks first
 
 Each manifest selects the condition(s) to execute through `conditions`, the
 condition used for ranking through `primary_condition`, and the workload through
@@ -285,6 +286,11 @@ so the harness can re-verify learned repairs without another model request.
 preserves the base prompt, `task_metadata` adds task family/difficulty/tags,
 `failure_tag_guardrails` adds concise checklists keyed by failure tags, and
 `data_model_guardrails` adds a selective checklist only for data-model tasks.
+`task_order_policy` is a separate allocation knob. `split_order` preserves the
+checked-in split order, while `coverage_gap_first` moves the currently shared
+held-out coverage-gap tasks to the front before `task_limit` truncation and
+scenario scheduling. Coverage-gap-first candidates are experimental by default
+because they are derived from existing artifacts, not a stable promotion rule.
 
 The frontier ladder is a self-contained 40-task corpus spanning sequence,
 string parsing, intervals, state machines, graphs, data models, numeric logic,
@@ -355,6 +361,7 @@ Run prompt-policy probes separately before considering them for promotion:
 python examples\foundry_harness_batch.py --candidates frontier_task_metadata --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guardrails --replicates 3 --json
 python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_coverage_gap_first --replicates 3 --json
 ```
 
 For local credentials or deployment names that should not be checked into a
