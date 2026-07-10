@@ -208,7 +208,10 @@ availability.
 ## Azure Foundry Workload
 
 The live Foundry benchmark repairs embedded Python functions and verifies the
-generated code in a separate timeout-bounded subprocess. It compares:
+generated code in a separate timeout-bounded subprocess with a sanitized
+environment that does not inherit Azure credentials. Linux and Windows use
+hard process memory limits; macOS fails candidates that exceed the verifier's
+measured peak resident-memory budget. It compares:
 
 - `static_art`: fixed token-level round-robin baseline
 - `scheduler_only`: objective scheduler with token actions

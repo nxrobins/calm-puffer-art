@@ -18,6 +18,18 @@ from calm_puffer_art import (
 
 
 class ObjectiveSchedulerTests(unittest.TestCase):
+    def test_scheduler_rejects_nonfinite_and_contradictory_configuration(self):
+        invalid_configs = (
+            {"exploration_bonus": float("nan")},
+            {"min_train_batch_groups": 2, "max_train_batch_groups": 1},
+            {"min_policy_lag": 2, "max_policy_lag": 1},
+        )
+
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    ObjectiveScheduler(**config)
+
     def test_joint_scheduling_action_receives_rollout_train_and_stale_credit(self):
         scheduler = ObjectiveScheduler(
             control_exploration_bonus=0.0,
@@ -5714,6 +5726,48 @@ class ObjectiveSchedulerTests(unittest.TestCase):
         self.assertEqual(metrics["scheduler/total_rollout_decisions"], 2.0)
         self.assertEqual(metrics["scheduler/arm/task_token/pulls"], 2.0)
         self.assertEqual(decision.arm_id, "task|token")
+
+    def test_scheduler_state_load_ignores_invalid_config_but_restores_learning(self):
+        scheduler = ObjectiveScheduler(
+            min_train_batch_groups=2,
+            max_train_batch_groups=4,
+            min_policy_lag=1,
+            max_policy_lag=3,
+            ema_alpha=0.5,
+            roi_patience=3,
+        )
+
+        scheduler.load_state_dict(
+            {
+                "config": {
+                    "min_train_batch_groups": -5,
+                    "max_train_batch_groups": 0,
+                    "min_policy_lag": -3,
+                    "max_policy_lag": -1,
+                    "ema_alpha": 2.0,
+                    "roi_patience": 0,
+                },
+                "arms": {
+                    "task|token": {
+                        "pulls": 2,
+                        "accepted": 1,
+                        "marginal_objective_ema": 0.4,
+                        "action_quality_ema": 1.0,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(scheduler.min_train_batch_groups, 2)
+        self.assertEqual(scheduler.max_train_batch_groups, 4)
+        self.assertEqual(scheduler.min_policy_lag, 1)
+        self.assertEqual(scheduler.max_policy_lag_limit, 3)
+        self.assertEqual(scheduler.ema_alpha, 0.5)
+        self.assertEqual(scheduler.roi_patience, 3)
+        self.assertEqual(
+            scheduler.metrics()["scheduler/arm/task_token/pulls"],
+            2.0,
+        )
 
 
 def _test_metric_key(value: str) -> str:

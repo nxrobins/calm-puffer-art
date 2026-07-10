@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -48,9 +49,14 @@ class RealWorkloadAblationTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(completed.stdout), [])
 
-    def test_calm_optional_extra_declares_torch(self):
-        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('calm = ["torch>=2"]', pyproject)
+    def test_calm_optional_extra_declares_runtime_dependencies(self):
+        pyproject = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        dependencies = pyproject["project"]["optional-dependencies"]["calm"]
+
+        self.assertIn("numpy>=1.26", dependencies)
+        self.assertIn("torch>=2", dependencies)
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch") is not None,
