@@ -1165,10 +1165,46 @@ class RuntimeTests(unittest.TestCase):
                 messages=[Message(role="user", content="adapt chunks")],
                 actions=actions,
                 reward=reward,
+                metrics={"rollout/dollar_seconds": 1.0},
             )
 
         async def run():
-            scheduler = ObjectiveScheduler(
+            chunk4_feedback_applied = asyncio.Event()
+
+            class FeedbackObservingScheduler(ObjectiveScheduler):
+                def observe_rollout(
+                    self,
+                    trajectory: Trajectory,
+                    *,
+                    accepted: bool,
+                    dollar_seconds: float,
+                    queue_wait_dollar_seconds: float = 0.0,
+                ) -> None:
+                    super().observe_rollout(
+                        trajectory,
+                        accepted=accepted,
+                        dollar_seconds=dollar_seconds,
+                        queue_wait_dollar_seconds=queue_wait_dollar_seconds,
+                    )
+                    if (
+                        trajectory.metadata.get("scheduler/action_codec")
+                        == "chunk(chunk_size=4)"
+                    ):
+                        chunk4_feedback_applied.set()
+
+            class FeedbackAwareTrainer(NoopTrainer):
+                async def train(
+                    self,
+                    current: PolicySnapshot,
+                    groups: Sequence[TrajectoryGroup],
+                ) -> TrainResult:
+                    await asyncio.wait_for(
+                        chunk4_feedback_applied.wait(),
+                        timeout=1.0,
+                    )
+                    return await super().train(current, groups)
+
+            scheduler = FeedbackObservingScheduler(
                 min_train_batch_groups=1,
                 max_train_batch_groups=1,
                 min_policy_lag=1,
@@ -1186,9 +1222,9 @@ class RuntimeTests(unittest.TestCase):
                     num_actors=1,
                     group_size=1,
                     train_batch_groups=1,
-                    max_train_steps=14,
-                    queue_max_trajectories=4,
-                    train_queue_capacity=2,
+                    max_train_steps=1,
+                    queue_max_trajectories=8,
+                    train_queue_capacity=3,
                     max_policy_lag=2,
                     cost_per_second_usd=1.0,
                 )
@@ -1196,7 +1232,7 @@ class RuntimeTests(unittest.TestCase):
             return await runtime.run(
                 scenarios=[Scenario(id="adapt")],
                 initial_policy=CountingPolicy(level=1),
-                trainer=NoopTrainer(),
+                trainer=FeedbackAwareTrainer(),
                 workflow=low_value_promoted_chunk_rollout,
                 action_space=action_space,
                 scheduler=scheduler,
@@ -1205,7 +1241,9 @@ class RuntimeTests(unittest.TestCase):
         summary = asyncio.run(run())
 
         self.assertEqual(
-            summary.metrics["action_space/codec/chunk_chunk_size_4/disabled"],
+            summary.metrics.get(
+                "action_space/codec/chunk_chunk_size_4/disabled"
+            ),
             1.0,
         )
         self.assertNotIn(
