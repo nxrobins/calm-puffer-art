@@ -77,6 +77,9 @@ class FakeArtBackend:
     def __init__(self) -> None:
         self.calls = []
         self.registered = []
+        self.prepared = []
+        self.deleted_checkpoint_steps = []
+        self.sft_calls = []
         self.closed = False
         self.step = 0
         self.block_event: asyncio.Event | None = None
@@ -87,6 +90,31 @@ class FakeArtBackend:
 
     async def _get_step(self, model):
         return self.step
+
+    def _model_inference_name(self, model, step=None):
+        name = str(getattr(model, "name", model))
+        return name if step is None else f"{name}@{step}"
+
+    async def _prepare_backend_for_training(self, model, config):
+        self.prepared.append((model, config))
+        return "https://inference.example/v1", "test-key"
+
+    async def _delete_checkpoint_files(self, model, steps_to_keep):
+        self.deleted_checkpoint_steps.append((model, tuple(steps_to_keep)))
+
+    async def _train_sft(
+        self,
+        model,
+        trajectories,
+        config,
+        dev_config,
+        verbose=False,
+    ):
+        self.sft_calls.append(
+            (model, trajectories, config, dev_config, verbose)
+        )
+        yield {"step": 1}
+        yield {"step": 2}
 
     async def train(self, model, trajectory_groups, **kwargs):
         if self.train_started_event is not None:
@@ -298,6 +326,7 @@ class ArtAdapterTests(unittest.TestCase):
             ],
             0.75,
         )
+
         state_decisions = update.metadata[ART_BACKEND_STATE_KEY][
             "publication_decision_stats"
         ]
@@ -394,6 +423,57 @@ class ArtAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(credited_lag_updates, [1.0])
         self.assertTrue(backend.closed)
+
+    def test_async_art_backend_delegates_current_art_lifecycle_hooks(self):
+        async def run():
+            backend = FakeArtBackend()
+            async_backend = AsyncArtBackend(backend=backend)
+            prepared = await async_backend._prepare_backend_for_training(
+                "art-model",
+                "register-config",
+            )
+            inference_name = async_backend._model_inference_name(
+                "art-model",
+                step=3,
+            )
+            await async_backend._delete_checkpoint_files("art-model", [1, 3])
+            updates = [
+                update
+                async for update in async_backend._train_sft(
+                    "art-model",
+                    ["trajectory"],
+                    "train-config",
+                    "dev-config",
+                    verbose=True,
+                )
+            ]
+            await async_backend.close()
+            return backend, prepared, inference_name, updates
+
+        backend, prepared, inference_name, updates = asyncio.run(run())
+
+        self.assertEqual(
+            prepared,
+            ("https://inference.example/v1", "test-key"),
+        )
+        self.assertEqual(inference_name, "art-model@3")
+        self.assertEqual(
+            backend.deleted_checkpoint_steps,
+            [("art-model", (1, 3))],
+        )
+        self.assertEqual(
+            backend.sft_calls,
+            [
+                (
+                    "art-model",
+                    ["trajectory"],
+                    "train-config",
+                    "dev-config",
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(updates, [{"step": 1}, {"step": 2}])
 
     def test_async_art_backend_reports_semantic_bandwidth_without_scheduler(self):
         async def run():

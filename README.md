@@ -36,7 +36,7 @@ What works today:
 
 What is intentionally out of scope for the core package:
 
-- training real LLM weights
+- implementing LLM optimizer or loss internals; real updates are delegated to ART
 - implementing GRPO/CISPO losses
 - managing CUDA/vLLM serving
 - implementing PufferLib internals
@@ -55,7 +55,7 @@ Optional extras:
 ```powershell
 py -m pip install -e ".[dev]"      # pytest only
 py -m pip install -e ".[calm]"     # torch-backed chunk encoder smoke
-py -m pip install -e ".[art]"      # real ART structural smoke
+py -m pip install -e ".[art]"      # ART contract and serverless proof
 py -m pip install -e ".[foundry]"  # Azure Foundry live codegen benchmark
 ```
 
@@ -104,6 +104,7 @@ AZURE_OPENAI_API_VERSION=...
 | Scheduler state-size and timing profile | `python examples\scalability_profile.py` |
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
+| Real ART weight-update preflight | `python examples\real_art_weight_update.py --preflight --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
 
@@ -182,8 +183,8 @@ cost-effective semantic bandwidth.
 
 ## ART Integration
 
-The package does not import ART at top level. Install `.[art]` only when you want
-the real structural smoke:
+The package does not import ART at top level. Install `.[art]` for the current
+ART contract smoke or serverless weight-update proof:
 
 ```powershell
 py -m pip install -e ".[art]"
@@ -194,6 +195,14 @@ python examples\live_art_bridge_smoke.py --backend structural --json
 The bridge preserves raw ART group and trajectory objects in metadata, so the
 control plane can use local scheduler telemetry while a real backend can still
 receive ART-shaped objects.
+
+The binding serverless experiment is documented in
+[`docs/real_art_weight_update.md`](docs/real_art_weight_update.md). Its preflight
+is offline and does not require credentials:
+
+```powershell
+python examples\real_art_weight_update.py --preflight --json
+```
 
 Manual real-backend modes are available:
 

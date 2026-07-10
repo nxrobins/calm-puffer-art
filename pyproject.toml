@@ -15,7 +15,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 calm = ["numpy>=1.26", "torch>=2"]
-art = ["openpipe-art>=0.4.9"]
+art = ["openpipe-art>=0.5.18,<0.6"]
 foundry = ["openai>=1.0"]
 
 [tool.setuptools.packages.find]

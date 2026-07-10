@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+artifacts/
+.env
+.env.*
+!.env.example

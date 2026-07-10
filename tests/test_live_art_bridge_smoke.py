@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import subprocess
@@ -19,7 +20,52 @@ class LiveArtBridgeSmokeTests(unittest.TestCase):
 
     def test_art_optional_extra_is_declared(self):
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('art = ["openpipe-art>=0.4.9"]', pyproject)
+        self.assertIn('art = ["openpipe-art>=0.5.18,<0.6"]', pyproject)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("art") is not None,
+        "openpipe-art is not installed",
+    )
+    def test_current_trainable_model_registers_through_async_backend(self):
+        import art
+
+        from calm_puffer_art import AsyncArtBackend
+
+        class RegistrationBackend:
+            def __init__(self):
+                self.registered = []
+
+            async def register(self, model):
+                self.registered.append(model)
+
+            async def _prepare_backend_for_training(self, model, config):
+                return "https://inference.example/v1", "test-key"
+
+            def _model_inference_name(self, model, step=None):
+                return model.name if step is None else f"{model.name}@{step}"
+
+            async def close(self):
+                return None
+
+        async def run():
+            delegate = RegistrationBackend()
+            backend = AsyncArtBackend(backend=delegate)
+            model = art.TrainableModel(
+                name="registration-contract",
+                project="calm-puffer-art-tests",
+                base_model="OpenPipe/Qwen3-0.6B",
+            )
+            try:
+                await model.register(backend)
+                return delegate, model
+            finally:
+                await backend.close()
+
+        delegate, model = asyncio.run(run())
+
+        self.assertEqual(delegate.registered, [model])
+        self.assertEqual(model.inference_base_url, "https://inference.example/v1")
+        self.assertEqual(model.inference_api_key, "test-key")
 
     @unittest.skipUnless(
         importlib.util.find_spec("art") is not None,
