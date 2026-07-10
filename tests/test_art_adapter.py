@@ -10,6 +10,7 @@ from calm_puffer_art import (
     AdaptiveActionSpace,
     ArtBackendTrainer,
     AsyncArtBackend,
+    AsyncArtBackendClosedError,
     AsyncArtBackendConfig,
     ChunkActionCodec,
     ObjectiveScheduler,
@@ -79,6 +80,7 @@ class FakeArtBackend:
         self.closed = False
         self.step = 0
         self.block_event: asyncio.Event | None = None
+        self.train_started_event: asyncio.Event | None = None
 
     async def register(self, model):
         self.registered.append(model)
@@ -87,6 +89,8 @@ class FakeArtBackend:
         return self.step
 
     async def train(self, model, trajectory_groups, **kwargs):
+        if self.train_started_event is not None:
+            self.train_started_event.set()
         if self.block_event is not None:
             await self.block_event.wait()
         self.step += 1
@@ -2052,6 +2056,67 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(after["art_backend/pending_groups"], 0.0)
         self.assertEqual(after["art_backend/completed_batches"], 1.0)
         self.assertEqual(len(backend.calls[0][1]), 1)
+
+    def test_async_art_backend_close_fails_partial_group_future(self):
+        async def run():
+            backend = FakeArtBackend()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(train_batch_groups=2),
+            )
+            group = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.2)]
+            )
+
+            future = await async_backend.submit_group("art-model", group)
+            await async_backend.close()
+            with self.assertRaises(AsyncArtBackendClosedError):
+                await future
+            return backend, async_backend
+
+        backend, async_backend = asyncio.run(run())
+
+        self.assertTrue(backend.closed)
+        self.assertEqual(async_backend.stats()["art_backend/pending_groups"], 0.0)
+
+    def test_async_art_backend_close_fails_all_accepted_futures(self):
+        async def run():
+            backend = FakeArtBackend()
+            backend.block_event = asyncio.Event()
+            backend.train_started_event = asyncio.Event()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(train_queue_capacity=1),
+            )
+            first = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.2)]
+            )
+            second = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.4)]
+            )
+            third = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.6)]
+            )
+
+            first_future = await async_backend.submit_train("art-model", [first])
+            await asyncio.wait_for(backend.train_started_event.wait(), timeout=1.0)
+            second_future = await async_backend.submit_train("art-model", [second])
+            blocked_submit = asyncio.create_task(
+                async_backend.submit_train("art-model", [third])
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(blocked_submit.done())
+            await async_backend.close()
+            third_future = await asyncio.wait_for(blocked_submit, timeout=1.0)
+            for future in (first_future, second_future, third_future):
+                with self.assertRaises(AsyncArtBackendClosedError):
+                    await future
+            return backend, async_backend
+
+        backend, async_backend = asyncio.run(run())
+
+        self.assertTrue(backend.closed)
+        self.assertEqual(async_backend.stats()["pending_batches"], 0.0)
 
     def test_async_art_backend_forced_flush_records_timing_response_payoff(self):
         async def run():

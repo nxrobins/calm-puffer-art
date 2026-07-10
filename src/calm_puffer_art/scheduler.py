@@ -367,10 +367,65 @@ class ObjectiveScheduler:
         reconstruction_drift_threshold: float = 0.95,
         reward_scale_normalization: str = "none",
     ) -> None:
+        finite_values = {
+            "ema_alpha": ema_alpha,
+            "exploration_bonus": exploration_bonus,
+            "objective_threshold": objective_threshold,
+            "unsafe_penalty": unsafe_penalty,
+            "rollout_objective_weight": rollout_objective_weight,
+            "train_objective_weight": train_objective_weight,
+            "reward_efficiency_weight": reward_efficiency_weight,
+            "stale_penalty_weight": stale_penalty_weight,
+            "staleness_priority_weight": staleness_priority_weight,
+            "off_policy_priority_weight": off_policy_priority_weight,
+            "off_policy_cadence_tightening_threshold": (
+                off_policy_cadence_tightening_threshold
+            ),
+            "off_policy_lag_tightening_threshold": (
+                off_policy_lag_tightening_threshold
+            ),
+            "confidence_penalty_weight": confidence_penalty_weight,
+            "control_exploration_bonus": control_exploration_bonus,
+            "rollout_cadence_lag_control_weight": (
+                rollout_cadence_lag_control_weight
+            ),
+            "joint_action_objective_weight": joint_action_objective_weight,
+            "train_selection_objective_weight": train_selection_objective_weight,
+            "min_rollout_coverage_fraction": min_rollout_coverage_fraction,
+            "min_train_objective": min_train_objective,
+            "max_rollout_admission_delay_s": max_rollout_admission_delay_s,
+            "rollout_admission_pressure_threshold": (
+                rollout_admission_pressure_threshold
+            ),
+            "rollout_admission_positive_signal_scale": (
+                rollout_admission_positive_signal_scale
+            ),
+            "reconstruction_drift_threshold": reconstruction_drift_threshold,
+        }
+        if max_rollout_coverage_cost_fraction is not None:
+            finite_values["max_rollout_coverage_cost_fraction"] = (
+                max_rollout_coverage_cost_fraction
+            )
+        if max_accounted_dollar_seconds is not None:
+            finite_values["max_accounted_dollar_seconds"] = (
+                max_accounted_dollar_seconds
+            )
+        for name, value in finite_values.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if min_train_batch_groups <= 0:
             raise ValueError("min_train_batch_groups must be positive")
+        if (
+            max_train_batch_groups is not None
+            and max_train_batch_groups < min_train_batch_groups
+        ):
+            raise ValueError(
+                "max_train_batch_groups must be >= min_train_batch_groups"
+            )
         if min_policy_lag < 0:
             raise ValueError("min_policy_lag must be non-negative")
+        if max_policy_lag is not None and max_policy_lag < min_policy_lag:
+            raise ValueError("max_policy_lag must be >= min_policy_lag")
         if min_actor_count <= 0:
             raise ValueError("min_actor_count must be positive")
         if max_actor_count is not None and max_actor_count < min_actor_count:
@@ -607,6 +662,49 @@ class ObjectiveScheduler:
         self._pending_continuation_decisions: dict[int, str] = {}
         self._recorded_continuation_stop_decisions: set[tuple[int, str]] = set()
         self._actors: dict[int, ActorStats] = {}
+
+    def _copy_configuration_from(self, source: "ObjectiveScheduler") -> None:
+        attributes = (
+            "min_train_batch_groups",
+            "max_train_batch_groups",
+            "min_policy_lag",
+            "max_policy_lag_limit",
+            "min_actor_count",
+            "max_actor_count_limit",
+            "ema_alpha",
+            "exploration_bonus",
+            "objective_threshold",
+            "unsafe_penalty",
+            "rollout_objective_weight",
+            "train_objective_weight",
+            "reward_efficiency_weight",
+            "stale_penalty_weight",
+            "staleness_priority_weight",
+            "off_policy_priority_weight",
+            "off_policy_cadence_tightening_threshold",
+            "off_policy_lag_tightening_threshold",
+            "confidence_penalty_weight",
+            "control_exploration_bonus",
+            "rollout_cadence_lag_control_weight",
+            "joint_action_objective_weight",
+            "train_selection_objective_weight",
+            "max_control_candidate_values",
+            "min_rollout_coverage_fraction",
+            "max_rollout_coverage_cost_fraction",
+            "min_train_steps",
+            "roi_patience",
+            "min_train_objective",
+            "continuation_objective",
+            "control_train_objective",
+            "max_accounted_dollar_seconds",
+            "max_rollout_admission_delay_s",
+            "rollout_admission_pressure_threshold",
+            "rollout_admission_positive_signal_scale",
+            "reconstruction_drift_threshold",
+            "reward_scale_normalization",
+        )
+        for attribute in attributes:
+            setattr(self, attribute, getattr(source, attribute))
 
     def select_rollout(
         self,
@@ -2196,6 +2294,7 @@ class ObjectiveScheduler:
         the useful parts of scheduler memory.
         """
 
+        previous_config = dict(self.state_dict()["config"])
         config = _mapping_state(state.get("config"))
         self.min_train_batch_groups = _state_int(
             config.get("min_train_batch_groups"),
@@ -2417,6 +2516,13 @@ class ObjectiveScheduler:
         )
         if reward_scale_normalization in {"none", "arm_range"}:
             self.reward_scale_normalization = reward_scale_normalization
+
+        candidate_config = dict(self.state_dict()["config"])
+        try:
+            validated_config = ObjectiveScheduler(**candidate_config)
+        except (TypeError, ValueError):
+            validated_config = ObjectiveScheduler(**previous_config)
+        self._copy_configuration_from(validated_config)
 
         arms = _mapping_state(state.get("arms"))
         self._arms = {
