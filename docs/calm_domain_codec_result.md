@@ -31,7 +31,7 @@ to ART's GRPO/CISPO loss.
 | Candidate | Raw train reconstruction | Raw holdout reconstruction | Holdout fallback | Effective held-out bandwidth | Eligible |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Chunk 2 | `1.0000` | `1.0000` | `0/4` | `2.0` tokens/decision | Yes |
-| Chunk 4 | `0.8646` | `0.8646` | `4/4` | `1.0` tokens/decision | No |
+| Chunk 4 | Below `1.0` | Below `1.0` | Nonzero | Below `4.0` tokens/decision | No |
 
 Chunk size 2 reached exact reconstruction after `25` autoencoder steps. Its
 `86,332`-byte checkpoint survived round-trip loading with identical model,
@@ -39,11 +39,13 @@ scorer, vocabulary, and codec identities. Every learned action retained complete
 offline old/new/reference scorer coverage. An unknown-symbol probe failed closed
 to token actions.
 
-Chunk size 4 exhausted `1,000` autoencoder steps at `86.46%` reconstruction.
-Seven of eight training examples and every held-out example therefore fell back
-to token actions. Its apparent four-token action width produced no effective
-held-out bandwidth gain and the candidate is explicitly ineligible for a live
-bridge.
+Chunk size 4 exhausted `1,000` autoencoder steps without reaching exact
+reconstruction. The local reference run reached `86.46%` raw reconstruction and
+fell back on every held-out example; Torch `2.13` reconstructed more examples,
+but still emitted reconstruction-drift fallbacks and failed the exact gate.
+Kernel-level numeric differences can change the fallback count, while the
+stable eligibility decision remains rejection. Its apparent four-token action
+width therefore cannot be treated as reliable semantic bandwidth.
 
 ## Interpretation
 
