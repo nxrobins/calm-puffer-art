@@ -20,7 +20,10 @@ class LiveArtBridgeSmokeTests(unittest.TestCase):
 
     def test_art_optional_extra_is_declared(self):
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('art = ["openpipe-art>=0.5.18,<0.6"]', pyproject)
+        self.assertIn(
+            'art = ["openpipe-art>=0.5.18,<0.6", "wandb>=0.21"]',
+            pyproject,
+        )
 
     @unittest.skipUnless(
         importlib.util.find_spec("art") is not None,

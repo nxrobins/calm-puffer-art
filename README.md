@@ -204,6 +204,9 @@ is offline and does not require credentials:
 python examples\real_art_weight_update.py --preflight --json
 ```
 
+The first verified step-1 artifact and its flat held-out result are recorded in
+[`docs/real_art_weight_update_result.md`](docs/real_art_weight_update_result.md).
+
 Manual real-backend modes are available:
 
 ```powershell

@@ -123,6 +123,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--recover-report", type=Path)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--env-path", type=Path)
     parser.add_argument("--project", default="calm-puffer-art-proof")
@@ -729,6 +730,135 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         await backend.close()
 
 
+async def _recover_live(args: argparse.Namespace) -> dict[str, Any]:
+    if args.recover_report is None:
+        raise ValueError("--recover-report is required")
+    if not os.environ.get("WANDB_API_KEY"):
+        raise RuntimeError("WANDB_API_KEY is required to recover an ART run")
+
+    import art
+    from art.serverless.backend import ServerlessBackend
+
+    report = json.loads(args.recover_report.read_text(encoding="utf-8"))
+    model_info = report.get("model")
+    if not isinstance(model_info, Mapping):
+        raise ValueError("recovery report has no model metadata")
+    before = report.get("heldout_before")
+    if not isinstance(before, Mapping):
+        raise ValueError("recovery report has no held-out baseline")
+    records = before.get("records")
+    if not isinstance(records, list):
+        raise ValueError("recovery report has no held-out task records")
+    tasks_by_id = {task.id: task for task in HELDOUT_TASKS}
+    task_ids = [
+        str(record.get("task_id"))
+        for record in records
+        if isinstance(record, Mapping)
+    ]
+    try:
+        heldout_tasks = [tasks_by_id[task_id] for task_id in task_ids]
+    except KeyError as exc:
+        raise ValueError(f"unknown held-out task in recovery report: {exc}") from exc
+    if not heldout_tasks:
+        raise ValueError("recovery report selected no held-out tasks")
+
+    backend = ServerlessBackend()
+    model = art.TrainableModel(
+        name=str(model_info["name"]),
+        project=str(model_info["project"]),
+        entity=(
+            str(model_info["entity"])
+            if model_info.get("entity") is not None
+            else None
+        ),
+        base_model=str(model_info["base_model"]),
+    )
+    started = time.perf_counter()
+    try:
+        await model.register(backend)
+        initial_step = int(report.get("initial_step", 0) or 0)
+        final_step = int(await backend._get_step(model))
+        if final_step <= initial_step:
+            raise RuntimeError(
+                "recovery found no checkpoint newer than the initial step"
+            )
+        final_inference_name = model.get_inference_name(step=final_step)
+        after = await _evaluate(
+            client=model.openai_client(),
+            inference_name=final_inference_name,
+            tasks=heldout_tasks,
+            split="heldout_after_recovery",
+            args=args,
+            semaphore=asyncio.Semaphore(args.concurrency),
+        )
+        entity = str(model.entity)
+        artifact_name = (
+            f"{entity}/{model.project}/{model.name}:step{final_step}"
+        )
+        heldout_delta = (
+            float(after["exact_accuracy"])
+            - float(before.get("exact_accuracy", 0.0) or 0.0)
+        )
+        training_sampling = report.get("training_sampling", {})
+        verified_groups = (
+            int(training_sampling.get("nonzero_advantage_group_count", 0) or 0)
+            if isinstance(training_sampling, Mapping)
+            else 0
+        )
+        original_error = {
+            "type": report.pop("error_type", None),
+            "message": report.pop("error", None),
+        }
+        trainer = report.get("trainer")
+        if not isinstance(trainer, dict):
+            trainer = {}
+            report["trainer"] = trainer
+        trainer["checkpoint_recovered_after_client_error"] = True
+        estimated_api_usd = sum(
+            float(phase.get("estimated_api_usd", 0.0) or 0.0)
+            for phase in (before, training_sampling, after)
+            if isinstance(phase, Mapping)
+        )
+        trainer_estimated_usd = float(trainer.get("estimated_usd", 0.0) or 0.0)
+        report.update(
+            {
+                "ok": True,
+                "status": "recovered_completed",
+                "final_step": final_step,
+                "artifact_name": artifact_name,
+                "final_inference_name": final_inference_name,
+                "heldout_after": after,
+                "heldout_exact_accuracy_delta": heldout_delta,
+                "claims": {
+                    "checkpoint_advanced": True,
+                    "artifact_identified": True,
+                    "verified_nonzero_advantage_groups": verified_groups,
+                    "weight_update_evidence": verified_groups > 0,
+                    "heldout_improved": heldout_delta > 0.0,
+                },
+                "pricing": _pricing_report(args),
+                "costs": {
+                    "estimated_api_usd": estimated_api_usd,
+                    "estimated_trainer_usd": trainer_estimated_usd,
+                    "estimated_total_usd": (
+                        estimated_api_usd + trainer_estimated_usd
+                    ),
+                    "recovered_report": True,
+                },
+                "recovery": {
+                    "original_client_error": original_error,
+                    "checkpoint_verified_from_backend": True,
+                    "control_plane_metrics_are_pre_recovery_failure_snapshot": True,
+                    "wall_s": time.perf_counter() - started,
+                },
+            }
+        )
+        _write_report(report, args=args, model_name=model.name)
+        return report
+    finally:
+        await backend.close()
+
+
 def _float_mapping(values: Mapping[str, Any] | Any) -> dict[str, float]:
     if not isinstance(values, Mapping):
         return {}
@@ -779,7 +909,7 @@ def _write_report(
     args: argparse.Namespace,
     model_name: str,
 ) -> None:
-    output = args.output or (
+    output = args.output or args.recover_report or (
         Path("artifacts") / f"real_art_weight_update_{model_name}.json"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -848,6 +978,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
     if args.preflight:
         result = _preflight(args)
+        _print_result(result, as_json=args.json)
+        return 0 if result["ok"] else 1
+    if args.recover_report is not None:
+        try:
+            result = asyncio.run(_recover_live(args))
+        except Exception as exc:
+            error = {
+                "ok": False,
+                "status": "failed",
+                "mode": "recovery",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            _print_result(error, as_json=args.json)
+            return 1
         _print_result(result, as_json=args.json)
         return 0 if result["ok"] else 1
     try:

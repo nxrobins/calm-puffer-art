@@ -6,6 +6,9 @@ integration. It registers a current `art.TrainableModel` through
 training groups, submits one serverless ART update, and evaluates the resulting
 checkpoint on the same held-out set.
 
+The first completed run is recorded in
+[`real_art_weight_update_result.md`](real_art_weight_update_result.md).
+
 The script deliberately reports three different claims:
 
 1. `checkpoint_advanced`: ART returned a later checkpoint step.
@@ -52,6 +55,16 @@ The generated JSON report is written under `artifacts/` by default, including
 when a post-registration phase fails. It includes
 the ART artifact identity, trainer metrics, per-task verifier results,
 control-plane accounting, and the exact pricing assumptions used.
+
+If training publishes a checkpoint but a later client-side integration fails,
+recover that exact run without another training step:
+
+```bash
+python examples/real_art_weight_update.py \
+  --env-path .env \
+  --recover-report artifacts/real_art_weight_update_<model>.json \
+  --json
+```
 
 ## Research Gate
 
