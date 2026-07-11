@@ -58,6 +58,30 @@ positive result is therefore a shaped-reward result, not task mastery.
 The trained conditions improved shaped reward on all three seeds. The ordering
 between direct and scheduled ART changed by seed.
 
+## Cost And Runtime Result
+
+The performance comparison was nearly flat between the two trained conditions,
+but their resource use was not identical:
+
+| Measurement | Direct ART | Async scheduler | Scheduler difference |
+| --- | ---: | ---: | ---: |
+| Requests | `444` | `444` | `0.0%` |
+| Total tokens | `71,402` | `69,432` | `-2.8%` |
+| Training-inference tokens | `23,016` | `20,925` | `-9.1%` |
+| Prompt tokens | `55,866` | `56,202` | `+0.6%` |
+| Completion tokens | `15,536` | `13,230` | `-14.8%` |
+| Condition wall time | `474.1 s` | `483.4 s` | `+1.9%` |
+
+At essentially the same shaped-reward delta, the scheduler used fewer training
+and completion tokens but took slightly longer wall-clock time. This is a
+potential efficiency result, not yet a monetary-cost result. Input, output, and
+trainer rates were not supplied, so dollars are unknown rather than zero.
+
+These figures were reconstructed from the raw experiment report after the run.
+Future runs emit the versioned JSONL evidence ledger described in
+[`telemetry.md`](telemetry.md), including cost provenance, coverage, lifecycle
+failures, efficiency views, and point-estimate Pareto analysis.
+
 ## What Changed
 
 Across the `150` held-out responses per condition, direct ART and scheduled ART
@@ -100,7 +124,9 @@ claim. Three seeds give very wide intervals, exact accuracy remains zero, and
 the scheduler has not beaten direct ART. A stronger next experiment needs a
 task family with nonzero base exact accuracy, more seeds, a reward that reports
 format compliance separately from correctness, and enough updates to test a
-learning curve.
+learning curve. It should sweep multiple budgets and report both performance at
+fixed cost and cost to fixed performance rather than choosing one outcome in
+advance.
 
 CALM was excluded. The current learned chunk codec is reconstruction-smoke-only
 and does not alter ART inference actions, policy logprobs, or optimizer loss.

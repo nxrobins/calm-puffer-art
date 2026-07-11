@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 SYSTEM_MESSAGE = {
@@ -259,6 +259,7 @@ async def _complete(
     args: argparse.Namespace,
     semaphore: asyncio.Semaphore,
     request_seed: int | None = None,
+    completion_observer: Callable[[CompletionRecord], None] | None = None,
 ) -> CompletionRecord:
     started = time.perf_counter()
     response = None
@@ -305,7 +306,7 @@ async def _complete(
         prompt_tokens * args.input_usd_per_million_tokens
         + completion_tokens * args.output_usd_per_million_tokens
     ) / 1_000_000.0
-    return CompletionRecord(
+    record = CompletionRecord(
         task=task,
         split=split,
         content=content,
@@ -320,6 +321,10 @@ async def _complete(
         attempts=attempts,
         choice=choice,
     )
+    observer = completion_observer or getattr(args, "completion_observer", None)
+    if observer is not None:
+        observer(record)
+    return record
 
 
 async def _evaluate(

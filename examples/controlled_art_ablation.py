@@ -18,6 +18,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
+from calm_puffer_art.telemetry import (
+    TELEMETRY_SCHEMA_VERSION,
+    PricingConfig,
+    TelemetryLedger,
+)
 from real_art_weight_update import (
     SYSTEM_MESSAGE,
     ChecksumTask,
@@ -63,11 +68,13 @@ class RetryingServerlessBackend:
         delegate: Any,
         max_attempts: int,
         timeout_seconds: float,
+        attempt_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.art = art
         self.delegate = delegate
         self.max_attempts = max_attempts
         self.timeout_seconds = timeout_seconds
+        self.attempt_observer = attempt_observer
         self.attempts: list[dict[str, Any]] = []
 
     def __getattr__(self, name: str) -> Any:
@@ -82,6 +89,15 @@ class RetryingServerlessBackend:
         groups = list(trajectory_groups)
         initial_step = int(await self.delegate._get_step(model))
         for attempt in range(1, self.max_attempts + 1):
+            if self.attempt_observer is not None:
+                self.attempt_observer(
+                    {
+                        "event": "started",
+                        "attempt": attempt,
+                        "status": "started",
+                        "initial_step": initial_step,
+                    }
+                )
             started = time.perf_counter()
             try:
                 result = await asyncio.wait_for(
@@ -94,14 +110,17 @@ class RetryingServerlessBackend:
                         "managed training advanced an unexpected number of "
                         f"checkpoints: {initial_step} -> {result_step}"
                     )
-                self.attempts.append(
-                    {
-                        "attempt": attempt,
-                        "status": "completed",
-                        "wall_s": time.perf_counter() - started,
-                        "step": result_step,
-                    }
-                )
+                entry = {
+                    "attempt": attempt,
+                    "status": "completed",
+                    "wall_s": time.perf_counter() - started,
+                    "initial_step": initial_step,
+                    "observed_step": result_step,
+                    "step": result_step,
+                    "metrics": _float_mapping(getattr(result, "metrics", {})),
+                    "artifact_name": getattr(result, "artifact_name", None),
+                }
+                self._record_attempt(entry)
                 return result
             except Exception as exc:
                 observed_step = int(await self.delegate._get_step(model))
@@ -109,30 +128,43 @@ class RetryingServerlessBackend:
                     "attempt": attempt,
                     "status": "failed",
                     "wall_s": time.perf_counter() - started,
+                    "initial_step": initial_step,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "observed_step": observed_step,
                 }
-                self.attempts.append(entry)
                 if observed_step > initial_step:
                     if observed_step != initial_step + 1:
+                        self._record_attempt(entry)
                         raise RuntimeError(
                             "managed training advanced an unexpected number of "
                             f"checkpoints: {initial_step} -> {observed_step}"
                         ) from exc
+                    entry["status"] = "recovered"
+                    entry["initial_step"] = initial_step
+                    entry["step"] = observed_step
                     artifact_name = (
                         f"{model.entity}/{model.project}/{model.name}:"
                         f"step{observed_step}"
                     )
+                    entry["artifact_name"] = artifact_name
+                    self._record_attempt(entry)
                     return self.art.ServerlessTrainResult(
                         step=observed_step,
                         metrics={"ablation/recovered_after_client_error": 1.0},
                         artifact_name=artifact_name,
                     )
+                self._record_attempt(entry)
                 if attempt >= self.max_attempts or not _retryable_train_error(exc):
                     raise
                 await asyncio.sleep(5.0)
         raise RuntimeError("managed training exhausted retry attempts")
+
+    def _record_attempt(self, entry: Mapping[str, Any]) -> None:
+        payload = dict(entry)
+        self.attempts.append(payload)
+        if self.attempt_observer is not None:
+            self.attempt_observer(payload)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -171,6 +203,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--trainer-usd-per-hour", type=float, default=0.0)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--telemetry-path", type=Path)
+    parser.add_argument("--telemetry-echo", action="store_true")
     args = parser.parse_args(argv)
     args.seed_values = _parse_seeds(parser, args.seeds)
     _validate_args(parser, args)
@@ -315,6 +349,45 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             pass
     credential_ready = bool(os.environ.get("WANDB_API_KEY"))
+    minimum_requests, maximum_requests = _inference_request_bounds(args)
+    return {
+        "ok": True,
+        "mode": "preflight",
+        "conditions": list(CONDITIONS),
+        "excluded_conditions": {"calm": CALM_EXCLUSION},
+        "seeds": list(args.seed_values),
+        "train_tasks": len(train),
+        "heldout_tasks": len(heldout),
+        "train_steps_per_trained_condition": args.train_steps,
+        "training_updates": (
+            len(args.seed_values) * 2 * args.train_steps
+        ),
+        "minimum_inference_requests": minimum_requests,
+        "maximum_inference_requests": maximum_requests,
+        "manifest_fingerprint": manifest_fingerprint(train, heldout),
+        "art_installed": art_installed,
+        "art_version": art_version,
+        "wandb_installed": wandb_installed,
+        "credential_ready": credential_ready,
+        "live_ready": art_installed and wandb_installed and credential_ready,
+        "pricing": _pricing_report(args),
+        "telemetry": {
+            "schema_version": TELEMETRY_SCHEMA_VERSION,
+            "event_ledger": "append-only JSONL",
+            "monetary_cost_requires_explicit_rates": True,
+            "missing_price_is_null_not_zero": True,
+            "token_cost_is_labeled_as_proxy": True,
+            "captures": [
+                "inference",
+                "training_attempt",
+                "scheduler_decision",
+                "condition_lifecycle",
+            ],
+        },
+    }
+
+
+def _inference_request_bounds(args: argparse.Namespace) -> tuple[int, int]:
     minimum_per_seed = (
         2 * args.heldout_tasks
         + 2
@@ -331,28 +404,28 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             + args.train_tasks * args.max_rollouts_per_group
         )
     )
-    return {
-        "ok": True,
-        "mode": "preflight",
-        "conditions": list(CONDITIONS),
-        "excluded_conditions": {"calm": CALM_EXCLUSION},
-        "seeds": list(args.seed_values),
-        "train_tasks": len(train),
-        "heldout_tasks": len(heldout),
-        "train_steps_per_trained_condition": args.train_steps,
-        "training_updates": (
-            len(args.seed_values) * 2 * args.train_steps
+    seeds = len(args.seed_values)
+    return minimum_per_seed * seeds, maximum_per_seed * seeds
+
+
+def _telemetry_pricing(args: argparse.Namespace) -> PricingConfig:
+    return PricingConfig(
+        input_usd_per_million_tokens=(
+            args.input_usd_per_million_tokens
+            if args.input_usd_per_million_tokens > 0.0
+            else None
         ),
-        "minimum_inference_requests": minimum_per_seed * len(args.seed_values),
-        "maximum_inference_requests": maximum_per_seed * len(args.seed_values),
-        "manifest_fingerprint": manifest_fingerprint(train, heldout),
-        "art_installed": art_installed,
-        "art_version": art_version,
-        "wandb_installed": wandb_installed,
-        "credential_ready": credential_ready,
-        "live_ready": art_installed and wandb_installed and credential_ready,
-        "pricing": _pricing_report(args),
-    }
+        output_usd_per_million_tokens=(
+            args.output_usd_per_million_tokens
+            if args.output_usd_per_million_tokens > 0.0
+            else None
+        ),
+        trainer_usd_per_hour=(
+            args.trainer_usd_per_hour
+            if args.trainer_usd_per_hour > 0.0
+            else None
+        ),
+    )
 
 
 async def _sample_group(
@@ -540,6 +613,7 @@ async def _run_base_condition(
         delegate=serverless_backend_cls(),
         max_attempts=args.training_attempts,
         timeout_seconds=args.training_timeout_seconds,
+        attempt_observer=getattr(args, "training_attempt_observer", None),
     )
     model = art.TrainableModel(
         name=f"ablation-{run_id}-base-s{seed}",
@@ -599,6 +673,7 @@ async def _run_direct_condition(
         delegate=serverless_backend_cls(),
         max_attempts=args.training_attempts,
         timeout_seconds=args.training_timeout_seconds,
+        attempt_observer=getattr(args, "training_attempt_observer", None),
     )
     model = art.TrainableModel(
         name=f"ablation-{run_id}-direct-s{seed}",
@@ -708,6 +783,7 @@ async def _run_scheduler_condition(
         delegate=serverless_backend_cls(),
         max_attempts=args.training_attempts,
         timeout_seconds=args.training_timeout_seconds,
+        attempt_observer=getattr(args, "training_attempt_observer", None),
     )
     scheduler = ObjectiveScheduler(
         min_train_batch_groups=args.groups_per_step,
@@ -779,6 +855,21 @@ async def _run_scheduler_condition(
                 items = tasks_by_stratum[stratum]
                 item = items[task_offsets[stratum] % len(items)]
                 task_offsets[stratum] += 1
+                decision_observer = getattr(
+                    args,
+                    "scheduler_decision_observer",
+                    None,
+                )
+                if decision_observer is not None:
+                    decision_observer(
+                        {
+                            "train_step": train_step,
+                            "group_index": group_index,
+                            "selected_stratum": stratum,
+                            "task_id": item.task.id,
+                            "metadata": dict(first_assignment.metadata),
+                        }
+                    )
                 metadata = [first_assignment.metadata]
                 for actor_id in range(1, args.rollouts_per_group):
                     assignment = await bridge.admit_and_select_rollout(
@@ -1006,6 +1097,135 @@ def _condition_usage(
     }
 
 
+def _condition_args_with_telemetry(
+    args: argparse.Namespace,
+    *,
+    telemetry: TelemetryLedger,
+    condition: str,
+    seed: int,
+    task_strata: Mapping[str, str],
+) -> argparse.Namespace:
+    condition_args = argparse.Namespace(**vars(args))
+
+    def completion_observer(record: CompletionRecord) -> None:
+        telemetry.record_inference(
+            condition=condition,
+            seed=seed,
+            phase=record.split,
+            task_id=record.task.id,
+            stratum=task_strata.get(record.task.id),
+            prompt_tokens=record.prompt_tokens,
+            completion_tokens=record.completion_tokens,
+            total_tokens=record.total_tokens,
+            latency_s=record.elapsed_s,
+            attempts=record.attempts,
+            reward=record.reward,
+            exact=record.exact,
+            parsed=record.parsed_answer is not None,
+        )
+
+    def training_attempt_observer(entry: Mapping[str, Any]) -> None:
+        if entry.get("event") == "started":
+            telemetry.emit(
+                "training_attempt_started",
+                dimensions={
+                    "condition": condition,
+                    "seed": seed,
+                    "attempt": int(entry.get("attempt", 0) or 0),
+                    "initial_step": int(entry.get("initial_step", 0) or 0),
+                },
+            )
+            return
+        metrics = entry.get("metrics")
+        trainer_metrics = metrics if isinstance(metrics, Mapping) else {}
+        reported_trainer_usd = trainer_metrics.get("cost/trainer_usd")
+        telemetry.record_training_attempt(
+            condition=condition,
+            seed=seed,
+            attempt=int(entry.get("attempt", 0) or 0),
+            status=str(entry.get("status", "unknown")),
+            duration_s=float(entry.get("wall_s", 0.0) or 0.0),
+            initial_step=int(entry.get("initial_step", 0) or 0),
+            observed_step=int(
+                entry.get("observed_step", entry.get("step", 0)) or 0
+            ),
+            trainer_metrics=trainer_metrics,
+            reported_trainer_usd=(
+                float(reported_trainer_usd)
+                if isinstance(reported_trainer_usd, (int, float))
+                else None
+            ),
+            reported_cost_provenance="reported_by_trainer",
+            error_type=(
+                str(entry["error_type"])
+                if entry.get("error_type") is not None
+                else None
+            ),
+            error=(str(entry["error"]) if entry.get("error") is not None else None),
+            artifact_name=(
+                str(entry["artifact_name"])
+                if entry.get("artifact_name") is not None
+                else None
+            ),
+        )
+
+    def scheduler_decision_observer(entry: Mapping[str, Any]) -> None:
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        estimated_cost = _first_finite_non_negative(
+            metadata,
+            (
+                "scheduler/decision/estimated_rollout_dollar_seconds",
+                "scheduler/decision/expected_rollout_dollar_seconds",
+                "scheduler/decision/reserved_rollout_dollar_seconds",
+            ),
+        )
+        telemetry.record_scheduler_decision(
+            condition=condition,
+            seed=seed,
+            train_step=int(entry["train_step"]),
+            group_index=int(entry["group_index"]),
+            selected_stratum=str(entry["selected_stratum"]),
+            task_id=str(entry["task_id"]),
+            estimated_cost=estimated_cost,
+            cost_provenance="scheduler_dollar_seconds_proxy",
+            attributes=_scheduler_telemetry_attributes(metadata),
+        )
+
+    condition_args.completion_observer = completion_observer
+    condition_args.training_attempt_observer = training_attempt_observer
+    condition_args.scheduler_decision_observer = scheduler_decision_observer
+    return condition_args
+
+
+def _first_finite_non_negative(
+    values: Mapping[str, Any],
+    keys: Sequence[str],
+) -> float | None:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, (int, float)):
+            converted = float(value)
+            if math.isfinite(converted) and converted >= 0.0:
+                return converted
+    return None
+
+
+def _scheduler_telemetry_attributes(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key).startswith(("scheduler/decision/", "scheduler/control/"))
+        and (
+            value is None
+            or isinstance(value, (str, int, float, bool))
+        )
+        and not (isinstance(value, float) and not math.isfinite(value))
+    }
+
+
 async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     if not os.environ.get("WANDB_API_KEY"):
         raise RuntimeError("WANDB_API_KEY is required for the controlled ablation")
@@ -1019,6 +1239,37 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     )
     run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     output = args.output or Path("artifacts") / f"controlled_art_ablation_{run_id}.json"
+    telemetry_path = args.telemetry_path or output.with_suffix(".telemetry.jsonl")
+    telemetry = TelemetryLedger(
+        run_id=run_id,
+        pricing=_telemetry_pricing(args),
+        path=telemetry_path,
+        echo_to_stderr=args.telemetry_echo,
+    )
+    minimum_requests, maximum_requests = _inference_request_bounds(args)
+    expected_requests = (
+        minimum_requests if minimum_requests == maximum_requests else None
+    )
+    task_strata = {
+        item.task.id: item.stratum for item in (*train, *heldout)
+    }
+    telemetry.emit(
+        "run_started",
+        attributes={
+            "base_model": args.base_model,
+            "conditions": list(CONDITIONS),
+            "manifest_fingerprint": manifest_fingerprint(train, heldout),
+            "minimum_inference_requests": minimum_requests,
+            "maximum_inference_requests": maximum_requests,
+            "expected_condition_runs": len(args.seed_values) * len(CONDITIONS),
+            "expected_training_updates": (
+                len(args.seed_values) * 2 * args.train_steps
+            ),
+            "expected_scheduler_decisions": (
+                len(args.seed_values) * args.train_tasks
+            ),
+        },
+    )
     report: dict[str, Any] = {
         "ok": False,
         "status": "running",
@@ -1043,6 +1294,7 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             "scheduler_cost_proxy": (
                 "estimated API USD when supplied; otherwise total tokens / 1e6"
             ),
+            "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
         },
         "manifest_fingerprint": manifest_fingerprint(train, heldout),
         "manifest": {
@@ -1051,6 +1303,8 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         },
         "runs": {},
         "report_path": str(output.resolve()),
+        "telemetry_path": str(telemetry_path.resolve()),
+        "telemetry": telemetry.summary(),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     _write_json(output, report)
@@ -1065,6 +1319,17 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         seed_key = str(seed)
         report["runs"][seed_key] = {}
         for condition in CONDITIONS:
+            condition_args = _condition_args_with_telemetry(
+                seed_args,
+                telemetry=telemetry,
+                condition=condition,
+                seed=seed,
+                task_strata=task_strata,
+            )
+            telemetry.emit(
+                "condition_started",
+                dimensions={"condition": condition, "seed": seed},
+            )
             print(
                 f"starting condition={condition} seed={seed}",
                 file=sys.stderr,
@@ -1078,7 +1343,7 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "heldout": heldout,
                     "seed": seed,
                     "run_id": run_id,
-                    "args": seed_args,
+                    "args": condition_args,
                 }
                 if condition != "base":
                     kwargs["train"] = train
@@ -1091,8 +1356,25 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "error": str(exc),
                     "wall_s": time.perf_counter() - started,
                 }
+            telemetry.record_condition_finished(
+                condition=condition,
+                seed=seed,
+                status=str(condition_report["status"]),
+                wall_s=float(condition_report["wall_s"]),
+                error_type=(
+                    str(condition_report["error_type"])
+                    if condition_report.get("error_type") is not None
+                    else None
+                ),
+                error=(
+                    str(condition_report["error"])
+                    if condition_report.get("error") is not None
+                    else None
+                ),
+            )
             report["runs"][seed_key][condition] = condition_report
             report["aggregate"] = aggregate_results(report["runs"])
+            report["telemetry"] = telemetry.summary()
             _write_json(output, report)
             print(
                 f"finished condition={condition} seed={seed} "
@@ -1101,12 +1383,26 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
     report["aggregate"] = aggregate_results(report["runs"])
-    report["ok"] = all(
+    conditions_ok = all(
         condition.get("status") == "completed"
         for seed_runs in report["runs"].values()
         for condition in seed_runs.values()
     )
-    report["status"] = "completed" if report["ok"] else "completed_with_failures"
+    telemetry.emit(
+        "run_finished",
+        metrics={"conditions_ok": conditions_ok},
+        attributes={"condition_runs": len(args.seed_values) * len(CONDITIONS)},
+    )
+    report["telemetry"] = telemetry.summary(
+        expected_inference_requests=expected_requests
+    )
+    report["ok"] = conditions_ok and bool(report["telemetry"]["healthy"])
+    if report["ok"]:
+        report["status"] = "completed"
+    elif conditions_ok:
+        report["status"] = "completed_with_telemetry_errors"
+    else:
+        report["status"] = "completed_with_failures"
     report["finished_at_utc"] = datetime.now(UTC).isoformat()
     _write_json(output, report)
     return report
@@ -1265,6 +1561,8 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _compact_result(report: Mapping[str, Any]) -> dict[str, Any]:
+    telemetry = report.get("telemetry")
+    telemetry = telemetry if isinstance(telemetry, Mapping) else {}
     return {
         "ok": report.get("ok"),
         "status": report.get("status"),
@@ -1272,6 +1570,13 @@ def _compact_result(report: Mapping[str, Any]) -> dict[str, Any]:
         "aggregate": report.get("aggregate"),
         "excluded_conditions": report.get("excluded_conditions"),
         "report_path": report.get("report_path"),
+        "telemetry_path": report.get("telemetry_path"),
+        "telemetry": {
+            "healthy": telemetry.get("healthy"),
+            "coverage": telemetry.get("coverage"),
+            "cost_performance": telemetry.get("cost_performance"),
+            "alerts": telemetry.get("alerts"),
+        },
     }
 
 

@@ -92,6 +92,8 @@ class RealArtWeightUpdateTests(unittest.TestCase):
                 "2",
             ]
         )
+        observed_completions = []
+        args.completion_observer = observed_completions.append
 
         class FakeCompletions:
             def __init__(self):
@@ -148,6 +150,11 @@ class RealArtWeightUpdateTests(unittest.TestCase):
         self.assertEqual(report["nonzero_advantage_group_count"], 1)
         self.assertEqual(report["excluded_uniform_reward_groups"], [])
         self.assertEqual(report["requests"], 2)
+        self.assertEqual(len(observed_completions), 2)
+        self.assertEqual(
+            [record.total_tokens for record in observed_completions],
+            [24, 24],
+        )
 
 
 if __name__ == "__main__":
