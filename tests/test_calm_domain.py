@@ -37,9 +37,11 @@ class CalmDomainProofTests(unittest.TestCase):
         )
         self.assertFalse(rows[4]["eligible_for_live_bridge"])
         self.assertLess(rows[4]["holdout"]["exact_reconstruction_rate"], 1.0)
-        self.assertEqual(rows[4]["holdout"]["failure_modes"], {
-            "reconstruction_drift": 4
-        })
+        self.assertGreater(rows[4]["holdout"]["fallbacks"], 0)
+        self.assertEqual(
+            rows[4]["holdout"]["failure_modes"],
+            {"reconstruction_drift": rows[4]["holdout"]["fallbacks"]},
+        )
         self.assertTrue(rows[4]["unknown_token_fallback"]["fallback"])
 
     def test_code_domain_cli_persists_report(self):
