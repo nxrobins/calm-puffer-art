@@ -382,6 +382,7 @@ class TelemetryLedger:
         self,
         *,
         expected_inference_requests: int | None = None,
+        performance_targets: Sequence[float] = (),
         stale_after_s: float = 600.0,
     ) -> dict[str, Any]:
         return summarize_telemetry(
@@ -389,6 +390,7 @@ class TelemetryLedger:
             pricing=self.pricing,
             path=self.path,
             expected_inference_requests=expected_inference_requests,
+            performance_targets=performance_targets,
             stale_after_s=stale_after_s,
         )
 
@@ -421,9 +423,12 @@ def summarize_telemetry(
     pricing: PricingConfig | None = None,
     path: Path | None = None,
     expected_inference_requests: int | None = None,
+    performance_targets: Sequence[float] = (),
     stale_after_s: float = 600.0,
 ) -> dict[str, Any]:
     _require_non_negative_finite("stale_after_s", stale_after_s)
+    for target in performance_targets:
+        _require_finite("performance_target", target)
     pricing = pricing or PricingConfig()
     events = _events_with_pricing(events, pricing)
     run_started_events = [
@@ -512,6 +517,9 @@ def summarize_telemetry(
             )
             for seed in seeds
         }
+        summary["learning_curve"] = _aggregate_learning_curves(
+            summary["by_seed"]
+        )
         condition_summaries[condition] = summary
     inference_priced = sum(
         event.get("metrics", {}).get("api_usd") is not None
@@ -625,6 +633,10 @@ def summarize_telemetry(
         ),
     }
     points, frontier_basis = _condition_points(condition_summaries)
+    cost_to_target, target_basis = _cost_to_target(
+        condition_summaries,
+        performance_targets,
+    )
     alerts = _monitoring_alerts(
         condition_summaries,
         coverage=coverage,
@@ -645,6 +657,8 @@ def summarize_telemetry(
             "points": points,
             "pareto_frontier": pareto_frontier(points),
             "pairwise": _pairwise_condition_comparisons(condition_summaries),
+            "cost_to_target_basis": target_basis,
+            "cost_to_target": cost_to_target,
         },
         "alerts": alerts,
         "healthy": not any(alert["severity"] == "error" for alert in alerts),
@@ -851,6 +865,11 @@ def _condition_summary(
     status_counts = Counter(
         str(event.get("dimensions", {}).get("status")) for event in finishes
     )
+    learning_curve = (
+        _learning_curve(inference, training, external_costs)
+        if seed is not None
+        else []
+    )
     return {
         "status_counts": dict(status_counts),
         "eligible_for_comparison": bool(status_counts)
@@ -885,6 +904,7 @@ def _condition_summary(
             "heldout_exact_accuracy_delta": exact_delta,
             "heldout_parse_rate_delta": parse_delta,
         },
+        "learning_curve": learning_curve,
         "cost": {
             "input_tokens": inference_rollup["prompt_tokens"],
             "output_tokens": inference_rollup["completion_tokens"],
@@ -917,6 +937,214 @@ def _condition_summary(
             ),
         },
     }
+
+
+def _learning_curve(
+    inference: Sequence[Mapping[str, Any]],
+    training: Sequence[Mapping[str, Any]],
+    external_costs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    evaluation_phases = {
+        str(event.get("dimensions", {}).get("phase"))
+        for event in inference
+        if str(event.get("dimensions", {}).get("phase", "")).startswith(
+            ("heldout_before", "heldout_checkpoint", "heldout_after")
+        )
+    }
+    ordered_phases = sorted(
+        evaluation_phases,
+        key=lambda phase: min(
+            int(event.get("sequence", 0) or 0)
+            for event in inference
+            if event.get("dimensions", {}).get("phase") == phase
+        ),
+    )
+    points: list[dict[str, Any]] = []
+    for point_index, phase in enumerate(ordered_phases):
+        phase_events = [
+            event
+            for event in inference
+            if event.get("dimensions", {}).get("phase") == phase
+        ]
+        cutoff = max(int(event.get("sequence", 0) or 0) for event in phase_events)
+        experiment_inference = [
+            event
+            for event in inference
+            if int(event.get("sequence", 0) or 0) <= cutoff
+        ]
+        learning_inference = [
+            event
+            for event in experiment_inference
+            if event.get("dimensions", {}).get("phase") == "train"
+        ]
+        cumulative_training = [
+            event
+            for event in training
+            if int(event.get("sequence", 0) or 0) <= cutoff
+        ]
+        cumulative_external = [
+            event
+            for event in external_costs
+            if int(event.get("sequence", 0) or 0) <= cutoff
+        ]
+        learning_external = [
+            event
+            for event in cumulative_external
+            if not str(event.get("dimensions", {}).get("phase", "")).startswith(
+                "heldout"
+            )
+        ]
+        experiment_rollup = _inference_rollup(experiment_inference)
+        learning_rollup = _inference_rollup(learning_inference)
+        experiment_inference_usd = _complete_sum(experiment_inference, "api_usd")
+        learning_inference_usd = _complete_sum(learning_inference, "api_usd")
+        trainer_usd = _complete_sum(cumulative_training, "trainer_usd")
+        experiment_external_usd = _complete_sum(
+            cumulative_external,
+            "amount_usd",
+        )
+        learning_external_usd = _complete_sum(learning_external, "amount_usd")
+        successful_steps = [
+            int(event.get("dimensions", {}).get("observed_step", 0) or 0)
+            for event in cumulative_training
+            if str(event.get("dimensions", {}).get("status"))
+            in {"completed", "recovered"}
+        ]
+        performance = _inference_rollup(phase_events)
+        points.append(
+            {
+                "point_index": point_index,
+                "phase": phase,
+                "checkpoint_step": max(successful_steps, default=0),
+                "mean_reward": performance["mean_reward"],
+                "exact_accuracy": performance["exact_accuracy"],
+                "parse_rate": performance["parse_rate"],
+                "experiment_requests": experiment_rollup["requests"],
+                "experiment_total_tokens": experiment_rollup["total_tokens"],
+                "experiment_token_proxy_millions": (
+                    experiment_rollup["total_tokens"] / 1_000_000.0
+                ),
+                "learning_requests": learning_rollup["requests"],
+                "learning_total_tokens": learning_rollup["total_tokens"],
+                "learning_token_proxy_millions": (
+                    learning_rollup["total_tokens"] / 1_000_000.0
+                ),
+                "experiment_total_usd": _complete_total(
+                    experiment_inference_usd,
+                    trainer_usd,
+                    experiment_external_usd,
+                ),
+                "learning_total_usd": _complete_total(
+                    learning_inference_usd,
+                    trainer_usd,
+                    learning_external_usd,
+                ),
+            }
+        )
+    return points
+
+
+def _complete_total(*values: float | None) -> float | None:
+    return sum(values) if all(value is not None for value in values) else None
+
+
+def _aggregate_learning_curves(
+    by_seed: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    curves = [
+        summary.get("learning_curve", [])
+        for summary in by_seed.values()
+        if summary.get("eligible_for_comparison")
+    ]
+    if not curves:
+        return []
+    point_indexes = sorted(
+        {
+            int(point["point_index"])
+            for curve in curves
+            for point in curve
+        }
+    )
+    numeric_fields = (
+        "checkpoint_step",
+        "mean_reward",
+        "exact_accuracy",
+        "parse_rate",
+        "experiment_requests",
+        "experiment_total_tokens",
+        "experiment_token_proxy_millions",
+        "learning_requests",
+        "learning_total_tokens",
+        "learning_token_proxy_millions",
+        "experiment_total_usd",
+        "learning_total_usd",
+    )
+    aggregate: list[dict[str, Any]] = []
+    for point_index in point_indexes:
+        points = [
+            point
+            for curve in curves
+            for point in curve
+            if int(point["point_index"]) == point_index
+        ]
+        row: dict[str, Any] = {
+            "point_index": point_index,
+            "phase": points[0]["phase"],
+            "seeds": len(points),
+        }
+        for field in numeric_fields:
+            values = [
+                float(point[field])
+                for point in points
+                if point.get(field) is not None
+            ]
+            row[f"mean_{field}"] = (
+                fmean(values) if len(values) == len(points) else None
+            )
+        aggregate.append(row)
+    return aggregate
+
+
+def _cost_to_target(
+    summaries: Mapping[str, Mapping[str, Any]],
+    targets: Sequence[float],
+) -> tuple[list[dict[str, Any]], str]:
+    curves = [
+        summary.get("learning_curve", [])
+        for summary in summaries.values()
+        if summary.get("eligible_for_comparison")
+    ]
+    monetary_complete = bool(curves) and all(
+        point.get("mean_learning_total_usd") is not None
+        for curve in curves
+        for point in curve
+    )
+    basis = (
+        "mean_learning_total_usd"
+        if monetary_complete
+        else "mean_learning_token_proxy_millions"
+    )
+    results: list[dict[str, Any]] = []
+    for condition, summary in summaries.items():
+        if not summary.get("eligible_for_comparison"):
+            continue
+        curve = summary.get("learning_curve", [])
+        for target in targets:
+            cost = minimum_cost_to_target(
+                curve,
+                target=float(target),
+                cost_key=basis,
+                performance_key="mean_mean_reward",
+            )
+            results.append(
+                {
+                    "condition": condition,
+                    "target_mean_reward": float(target),
+                    "minimum_learning_cost": cost,
+                    "reached": cost is not None,
+                }
+            )
+    return results, basis
 
 
 def _inference_rollup(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

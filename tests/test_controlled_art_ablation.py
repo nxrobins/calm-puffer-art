@@ -41,10 +41,39 @@ class ControlledArtAblationTests(unittest.TestCase):
         self.assertEqual(payload["train_tasks"], 12)
         self.assertEqual(payload["heldout_tasks"], 50)
         self.assertEqual(payload["training_updates"], 18)
-        self.assertEqual(payload["minimum_inference_requests"], 1188)
-        self.assertEqual(payload["maximum_inference_requests"], 1188)
+        self.assertEqual(payload["minimum_inference_requests"], 1788)
+        self.assertEqual(payload["maximum_inference_requests"], 1788)
+        self.assertEqual(
+            payload["checkpoint_evaluations_per_trained_condition"],
+            2,
+        )
+        self.assertEqual(payload["reward_targets"], [0.2, 0.225, 0.25])
         self.assertEqual(payload["telemetry"]["schema_version"], 1)
         self.assertTrue(payload["telemetry"]["missing_price_is_null_not_zero"])
+
+    def test_preflight_can_budget_a_targeted_recovery_condition(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--preflight",
+                "--json",
+                "--seeds",
+                "202",
+                "--conditions",
+                "direct_art",
+            ],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        payload = json.loads(completed.stdout)
+
+        self.assertEqual(payload["conditions"], ["direct_art"])
+        self.assertEqual(payload["training_updates"], 3)
+        self.assertEqual(payload["minimum_inference_requests"], 248)
+        self.assertEqual(payload["maximum_inference_requests"], 248)
 
     def test_manifest_is_deterministic_disjoint_and_balanced(self):
         namespace = load_namespace()

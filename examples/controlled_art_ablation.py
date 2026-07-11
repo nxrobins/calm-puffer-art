@@ -180,10 +180,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project", default="calm-puffer-art-ablation")
     parser.add_argument("--base-model", default="OpenPipe/Qwen3-14B-Instruct")
     parser.add_argument("--seeds", default="101,202,303")
+    parser.add_argument(
+        "--conditions",
+        default=",".join(CONDITIONS),
+        help="comma-separated subset of base,direct_art,async_scheduler",
+    )
     parser.add_argument("--manifest-seed", type=int, default=20260711)
     parser.add_argument("--train-tasks", type=int, default=12)
     parser.add_argument("--heldout-tasks", type=int, default=50)
     parser.add_argument("--train-steps", type=int, default=3)
+    parser.add_argument(
+        "--checkpoint-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="evaluate held-out tasks after each non-final training update",
+    )
+    parser.add_argument(
+        "--reward-targets",
+        default="0.20,0.225,0.25",
+        help="pre-registered held-out mean reward targets",
+    )
     parser.add_argument("--groups-per-step", type=int, default=4)
     parser.add_argument("--rollouts-per-group", type=int, default=4)
     parser.add_argument("--max-rollouts-per-group", type=int, default=4)
@@ -207,6 +223,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--telemetry-echo", action="store_true")
     args = parser.parse_args(argv)
     args.seed_values = _parse_seeds(parser, args.seeds)
+    args.condition_values = _parse_conditions(parser, args.conditions)
+    args.reward_target_values = _parse_reward_targets(parser, args.reward_targets)
     _validate_args(parser, args)
     return args
 
@@ -224,6 +242,40 @@ def _parse_seeds(
     if len(set(seeds)) != len(seeds):
         parser.error("--seeds must not contain duplicates")
     return seeds
+
+
+def _parse_reward_targets(
+    parser: argparse.ArgumentParser,
+    raw: str,
+) -> tuple[float, ...]:
+    try:
+        targets = tuple(
+            float(value.strip()) for value in raw.split(",") if value.strip()
+        )
+    except ValueError:
+        parser.error("--reward-targets must be a comma-separated list of numbers")
+    if not targets:
+        parser.error("--reward-targets must contain at least one value")
+    if any(not math.isfinite(target) or not 0.0 <= target <= 1.0 for target in targets):
+        parser.error("--reward-targets values must be finite and between 0 and 1")
+    if len(set(targets)) != len(targets):
+        parser.error("--reward-targets must not contain duplicates")
+    return targets
+
+
+def _parse_conditions(
+    parser: argparse.ArgumentParser,
+    raw: str,
+) -> tuple[str, ...]:
+    conditions = tuple(value.strip() for value in raw.split(",") if value.strip())
+    if not conditions:
+        parser.error("--conditions must contain at least one condition")
+    unknown = sorted(set(conditions) - set(CONDITIONS))
+    if unknown:
+        parser.error(f"--conditions contains unknown values: {', '.join(unknown)}")
+    if len(set(conditions)) != len(conditions):
+        parser.error("--conditions must not contain duplicates")
+    return conditions
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -353,14 +405,20 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": True,
         "mode": "preflight",
-        "conditions": list(CONDITIONS),
+        "conditions": list(args.condition_values),
         "excluded_conditions": {"calm": CALM_EXCLUSION},
         "seeds": list(args.seed_values),
         "train_tasks": len(train),
         "heldout_tasks": len(heldout),
         "train_steps_per_trained_condition": args.train_steps,
+        "checkpoint_evaluations_per_trained_condition": (
+            args.train_steps - 1 if args.checkpoint_eval else 0
+        ),
+        "reward_targets": list(args.reward_target_values),
         "training_updates": (
-            len(args.seed_values) * 2 * args.train_steps
+            len(args.seed_values)
+            * sum(condition != "base" for condition in args.condition_values)
+            * args.train_steps
         ),
         "minimum_inference_requests": minimum_requests,
         "maximum_inference_requests": maximum_requests,
@@ -388,21 +446,28 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _inference_request_bounds(args: argparse.Namespace) -> tuple[int, int]:
-    minimum_per_seed = (
-        2 * args.heldout_tasks
-        + 2
-        * (
-            2 * args.heldout_tasks
-            + args.train_tasks * args.rollouts_per_group
-        )
+    checkpoint_requests = (
+        (args.train_steps - 1) * args.heldout_tasks
+        if args.checkpoint_eval
+        else 0
     )
-    maximum_per_seed = (
+    minimum_per_seed = sum(
         2 * args.heldout_tasks
-        + 2
-        * (
-            2 * args.heldout_tasks
-            + args.train_tasks * args.max_rollouts_per_group
+        + (
+            args.train_tasks * args.rollouts_per_group + checkpoint_requests
+            if condition != "base"
+            else 0
         )
+        for condition in args.condition_values
+    )
+    maximum_per_seed = sum(
+        2 * args.heldout_tasks
+        + (
+            args.train_tasks * args.max_rollouts_per_group + checkpoint_requests
+            if condition != "base"
+            else 0
+        )
+        for condition in args.condition_values
     )
     seeds = len(args.seed_values)
     return minimum_per_seed * seeds, maximum_per_seed * seeds
@@ -649,6 +714,7 @@ async def _run_base_condition(
             final_step=initial_step,
             before=before,
             after=after,
+            checkpoint_evaluations=[],
             training=None,
             train_results=[],
             backend_attempts=delegate.attempts,
@@ -684,6 +750,7 @@ async def _run_direct_condition(
     started = time.perf_counter()
     sampled_groups: list[SampledGroup] = []
     train_results: list[dict[str, Any]] = []
+    checkpoint_evaluations: list[dict[str, Any]] = []
     ordered_train = _round_robin_strata(train)
     try:
         await model.register(delegate)
@@ -736,6 +803,22 @@ async def _run_direct_condition(
             )
             current_step = int(result.step)
             train_results.append(_train_result_report(result, train_step))
+            if args.checkpoint_eval and train_step < args.train_steps - 1:
+                evaluation = await _evaluate_manifest(
+                    client=model.openai_client(),
+                    inference_name=model.get_inference_name(step=current_step),
+                    heldout=heldout,
+                    split=f"heldout_checkpoint_step_{current_step}",
+                    args=args,
+                    semaphore=semaphore,
+                )
+                checkpoint_evaluations.append(
+                    {
+                        "train_step_index": train_step,
+                        "checkpoint_step": current_step,
+                        "evaluation": evaluation,
+                    }
+                )
         after = await _evaluate_manifest(
             client=model.openai_client(),
             inference_name=model.get_inference_name(step=current_step),
@@ -751,6 +834,7 @@ async def _run_direct_condition(
             final_step=current_step,
             before=before,
             after=after,
+            checkpoint_evaluations=checkpoint_evaluations,
             training=_training_report(sampled_groups),
             train_results=train_results,
             backend_attempts=delegate.attempts,
@@ -823,6 +907,7 @@ async def _run_scheduler_condition(
     task_offsets: Counter[str] = Counter()
     sampled_groups: list[SampledGroup] = []
     train_results: list[dict[str, Any]] = []
+    checkpoint_evaluations: list[dict[str, Any]] = []
     allocations: list[str] = []
     started = time.perf_counter()
     try:
@@ -929,6 +1014,22 @@ async def _run_scheduler_condition(
             )
             current_step = int(result.step)
             train_results.append(_train_result_report(result, train_step))
+            if args.checkpoint_eval and train_step < args.train_steps - 1:
+                evaluation = await _evaluate_manifest(
+                    client=model.openai_client(),
+                    inference_name=model.get_inference_name(step=current_step),
+                    heldout=heldout,
+                    split=f"heldout_checkpoint_step_{current_step}",
+                    args=args,
+                    semaphore=semaphore,
+                )
+                checkpoint_evaluations.append(
+                    {
+                        "train_step_index": train_step,
+                        "checkpoint_step": current_step,
+                        "evaluation": evaluation,
+                    }
+                )
         after = await _evaluate_manifest(
             client=model.openai_client(),
             inference_name=model.get_inference_name(step=current_step),
@@ -947,6 +1048,7 @@ async def _run_scheduler_condition(
             final_step=current_step,
             before=before,
             after=after,
+            checkpoint_evaluations=checkpoint_evaluations,
             training=training,
             train_results=train_results,
             backend_attempts=delegate.attempts,
@@ -1036,6 +1138,7 @@ def _condition_result(
     final_step: int,
     before: Mapping[str, Any],
     after: Mapping[str, Any],
+    checkpoint_evaluations: Sequence[Mapping[str, Any]],
     training: Mapping[str, Any] | None,
     train_results: Sequence[Mapping[str, Any]],
     backend_attempts: Sequence[Mapping[str, Any]],
@@ -1056,6 +1159,7 @@ def _condition_result(
         "checkpoint_advanced": final_step > initial_step,
         "heldout_before": before,
         "heldout_after": after,
+        "heldout_checkpoints": list(checkpoint_evaluations),
         "heldout_exact_accuracy_delta": (
             float(after["exact_accuracy"]) - float(before["exact_accuracy"])
         ),
@@ -1072,7 +1176,12 @@ def _condition_result(
         "training": training,
         "train_results": list(train_results),
         "backend_attempts": list(backend_attempts),
-        "usage": _condition_usage(before, after, training),
+        "usage": _condition_usage(
+            before,
+            after,
+            training,
+            checkpoint_evaluations=checkpoint_evaluations,
+        ),
         "wall_s": wall_s,
     }
 
@@ -1081,8 +1190,13 @@ def _condition_usage(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
     training: Mapping[str, Any] | None,
+    *,
+    checkpoint_evaluations: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, float]:
     phases = [before, after]
+    phases.extend(
+        checkpoint["evaluation"] for checkpoint in checkpoint_evaluations
+    )
     if training is not None:
         phases.append(training)
     return {
@@ -1257,16 +1371,24 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         "run_started",
         attributes={
             "base_model": args.base_model,
-            "conditions": list(CONDITIONS),
+            "conditions": list(args.condition_values),
             "manifest_fingerprint": manifest_fingerprint(train, heldout),
             "minimum_inference_requests": minimum_requests,
             "maximum_inference_requests": maximum_requests,
-            "expected_condition_runs": len(args.seed_values) * len(CONDITIONS),
+            "expected_condition_runs": (
+                len(args.seed_values) * len(args.condition_values)
+            ),
             "expected_training_updates": (
-                len(args.seed_values) * 2 * args.train_steps
+                len(args.seed_values)
+                * sum(
+                    condition != "base" for condition in args.condition_values
+                )
+                * args.train_steps
             ),
             "expected_scheduler_decisions": (
                 len(args.seed_values) * args.train_tasks
+                if "async_scheduler" in args.condition_values
+                else 0
             ),
         },
     )
@@ -1275,7 +1397,7 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         "status": "running",
         "run_id": run_id,
         "started_at_utc": datetime.now(UTC).isoformat(),
-        "conditions": list(CONDITIONS),
+        "conditions": list(args.condition_values),
         "excluded_conditions": {"calm": CALM_EXCLUSION},
         "config": {
             "base_model": args.base_model,
@@ -1285,6 +1407,8 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             "train_tasks": args.train_tasks,
             "heldout_tasks": args.heldout_tasks,
             "train_steps": args.train_steps,
+            "checkpoint_eval": args.checkpoint_eval,
+            "reward_targets": list(args.reward_target_values),
             "groups_per_step": args.groups_per_step,
             "rollouts_per_group": args.rollouts_per_group,
             "max_rollouts_per_group": args.max_rollouts_per_group,
@@ -1304,7 +1428,9 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         "runs": {},
         "report_path": str(output.resolve()),
         "telemetry_path": str(telemetry_path.resolve()),
-        "telemetry": telemetry.summary(),
+        "telemetry": telemetry.summary(
+            performance_targets=args.reward_target_values
+        ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     _write_json(output, report)
@@ -1318,7 +1444,7 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         seed_args.request_seed = seed
         seed_key = str(seed)
         report["runs"][seed_key] = {}
-        for condition in CONDITIONS:
+        for condition in args.condition_values:
             condition_args = _condition_args_with_telemetry(
                 seed_args,
                 telemetry=telemetry,
@@ -1374,7 +1500,9 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             )
             report["runs"][seed_key][condition] = condition_report
             report["aggregate"] = aggregate_results(report["runs"])
-            report["telemetry"] = telemetry.summary()
+            report["telemetry"] = telemetry.summary(
+                performance_targets=args.reward_target_values
+            )
             _write_json(output, report)
             print(
                 f"finished condition={condition} seed={seed} "
@@ -1391,10 +1519,13 @@ async def run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     telemetry.emit(
         "run_finished",
         metrics={"conditions_ok": conditions_ok},
-        attributes={"condition_runs": len(args.seed_values) * len(CONDITIONS)},
+        attributes={
+            "condition_runs": len(args.seed_values) * len(args.condition_values)
+        },
     )
     report["telemetry"] = telemetry.summary(
-        expected_inference_requests=expected_requests
+        expected_inference_requests=expected_requests,
+        performance_targets=args.reward_target_values,
     )
     report["ok"] = conditions_ok and bool(report["telemetry"]["healthy"])
     if report["ok"]:
@@ -1412,7 +1543,12 @@ def aggregate_results(runs: Mapping[str, Any]) -> dict[str, Any]:
     aggregate: dict[str, Any] = {}
     total_requests = 0.0
     total_tokens = 0.0
-    for condition in CONDITIONS:
+    active_conditions = tuple(
+        condition
+        for condition in CONDITIONS
+        if any(condition in seed_runs for seed_runs in runs.values())
+    )
+    for condition in active_conditions:
         completed = [
             seed_runs[condition]
             for seed_runs in runs.values()
@@ -1459,22 +1595,27 @@ def aggregate_results(runs: Mapping[str, Any]) -> dict[str, Any]:
                 if isinstance(training, Mapping):
                     allocations.update(training.get("scheduler_group_allocations", {}))
             aggregate[condition]["scheduler_group_allocations"] = dict(allocations)
+    comparison_pairs = (
+        ("direct_art", "base"),
+        ("async_scheduler", "base"),
+        ("async_scheduler", "direct_art"),
+    )
     aggregate["comparisons"] = {
-        "direct_art_minus_base": _paired_comparison(
-            runs, "direct_art", "base"
-        ),
-        "async_scheduler_minus_base": _paired_comparison(
-            runs, "async_scheduler", "base"
-        ),
-        "async_scheduler_minus_direct_art": _paired_comparison(
-            runs, "async_scheduler", "direct_art"
-        ),
+        f"{treatment}_minus_{reference}": _paired_comparison(
+            runs,
+            treatment,
+            reference,
+        )
+        for treatment, reference in comparison_pairs
+        if treatment in active_conditions and reference in active_conditions
     }
     aggregate["total_requests"] = total_requests
     aggregate["total_tokens"] = total_tokens
+    seed_count = len(runs)
     aggregate["interpretation"] = (
-        "Condition deltas are paired within each model run. With three seeds, "
-        "confidence intervals are descriptive and not publication-grade."
+        "Condition deltas are paired within each model run. With "
+        f"{seed_count} seed{'s' if seed_count != 1 else ''}, confidence "
+        "intervals are descriptive and not publication-grade."
     )
     return aggregate
 

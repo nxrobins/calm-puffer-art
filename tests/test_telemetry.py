@@ -349,6 +349,80 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(minimum_cost_to_target(points, target=0.55), 2.5)
         self.assertIsNone(minimum_cost_to_target(points, target=0.9))
 
+    def test_summary_builds_learning_curve_and_cost_to_target(self):
+        ledger = TelemetryLedger(run_id="learning-curve")
+        ledger.emit(
+            "condition_started",
+            dimensions={"condition": "direct_art", "seed": 1},
+        )
+
+        def inference(phase, task_id, tokens, reward):
+            ledger.record_inference(
+                condition="direct_art",
+                seed=1,
+                phase=phase,
+                task_id=task_id,
+                prompt_tokens=tokens // 2,
+                completion_tokens=tokens - tokens // 2,
+                total_tokens=tokens,
+                latency_s=0.1,
+                attempts=1,
+                reward=reward,
+                exact=False,
+                parsed=True,
+            )
+
+        inference("heldout_before", "before", 100, 0.1)
+        inference("train", "train-1", 30, 0.2)
+        ledger.record_training_attempt(
+            condition="direct_art",
+            seed=1,
+            attempt=1,
+            status="completed",
+            duration_s=1.0,
+            initial_step=0,
+            observed_step=1,
+        )
+        inference("heldout_checkpoint_step_1", "checkpoint", 100, 0.23)
+        inference("train", "train-2", 40, 0.3)
+        ledger.record_training_attempt(
+            condition="direct_art",
+            seed=1,
+            attempt=1,
+            status="completed",
+            duration_s=1.0,
+            initial_step=1,
+            observed_step=2,
+        )
+        inference("heldout_after", "after", 100, 0.3)
+        ledger.record_condition_finished(
+            condition="direct_art",
+            seed=1,
+            status="completed",
+            wall_s=3.0,
+        )
+
+        summary = ledger.summary(performance_targets=[0.2, 0.28, 0.4])
+        condition = summary["conditions"]["direct_art"]
+        curve = condition["learning_curve"]
+        targets = summary["cost_performance"]["cost_to_target"]
+
+        self.assertEqual(len(curve), 3)
+        self.assertEqual(curve[0]["mean_learning_total_tokens"], 0.0)
+        self.assertEqual(curve[1]["mean_learning_total_tokens"], 30.0)
+        self.assertEqual(curve[2]["mean_learning_total_tokens"], 70.0)
+        self.assertEqual(
+            summary["cost_performance"]["cost_to_target_basis"],
+            "mean_learning_token_proxy_millions",
+        )
+        self.assertAlmostEqual(targets[0]["minimum_learning_cost"], 0.00003)
+        self.assertAlmostEqual(targets[1]["minimum_learning_cost"], 0.00007)
+        self.assertFalse(targets[2]["reached"])
+        self.assertNotIn(
+            "cost_to_target_unobservable",
+            {alert["code"] for alert in summary["alerts"]},
+        )
+
     def test_non_finite_metrics_are_rejected(self):
         ledger = TelemetryLedger(run_id="finite")
 
