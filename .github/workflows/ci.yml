@@ -61,7 +61,7 @@ jobs:
             tests: tests/test_chunk_encoder.py tests/test_real_workload_ablation.py
           - name: OpenPipe ART structural smoke
             extra: art
-            tests: tests/test_live_art_bridge_smoke.py tests/test_real_art_weight_update.py
+            tests: tests/test_live_art_bridge_smoke.py tests/test_real_art_weight_update.py tests/test_controlled_art_ablation.py
           - name: Azure Foundry SDK offline
             extra: foundry
             tests: tests/test_foundry_codegen.py

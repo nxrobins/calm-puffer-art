@@ -142,6 +142,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--inference-retries", type=int, default=4)
+    parser.add_argument("--request-seed", type=int)
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument(
         "--input-usd-per-million-tokens",
@@ -257,6 +258,7 @@ async def _complete(
     temperature: float,
     args: argparse.Namespace,
     semaphore: asyncio.Semaphore,
+    request_seed: int | None = None,
 ) -> CompletionRecord:
     started = time.perf_counter()
     response = None
@@ -264,15 +266,23 @@ async def _complete(
     for attempts in range(1, args.inference_retries + 1):
         try:
             async with semaphore:
-                response = await client.chat.completions.create(
-                    model=inference_name,
-                    messages=[
+                request = {
+                    "model": inference_name,
+                    "messages": [
                         SYSTEM_MESSAGE,
                         {"role": "user", "content": task.prompt},
                     ],
-                    temperature=temperature,
-                    max_tokens=args.max_tokens,
+                    "temperature": temperature,
+                    "max_tokens": args.max_tokens,
+                }
+                effective_seed = (
+                    request_seed
+                    if request_seed is not None
+                    else getattr(args, "request_seed", None)
                 )
+                if effective_seed is not None:
+                    request["seed"] = int(effective_seed)
+                response = await client.chat.completions.create(**request)
             break
         except Exception:
             if attempts >= args.inference_retries:
