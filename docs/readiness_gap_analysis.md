@@ -21,7 +21,7 @@ quality, real monetary inputs, repeated budget sweeps, and real CALM integration
 | Axis | Current status | Gap | Next proof |
 | --- | --- | --- | --- |
 | Signal quality | Mostly exogenous. The runtime accepts rewards, verifiers, promotion evaluators, and failure metadata, but it does not make weak rewards strong. | Better task rewards, held-out verifiers, curriculum, and KL/logprob tuning. | A task where verifier quality predicts downstream policy improvement. |
-| Semantic bandwidth | Locally smoke-proven. Token, chunk, latent-patch stand-ins, command units, reasoning-step units, adaptive action-space promotion, and a tiny optional torch learned chunk encoder are implemented. | The learned encoder is smoke-only: no production corpus, no real ART/vLLM loss integration, and no upstream CALM checkpoint. | Run the learned chunk path inside a real ART training job once the async bridge is live. |
+| Semantic bandwidth | Offline domain proof. Token and semantic stand-ins remain available, and a bounded Python code-repair codec now has verified checkpoint save/load, held-out reconstruction, fallback evaluation, and explicit candidate rejection. Chunk size 2 passed; chunk size 4 did not. | The corpus and whitespace vocabulary are deliberately tiny. Scorer logprobs are not conditioned on the serving LLM state, and ART does not optimize chunk actions. | Add a native policy adapter that produces state-conditioned chunk actions and connect its old/new/reference logprobs to a real ART loss. |
 | Allocation efficiency | Heavily invested. Joint-action payoff and scoped runtime-control feedback are implemented. | Risk of diminishing returns without real reward/cost signal; the scheduler can optimize only the evidence it receives. | A live run showing scheduler choices improve reward per dollar-second over fixed async ART. |
 | Cost measurement fidelity | Runtime accounting is joined by a versioned experiment evidence ledger covering raw performance, tokens, latency, retries, trainer lifecycle, scheduler allocation, pricing coverage, and Pareto views. Missing price is explicit rather than zero. | The valid live run supplied no authoritative inference or trainer rates, and trainer wall time is not the same as billed active GPU time. | Add provider-authoritative token, trainer, tool, and evaluator prices, then run repeated fixed-cost and fixed-quality sweeps. |
 | Learnability | Underdeveloped. Current control is local bandit-style learning with exploration bonuses and optional confidence penalties. | Joint-action spaces can become sparse and combinatorial. No sample-complexity model or adaptive exploration budget exists yet. | Stress profiles plus a policy for pruning, factorizing, or backing off from low-evidence joint keys. |
@@ -34,8 +34,9 @@ quality, real monetary inputs, repeated budget sweeps, and real CALM integration
    API, token, tool, and evaluator costs.
 2. Cost-performance sweeps: compare fixed-budget quality, fixed-quality cost,
    time-to-target, and the Pareto frontier across more seeds and checkpoints.
-3. Semantic-bandwidth integration: feed the optional learned encoder's explicit
-   action logprob and reconstruction contract into a real training run.
+3. Semantic-bandwidth integration: use the eligible chunk-size-2 checkpoint to
+   build a state-conditioned policy adapter, then feed genuine policy logprobs
+   and reconstruction evidence into a real ART training run.
 4. Scalability guardrails: use the scheduler profile to detect when the current
    tabular joint-action controller needs pruning or factorization.
 

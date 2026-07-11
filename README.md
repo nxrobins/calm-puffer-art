@@ -103,6 +103,7 @@ AZURE_OPENAI_API_VERSION=...
 | Three-condition local codegen showcase | `python examples\python_codegen_showcase.py --json` |
 | Scheduler state-size and timing profile | `python examples\scalability_profile.py` |
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
+| Offline code-domain chunk proof | `python examples\code_domain_chunk_codec.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
 | Real ART weight-update preflight | `python examples\real_art_weight_update.py --preflight --json` |
 | Controlled live ART ablation preflight | `python examples\controlled_art_ablation.py --preflight --json` |
@@ -317,6 +318,7 @@ Optional checks:
 
 ```powershell
 python examples\chunk_encoder_smoke.py --json
+python examples\code_domain_chunk_codec.py --json
 python examples\live_art_bridge_smoke.py --backend structural --json
 python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name
 ```
@@ -340,6 +342,7 @@ cloud/GPU resources depending on the mode.
 - `docs/architecture.md`: higher-level runtime architecture.
 - `docs/art_puffer_calm_synthesis.md`: original ART/Puffer/CALM synthesis.
 - `docs/readiness_gap_analysis.md`: gaps before a serious external integration.
+- `docs/calm_domain_codec_result.md`: offline code-domain checkpoint and reconstruction result.
 
 ## References
 
