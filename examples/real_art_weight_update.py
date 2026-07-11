@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 SYSTEM_MESSAGE = {
@@ -142,6 +142,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--inference-retries", type=int, default=4)
+    parser.add_argument("--request-seed", type=int)
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument(
         "--input-usd-per-million-tokens",
@@ -257,6 +258,8 @@ async def _complete(
     temperature: float,
     args: argparse.Namespace,
     semaphore: asyncio.Semaphore,
+    request_seed: int | None = None,
+    completion_observer: Callable[[CompletionRecord], None] | None = None,
 ) -> CompletionRecord:
     started = time.perf_counter()
     response = None
@@ -264,15 +267,23 @@ async def _complete(
     for attempts in range(1, args.inference_retries + 1):
         try:
             async with semaphore:
-                response = await client.chat.completions.create(
-                    model=inference_name,
-                    messages=[
+                request = {
+                    "model": inference_name,
+                    "messages": [
                         SYSTEM_MESSAGE,
                         {"role": "user", "content": task.prompt},
                     ],
-                    temperature=temperature,
-                    max_tokens=args.max_tokens,
+                    "temperature": temperature,
+                    "max_tokens": args.max_tokens,
+                }
+                effective_seed = (
+                    request_seed
+                    if request_seed is not None
+                    else getattr(args, "request_seed", None)
                 )
+                if effective_seed is not None:
+                    request["seed"] = int(effective_seed)
+                response = await client.chat.completions.create(**request)
             break
         except Exception:
             if attempts >= args.inference_retries:
@@ -295,7 +306,7 @@ async def _complete(
         prompt_tokens * args.input_usd_per_million_tokens
         + completion_tokens * args.output_usd_per_million_tokens
     ) / 1_000_000.0
-    return CompletionRecord(
+    record = CompletionRecord(
         task=task,
         split=split,
         content=content,
@@ -310,6 +321,10 @@ async def _complete(
         attempts=attempts,
         choice=choice,
     )
+    observer = completion_observer or getattr(args, "completion_observer", None)
+    if observer is not None:
+        observer(record)
+    return record
 
 
 async def _evaluate(

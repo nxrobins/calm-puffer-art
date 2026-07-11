@@ -105,6 +105,8 @@ AZURE_OPENAI_API_VERSION=...
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
 | Real ART weight-update preflight | `python examples\real_art_weight_update.py --preflight --json` |
+| Controlled live ART ablation preflight | `python examples\controlled_art_ablation.py --preflight --json` |
+| Experiment telemetry report | `python examples\telemetry_report.py artifacts\run.telemetry.jsonl --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
 
@@ -206,6 +208,20 @@ python examples\real_art_weight_update.py --preflight --json
 
 The first verified step-1 artifact and its flat held-out result are recorded in
 [`docs/real_art_weight_update_result.md`](docs/real_art_weight_update_result.md).
+
+The three-seed, fixed-budget comparison of no training, direct ART, and ART
+through the adaptive scheduler is recorded in
+[`docs/controlled_art_ablation_result.md`](docs/controlled_art_ablation_result.md).
+Its live command is:
+
+```powershell
+python examples\controlled_art_ablation.py --env-path .env --json
+```
+
+The harness writes append-only experiment telemetry and embeds coverage,
+cost-performance, Pareto, and monitoring-alert summaries in its report. The
+schema, pricing semantics, and offline repricing workflow are documented in
+[`docs/telemetry.md`](docs/telemetry.md).
 
 Manual real-backend modes are available:
 
