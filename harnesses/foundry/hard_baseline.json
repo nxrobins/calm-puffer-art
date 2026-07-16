@@ -1,0 +1,34 @@
+{
+  "action_codecs": [
+    "token"
+  ],
+  "action_unit_dollar_seconds": 0.04,
+  "budget_dollar_seconds": 220.0,
+  "budget_race": true,
+  "conditions": [
+    "static_art"
+  ],
+  "deployment": "your-deployment-name",
+  "description": "Static token-level Foundry fixed-budget profile on the hard held-out repair split.",
+  "env_path": ".env",
+  "heartbeat_interval_s": 30.0,
+  "max_completion_tokens": 900,
+  "model_call_budget": 256,
+  "name": "hard_baseline",
+  "output_contract": "python_solve_function_only",
+  "primary_condition": "static_art",
+  "promotion_metric": "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second",
+  "prompt_context_policy": "repair_prompt_only",
+  "request_dollar_seconds": 2.0,
+  "request_timeout_s": 120.0,
+  "retry_policy": "none",
+  "run_timeout_s": 3600.0,
+  "scheduler_mode": "static_art_round_robin_budget",
+  "task_limit": 5,
+  "task_split": "hard_heldout",
+  "telemetry_filename": "telemetry.jsonl",
+  "train_steps": 512,
+  "verifier": "isolated_subprocess_unit_tests",
+  "verify_memory_limit_mib": 512,
+  "verify_timeout_s": 3.0
+}

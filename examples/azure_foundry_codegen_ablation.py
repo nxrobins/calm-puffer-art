@@ -13,14 +13,23 @@ from typing import Any, Awaitable, Callable
 from calm_puffer_art.foundry_codegen import (
     DEFAULT_FOUNDRY_ACTION_UNIT_DOLLAR_SECONDS,
     DEFAULT_FOUNDRY_BUDGET_DOLLAR_SECONDS,
+    DEFAULT_FOUNDRY_CONDITIONS,
     DEFAULT_FOUNDRY_DEPLOYMENT,
     DEFAULT_FOUNDRY_ENV_PATH,
     DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS,
     DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
+    DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
     DEFAULT_FOUNDRY_REQUEST_DOLLAR_SECONDS,
+    DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S,
     DEFAULT_FOUNDRY_TASK_LIMIT,
+    DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
+    DEFAULT_FOUNDRY_TASK_SPLIT,
     DEFAULT_FOUNDRY_TRAIN_STEPS,
     DEFAULT_FOUNDRY_VERIFY_MEMORY_LIMIT_BYTES,
+    DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
+    FOUNDRY_CONDITIONS,
+    FOUNDRY_PROMPT_CONTEXT_POLICIES,
+    FOUNDRY_TASK_ORDER_POLICIES,
     AzureFoundryCodegenConfig,
     run_azure_foundry_budget_race,
     run_azure_foundry_codegen_ablation,
@@ -62,8 +71,14 @@ async def _run(
     deployment: str,
     max_train_steps: int,
     task_limit: int,
+    task_split: str,
+    prompt_context_policy: str,
+    task_order_policy: str,
+    conditions: tuple[str, ...],
     model_call_budget: int,
     max_completion_tokens: int,
+    request_timeout_s: float,
+    verify_timeout_s: float,
     request_dollar_seconds: float,
     action_unit_dollar_seconds: float,
     verify_memory_limit_bytes: int,
@@ -75,8 +90,13 @@ async def _run(
         deployment=deployment,
         max_train_steps=max_train_steps,
         task_limit=task_limit,
+        task_split=task_split,
+        prompt_context_policy=prompt_context_policy,
+        task_order_policy=task_order_policy,
         model_call_budget=model_call_budget,
         max_completion_tokens=max_completion_tokens,
+        request_timeout_s=request_timeout_s,
+        verify_timeout_s=verify_timeout_s,
         request_dollar_seconds=request_dollar_seconds,
         action_unit_dollar_seconds=action_unit_dollar_seconds,
         verify_memory_limit_bytes=verify_memory_limit_bytes,
@@ -85,8 +105,12 @@ async def _run(
         return await run_azure_foundry_budget_race(
             config=config,
             budget_dollar_seconds=budget_dollar_seconds,
+            conditions=conditions,
         )
-    return await run_azure_foundry_codegen_ablation(config=config)
+    return await run_azure_foundry_codegen_ablation(
+        config=config,
+        conditions=conditions,
+    )
 
 
 async def _run_with_watchdog(
@@ -203,6 +227,34 @@ def _parse_args() -> argparse.Namespace:
         help="Number of embedded repair tasks to include.",
     )
     parser.add_argument(
+        "--task-split",
+        default=DEFAULT_FOUNDRY_TASK_SPLIT,
+        help=(
+            "Embedded repair task split: standard, standard_heldout, hard, "
+            "hard_heldout, mixed_heldout, frontier_smoke, frontier_balanced, "
+            "frontier_hard, or frontier_full."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-context-policy",
+        default=DEFAULT_FOUNDRY_PROMPT_CONTEXT_POLICY,
+        choices=FOUNDRY_PROMPT_CONTEXT_POLICIES,
+        help="Prompt context policy for live Foundry repair requests.",
+    )
+    parser.add_argument(
+        "--task-order-policy",
+        default=DEFAULT_FOUNDRY_TASK_ORDER_POLICY,
+        choices=FOUNDRY_TASK_ORDER_POLICIES,
+        help="Deterministic task ordering policy before task-limit truncation.",
+    )
+    parser.add_argument(
+        "--conditions",
+        nargs="+",
+        default=list(DEFAULT_FOUNDRY_CONDITIONS),
+        choices=FOUNDRY_CONDITIONS,
+        help="Condition preset(s) to execute.",
+    )
+    parser.add_argument(
         "--model-call-budget",
         type=int,
         default=DEFAULT_FOUNDRY_MODEL_CALL_BUDGET,
@@ -213,6 +265,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_FOUNDRY_MAX_COMPLETION_TOKENS,
         help="Maximum completion tokens per Foundry call.",
+    )
+    parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=DEFAULT_FOUNDRY_REQUEST_TIMEOUT_S,
+        help="Per-request Azure Foundry timeout in seconds.",
+    )
+    parser.add_argument(
+        "--verify-timeout-s",
+        type=float,
+        default=DEFAULT_FOUNDRY_VERIFY_TIMEOUT_S,
+        help="Per-candidate verifier timeout in seconds.",
     )
     parser.add_argument(
         "--request-dollar-seconds",
@@ -273,6 +337,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--model-call-budget must be non-negative")
     if args.max_completion_tokens < 1:
         raise SystemExit("--max-completion-tokens values must be positive")
+    if args.request_timeout_s <= 0.0:
+        raise SystemExit("--request-timeout-s must be positive")
+    if args.verify_timeout_s <= 0.0:
+        raise SystemExit("--verify-timeout-s must be positive")
     if args.request_dollar_seconds < 0.0:
         raise SystemExit("--request-dollar-seconds must be non-negative")
     if args.action_unit_dollar_seconds < 0.0:
@@ -305,9 +373,13 @@ def main() -> None:
     )
     run_metadata = {
         "budget_race": bool(args.budget_race),
+        "conditions": list(args.conditions),
         "deployment": args.deployment,
         "model_call_budget": args.model_call_budget,
+        "prompt_context_policy": args.prompt_context_policy,
+        "task_order_policy": args.task_order_policy,
         "task_limit": args.task_limit,
+        "task_split": args.task_split,
         "train_steps": args.train_steps,
     }
     try:
@@ -318,8 +390,14 @@ def main() -> None:
                     deployment=args.deployment,
                     max_train_steps=args.train_steps,
                     task_limit=args.task_limit,
+                    task_split=args.task_split,
+                    prompt_context_policy=args.prompt_context_policy,
+                    task_order_policy=args.task_order_policy,
+                    conditions=tuple(args.conditions),
                     model_call_budget=args.model_call_budget,
                     max_completion_tokens=args.max_completion_tokens,
+                    request_timeout_s=args.request_timeout_s,
+                    verify_timeout_s=args.verify_timeout_s,
                     request_dollar_seconds=args.request_dollar_seconds,
                     action_unit_dollar_seconds=args.action_unit_dollar_seconds,
                     verify_memory_limit_bytes=args.verify_memory_limit_mib

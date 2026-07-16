@@ -1,0 +1,34 @@
+{
+  "action_codecs": [
+    "token"
+  ],
+  "action_unit_dollar_seconds": 0.04,
+  "budget_dollar_seconds": 320.0,
+  "budget_race": true,
+  "conditions": [
+    "scheduler_only"
+  ],
+  "deployment": "your-deployment-name",
+  "description": "Objective scheduler with token-only actions on the frontier hard repair ladder.",
+  "env_path": ".env",
+  "heartbeat_interval_s": 30.0,
+  "max_completion_tokens": 900,
+  "model_call_budget": 256,
+  "name": "frontier_scheduler_only",
+  "output_contract": "python_solve_function_only",
+  "primary_condition": "scheduler_only",
+  "promotion_metric": "north_star/accounted_published_policy_reward_improving_experience_per_dollar_second",
+  "prompt_context_policy": "repair_prompt_only",
+  "request_dollar_seconds": 2.0,
+  "request_timeout_s": 120.0,
+  "retry_policy": "none",
+  "run_timeout_s": 5400.0,
+  "scheduler_mode": "objective_scheduler_token_only",
+  "task_limit": 32,
+  "task_split": "frontier_hard",
+  "telemetry_filename": "telemetry.jsonl",
+  "train_steps": 768,
+  "verifier": "isolated_subprocess_unit_tests",
+  "verify_memory_limit_mib": 512,
+  "verify_timeout_s": 3.0
+}

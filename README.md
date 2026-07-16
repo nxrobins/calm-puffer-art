@@ -117,6 +117,10 @@ AZURE_OPENAI_API_VERSION=...
 | Experiment telemetry report | `python examples\telemetry_report.py artifacts\run.telemetry.jsonl --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
+| Foundry harness candidate run | `python examples\foundry_harness_run.py --candidate full_trinity --output-dir .codex\foundry-runs\trial --json` |
+| Foundry harness replicate batch | `python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --json` |
+| Foundry harness comparison | `python examples\foundry_harness_compare.py --runs .codex\foundry-runs --json` |
+| Foundry harness diagnostics | `python examples\foundry_harness_analyze.py --runs .codex\foundry-runs --run-prefix frontier-live --json` |
 
 ## Architecture
 
@@ -162,6 +166,7 @@ unsafe, stale, rejected, or expensive samples remain in the denominator.
 | `calm_puffer_art.chunk_encoder` | Optional torch learned chunk codec smoke |
 | `calm_puffer_art.codegen_ablation` | Deterministic Python codegen verifier experiments |
 | `calm_puffer_art.foundry_codegen` | Optional live Azure Foundry Python repair workload |
+| `calm_puffer_art.foundry_harness` | Foundry candidate manifests, artifacts, failure taxonomy, and comparison |
 | `calm_puffer_art.objective_ablation` | Synthetic and torch-gated scheduler ablations |
 | `calm_puffer_art.scalability` | Scheduler scale/readiness profiler |
 
@@ -251,7 +256,11 @@ measured peak resident-memory budget. It compares:
 
 - `static_art`: fixed token-level round-robin baseline
 - `scheduler_only`: objective scheduler with token actions
+- `chunk2_only`: objective scheduler with token and chunk2 actions
+- `chunk4_only`: objective scheduler with token and chunk4 actions
 - `full_trinity`: objective scheduler plus token/chunk semantic action units
+- `full_trinity_patient_demote`: full-trinity with chunk demotion delayed until four pulls
+- `full_trinity_no_demote`: full-trinity with adaptive chunk demotion disabled
 
 Train-step ablation:
 
@@ -277,9 +286,171 @@ Heartbeat events are written to stderr so stdout remains parseable JSON. The
 telemetry file records `run_started`, `run_heartbeat`, `run_completed`,
 `run_failed`, or `run_timeout` events with elapsed time and run settings.
 
-The fixed-budget race is the sharper test when asking whether the system wins on
-both performance and cost. It stops every condition on the same accounted
-dollar-second ceiling and reports:
+### Foundry Harness Lab
+
+The harness layer is a reproducible artifact shell around executable Foundry
+candidate profiles. It keeps candidate editing manual while making every run
+inspectable and comparable.
+
+True north: maximize held-out, verifier-confirmed repair improvement per
+accounted dollar-second on task splits that are hard enough not to saturate.
+The primary comparison key is
+`north_star/accounted_published_policy_reward_improving_experience_per_dollar_second`,
+with held-out reward preferred whenever a run includes held-out verification.
+A candidate is better only when its durable artifacts show that it is more
+reliable, more efficient, or more generalizing than the baseline, and the
+diagnostics explain where the gain came from or why it failed.
+
+Checked-in candidates live in `harnesses/foundry/`:
+
+- `baseline.json`: static token-level budget reference on the standard held-out split
+- `full_trinity.json`: objective scheduler plus adaptive token/chunk actions on the standard held-out split
+- `hard_baseline.json`: static token-level budget reference on harder repair tasks
+- `hard_full_trinity.json`: full-trinity profile on harder repair tasks
+- `frontier_baseline.json`: static token-level budget reference on the frontier hard ladder
+- `frontier_scheduler_only.json`: objective scheduler with token-only actions on the frontier hard ladder
+- `frontier_chunk2_only.json`: experimental objective scheduler probe with token and chunk2 actions only
+- `frontier_chunk4_only.json`: experimental objective scheduler probe with token and chunk4 actions only
+- `frontier_full_trinity.json`: full-trinity profile on the frontier hard ladder
+- `frontier_full_trinity_patient_demote.json`: experimental full-trinity profile with adaptive chunk demotion delayed until four pulls
+- `frontier_full_trinity_no_demote.json`: experimental full-trinity profile with adaptive chunk demotion disabled
+- `frontier_task_metadata.json`: experimental full-trinity prompt-policy probe with metadata only
+- `frontier_failure_tag_guardrails.json`: experimental full-trinity prompt-policy probe keyed by failure tags
+- `frontier_data_model_guardrails.json`: experimental full-trinity prompt-policy probe for data-model failures
+- `frontier_coverage_gap_first.json`: experimental full-trinity allocation probe that attempts shared coverage-gap tasks first
+- `frontier_lift_pocket_first.json`: experimental full-trinity allocation probe that replays observed positive lift pockets first
+
+Each manifest selects the condition(s) to execute through `conditions`, the
+condition used for ranking through `primary_condition`, and the workload through
+`task_split`. Experimental probes can set `promotion_eligible` to `false`, so
+they remain visible in comparisons and diagnostics without causing
+`promotion_readiness` to request more runs or recommend promotion. Supported
+splits are `standard`, `standard_heldout`, `hard`, `hard_heldout`,
+`mixed_heldout`, `frontier_smoke`, `frontier_balanced`, `frontier_hard`, and
+`frontier_full`. Held-out splits reuse task IDs with stricter edge-case tests,
+so the harness can re-verify learned repairs without another model request.
+
+`prompt_context_policy` is an explicit candidate knob. `repair_prompt_only`
+preserves the base prompt, `task_metadata` adds task family/difficulty/tags,
+`failure_tag_guardrails` adds concise checklists keyed by failure tags, and
+`data_model_guardrails` adds a selective checklist only for data-model tasks.
+`task_order_policy` is a separate allocation knob. `split_order` preserves the
+checked-in split order, `coverage_gap_first` moves the currently shared held-out
+coverage-gap tasks to the front, and `lift_pocket_first` replays tasks where
+full-trinity has shown positive lift over baseline. Allocation probes are
+experimental by default because they are derived from existing artifacts, not a
+stable promotion rule.
+
+The frontier ladder is a self-contained 40-task corpus spanning sequence,
+string parsing, intervals, state machines, graphs, data models, numeric logic,
+and real bug patterns. Each task carries family, difficulty, and failure-tag
+metadata; result payloads summarize coverage, held-out pass rate by
+family/difficulty, and saturation indicators.
+
+Run one candidate:
+
+```powershell
+$env:PYTHONPATH = "src"
+python examples\foundry_harness_run.py --candidate full_trinity --output-dir .codex\foundry-runs\trial --json
+```
+
+Compare saved runs:
+
+```powershell
+python examples\foundry_harness_compare.py --runs .codex\foundry-runs --json
+```
+
+Add `--run-prefix <prefix>` when comparing only one batch from a shared runs
+directory.
+
+Analyze why a saved batch won or failed:
+
+```powershell
+python examples\foundry_harness_analyze.py --runs .codex\foundry-runs --run-prefix frontier-live --json
+```
+
+Diagnostics include winner, deltas versus the static baseline, budget exhaustion,
+weakest held-out families/difficulties/failure tags, non-saturation state, and
+exact held-out task failures when the run artifact includes per-task results.
+They also include `failure_pockets`, which aggregates repeated runs by task,
+family, difficulty, and failure tag, then reports which tasks got better or
+worse versus the static baseline. When older artifacts omit task metadata, the
+analyzer backfills it from the checked-in embedded corpus registry by task ID.
+`promotion_readiness` defaults to holding a candidate unless it has at least
+three successful runs, beats the static baseline median score, and leads the
+baseline pairwise comparison by at least 60%. `next_hypotheses` converts those
+same artifacts into deterministic follow-up actions such as running missing
+replicates, studying unstable lift, keeping failed probes out of promotion,
+running the existing coverage-gap allocation probe, rejecting replicated probes
+that underperform baseline, running codec-stability probes for unstable lift,
+running chunk4 codec ablations after replicated chunk2 evidence, running
+adaptive demotion ablations after replicated chunk4 evidence, running
+patient-demotion threshold probes after disabling demotion fails, running
+positive-lift replay probes, or designing a new probe around shared unsolved
+held-out pockets. Shared-pocket diagnostics include dominant failure modes and
+classify whether the next probe should focus on task allocation/coverage, repair
+quality, output contracts, or runtime/verifier hardening.
+
+Run a small replicate batch:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --json
+```
+
+Run the harder held-out comparison:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates hard_baseline hard_full_trinity --replicates 3 --json
+```
+
+Run the frontier hard ladder:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates frontier_baseline frontier_scheduler_only frontier_full_trinity --replicates 3 --json
+```
+
+Run prompt-policy probes separately before considering them for promotion:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates frontier_task_metadata --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_failure_tag_guardrails --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_data_model_guardrails --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_coverage_gap_first --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_chunk2_only --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_chunk4_only --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_full_trinity_no_demote --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_full_trinity_patient_demote --replicates 3 --json
+python examples\foundry_harness_batch.py --candidates frontier_lift_pocket_first --replicates 3 --json
+```
+
+For local credentials or deployment names that should not be checked into a
+manifest, use runtime overrides:
+
+```powershell
+python examples\foundry_harness_batch.py --candidates baseline full_trinity --replicates 3 --env-path .env --deployment your-deployment-name --json
+```
+
+Run outputs are written under `.codex/foundry-runs/`, which is ignored by git.
+Each run directory contains:
+
+- `manifest.json`: resolved candidate manifest copy
+- `result.json`: parsed Foundry experiment payload or parseable failure payload
+- `telemetry.jsonl`: watchdog lifecycle events
+- `stdout.txt` and `stderr.txt`: captured child process streams
+- `summary.json`: condition metrics and ranking score
+- `failures.json`: setup, timeout, model, verifier, parse, answer, budget, and
+  scheduler/control failure categories
+
+The comparison payload also includes `candidate_aggregates`, which groups run
+summaries by candidate and reports successful runs, failure rate, mean/median
+ranking score, best score, worst score, mean accounted spend, and the best
+artifact directory. For repeated batches, `candidate_pairwise` reports all
+successful candidate pairs with win/tie/loss counts, win rates, mean score
+delta, and mean accounted-spend delta.
+
+The fixed-budget profile is the sharper test when asking whether a candidate
+wins on both performance and cost. It stops each selected condition on the same
+accounted dollar-second ceiling and reports:
 
 - learned verified repairs
 - accounted dollar-seconds
@@ -288,11 +459,14 @@ dollar-second ceiling and reports:
 - verifier passes
 - token/chunk pulls
 - semantic bandwidth
+- held-out pass rate and held-out north-star score when the split provides
+  hidden edge-case tasks
 
-Current empirical caveat: on the 17-task Foundry workload, full-trinity found a
-qualified performance-plus-cost win versus `scheduler_only` at one sampled budget,
-but did not beat the static round-robin baseline overall. The task bank still
-saturates too easily for a broad performance claim.
+Current empirical caveat: the original 17-task Foundry workload saturated too
+easily. Use `frontier_hard` or `frontier_full` before making claims about
+full-trinity lift. Optional future corpus adapters are reserved for EvalPlus,
+BigCodeBench, QuixBugs, BugsInPy, SWE-bench, and LiveCodeBench; default CI does
+not download or depend on them.
 
 ## Metrics To Watch
 
@@ -307,6 +481,9 @@ Useful run-summary keys:
 | `scheduler/arm/*/total_improvement_per_dollar_second` | Arm-level value signal |
 | `action_space/active_codecs` | Count of currently active action codecs |
 | `foundry/learned_solutions` | Verified repair tasks stored by the Foundry trainer |
+| `heldout/pass_rate` | Fraction of hidden edge-case task variants passed by learned repairs |
+| `task_coverage.train.families` | Train task family counts for the selected split |
+| `non_saturation.conditions.*.learned_fraction` | Learned task fraction for each executed condition |
 | `foundry/codec/*/pulls` | Foundry workload pulls by action codec |
 
 ## Development
