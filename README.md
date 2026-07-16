@@ -42,7 +42,7 @@ What works today:
 
 What is intentionally out of scope for the core package:
 
-- training real LLM weights
+- implementing LLM optimizer or loss internals; real updates are delegated to ART
 - implementing GRPO/CISPO losses
 - managing CUDA/vLLM serving
 - implementing PufferLib internals
@@ -61,7 +61,7 @@ Optional extras:
 ```powershell
 py -m pip install -e ".[dev]"      # pytest only
 py -m pip install -e ".[calm]"     # torch-backed chunk encoder smoke
-py -m pip install -e ".[art]"      # real ART structural smoke
+py -m pip install -e ".[art]"      # ART contract and serverless proof
 py -m pip install -e ".[foundry]"  # Azure Foundry live codegen benchmark
 ```
 
@@ -110,6 +110,9 @@ AZURE_OPENAI_API_VERSION=...
 | Scheduler state-size and timing profile | `python examples\scalability_profile.py` |
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
+| Real ART weight-update preflight | `python examples\real_art_weight_update.py --preflight --json` |
+| Controlled live ART ablation preflight | `python examples\controlled_art_ablation.py --preflight --json` |
+| Experiment telemetry report | `python examples\telemetry_report.py artifacts\run.telemetry.jsonl --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
 
@@ -188,8 +191,8 @@ cost-effective semantic bandwidth.
 
 ## ART Integration
 
-The package does not import ART at top level. Install `.[art]` only when you want
-the real structural smoke:
+The package does not import ART at top level. Install `.[art]` for the current
+ART contract smoke or serverless weight-update proof:
 
 ```powershell
 py -m pip install -e ".[art]"
@@ -200,6 +203,31 @@ python examples\live_art_bridge_smoke.py --backend structural --json
 The bridge preserves raw ART group and trajectory objects in metadata, so the
 control plane can use local scheduler telemetry while a real backend can still
 receive ART-shaped objects.
+
+The binding serverless experiment is documented in
+[`docs/real_art_weight_update.md`](docs/real_art_weight_update.md). Its preflight
+is offline and does not require credentials:
+
+```powershell
+python examples\real_art_weight_update.py --preflight --json
+```
+
+The first verified step-1 artifact and its flat held-out result are recorded in
+[`docs/real_art_weight_update_result.md`](docs/real_art_weight_update_result.md).
+
+The three-seed, fixed-budget comparison of no training, direct ART, and ART
+through the adaptive scheduler is recorded in
+[`docs/controlled_art_ablation_result.md`](docs/controlled_art_ablation_result.md).
+Its live command is:
+
+```powershell
+python examples\controlled_art_ablation.py --env-path .env --json
+```
+
+The harness writes append-only experiment telemetry and embeds coverage,
+cost-performance, Pareto, and monitoring-alert summaries in its report. The
+schema, pricing semantics, and offline repricing workflow are documented in
+[`docs/telemetry.md`](docs/telemetry.md).
 
 Manual real-backend modes are available:
 

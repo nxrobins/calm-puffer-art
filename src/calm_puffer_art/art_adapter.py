@@ -363,6 +363,58 @@ class AsyncArtBackend:
         name = str(getattr(model, "name", "model"))
         return name if step is None else f"{name}@{step}"
 
+    async def _prepare_backend_for_training(
+        self,
+        model: Any,
+        config: Any,
+    ) -> tuple[str, str]:
+        """Delegate ART's inference endpoint preparation lifecycle hook."""
+
+        delegate = getattr(self.backend, "_prepare_backend_for_training", None)
+        if delegate is None:
+            raise AttributeError(
+                "wrapped ART backend has no _prepare_backend_for_training"
+            )
+        result = await _maybe_await(delegate(model, config))
+        return result
+
+    async def _delete_checkpoint_files(
+        self,
+        model: Any,
+        steps_to_keep: Sequence[int],
+    ) -> None:
+        """Delegate ART checkpoint cleanup without importing ART internals."""
+
+        delegate = getattr(self.backend, "_delete_checkpoint_files", None)
+        if delegate is None:
+            raise AttributeError("wrapped ART backend has no _delete_checkpoint_files")
+        await _maybe_await(delegate(model, steps_to_keep))
+
+    async def _train_sft(
+        self,
+        model: Any,
+        trajectories: Sequence[Any],
+        config: Any,
+        dev_config: Any,
+        verbose: bool = False,
+    ):
+        """Stream ART SFT updates from the wrapped backend when requested."""
+
+        delegate = getattr(self.backend, "_train_sft", None)
+        if delegate is None:
+            raise AttributeError("wrapped ART backend has no _train_sft")
+        updates = delegate(
+            model,
+            trajectories,
+            config,
+            dev_config,
+            verbose=verbose,
+        )
+        if inspect.isawaitable(updates):
+            updates = await updates
+        async for update in updates:
+            yield update
+
     async def register(self, model: Any) -> None:
         self._model = model
         delegate = getattr(self.backend, "register", None)

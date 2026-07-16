@@ -277,6 +277,22 @@ The runtime also reports attributed cost telemetry:
 
 `costs/runtime_dollar_seconds` remains the wall-clock infrastructure denominator for compatibility. The accounted denominator is useful when tuning actor count, train cadence, model/API spend, promotion gates, or backpressure because it exposes where the local scaffold is spending work. Scheduler train objective receives trainer wait and admitted train-ring producer wait as part of the candidate dollar-second denominator, so large batch cadence can be penalized when it keeps the trainer idle or backs up the train ring. If queued work becomes stale first, the same producer-wait spend is debited through stale feedback as `scheduler/costs/stale_additional_dollar_seconds`; if stale feedback is the first scheduler observation for those samples, their sample spend is debited once as `scheduler/costs/stale_unobserved_sample_dollar_seconds`. When an attached scheduler reports a larger `scheduler/costs/total_dollar_seconds` than runtime telemetry's local attribution, the run summary reconciles top-level `costs/accounted_dollar_seconds` and the accounted north-star metrics to that scheduler denominator. Scheduler arm metrics also expose `sample_dollar_share`, `mean_rollout_dollar_seconds`, `queue_wait_dollar_seconds`, `mean_queue_wait_dollar_seconds`, `admission_dollar_seconds`, `mean_admission_dollar_seconds`, `mean_sample_dollar_seconds`, `failure_rate`, failure-mode counters, `semantic_bandwidth_tokens_per_decision`, `source_tokens_per_dollar_second`, `confidence_penalty`, `objective_stddev`, and `total_improvement_per_dollar_second` for auditing whether a scenario/action-codec arm is actually worth its observed rollout, bandwidth, queue-wait, admission, uncertainty, and failure cost. Action-space decision metrics expose the same comparison at the control-action level as `action_space/decision/*/estimated_objective_payoff`, `post_decision_observations`, `realized_objective_payoff`, `mean_realized_objective_payoff_per_decision`, and `mean_realized_objective_payoff_per_post_decision_observation`. Promotion-decision metrics expose the publication gate comparison as `promotion/decision/*/realized_reward_improving_experience`, `total_dollar_seconds`, `mean_realized_reward_improving_experience_per_decision`, and `realized_reward_improving_experience_per_dollar_second`.
 
+## Experiment Observability
+
+Runtime and scheduler metrics describe the controller's internal state. The
+experiment telemetry ledger is a separate evidence boundary that records raw
+condition, seed, phase, task, cost, performance, latency, reliability, trainer,
+and scheduler events. It keeps unavailable monetary cost distinct from zero,
+labels token and dollar-second proxies, and flushes lifecycle events so crashed
+runs remain diagnosable.
+
+Summaries derive efficiency and point-estimate Pareto views from the ledger but
+do not replace the raw observations. Failed or unfinished conditions are
+excluded from comparisons, pricing and request coverage remain visible, and
+offline repricing can apply later authoritative rates without mutating the
+original JSONL. See [`telemetry.md`](telemetry.md) for the schema and monitoring
+contract.
+
 ## Implementation Boundary
 
 Implemented now:
@@ -298,6 +314,8 @@ Implemented now:
 - Explicit train dollar-second overrides for trainer/API/GPU cost accounting.
 - Pressure-aware train cadence that widens low-ROI batches under trainer saturation.
 - Rollout, trainer, queue-wait, wall-clock, accounted cost, throughput, and utilization telemetry.
+- Versioned experiment JSONL with cost provenance, coverage gates, alerts,
+  offline repricing, and cost-performance frontier summaries.
 - Actor queue-wait cost attribution into scheduler rollout objective denominators.
 - Stale train-batch discard feedback into scheduler arm, cadence, and policy-lag objective memory.
 - Opt-in stale feedback demotion refresh for adaptive action-space codecs.
