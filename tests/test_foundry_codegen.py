@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from calm_puffer_art.foundry_codegen import (
     AzureFoundryCodegenConfig,
@@ -236,6 +237,51 @@ class FoundryCodegenTests(unittest.TestCase):
                 "verifier_crashed",
             },
         )
+
+    def test_verify_python_solution_uses_isolated_environment(self):
+        task = PythonRepairTask(
+            id="mini",
+            prompt="Return x plus one.",
+            signature="def solve(x)",
+            buggy_code="def solve(x):\n    return x\n",
+            tests=(((1,), 2),),
+        )
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "passed": True,
+                    "failure_mode": "passed",
+                    "tests_passed": 1,
+                    "tests_total": 1,
+                }
+            ),
+            stderr="",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "AZURE_OPENAI_API_KEY": "secret",
+                "AZURE_OPENAI_ENDPOINT": "https://example.invalid",
+                "UNRELATED_SECRET": "also-secret",
+            },
+        ):
+            with patch(
+                "calm_puffer_art.foundry_codegen.subprocess.run",
+                return_value=completed,
+            ) as run:
+                result = verify_python_solution(
+                    task,
+                    "def solve(x):\n    return x + 1\n",
+                )
+
+        child_env = run.call_args.kwargs["env"]
+        self.assertTrue(result.passed)
+        self.assertNotIn("AZURE_OPENAI_API_KEY", child_env)
+        self.assertNotIn("AZURE_OPENAI_ENDPOINT", child_env)
+        self.assertNotIn("UNRELATED_SECRET", child_env)
+        self.assertEqual(child_env["PYTHONIOENCODING"], "utf-8")
 
     def test_foundry_cli_json_reports_missing_env_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:

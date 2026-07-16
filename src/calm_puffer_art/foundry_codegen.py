@@ -720,6 +720,7 @@ def verify_python_solution(
             capture_output=True,
             timeout=timeout_s,
             check=False,
+            env=_verifier_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         return VerificationResult(
@@ -752,6 +753,29 @@ def verify_python_solution(
         tests_passed=int(result.get("tests_passed", 0)),
         tests_total=int(result.get("tests_total", len(task.tests))),
     )
+
+
+def _verifier_subprocess_env() -> dict[str, str]:
+    allowed_names = (
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    )
+    child_env = {
+        name: value
+        for name in allowed_names
+        if (value := os.environ.get(name)) is not None
+    }
+    child_env["PYTHONHASHSEED"] = "0"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    return child_env
 
 
 async def _run_foundry_condition(
@@ -1990,7 +2014,7 @@ def apply_posix_memory_limit(limit_bytes):
                 if hard == resource.RLIM_INFINITY
                 else min(limit_bytes, hard)
             )
-            resource.setrlimit(limit, (capped, hard))
+            resource.setrlimit(limit, (capped, capped))
         except (OSError, ValueError):
             continue
         applied = True
@@ -2001,7 +2025,21 @@ def apply_memory_limit(limit_bytes):
         return True
     if os.name == "nt":
         return apply_windows_memory_limit(limit_bytes)
+    if sys.platform == "darwin":
+        return True
     return apply_posix_memory_limit(limit_bytes)
+
+def darwin_memory_limit_exceeded(limit_bytes):
+    if sys.platform != "darwin" or limit_bytes <= 0:
+        return False
+    try:
+        import resource
+    except ImportError:
+        return True
+    peak_resident_bytes = int(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    )
+    return peak_resident_bytes > limit_bytes
 
 if not apply_memory_limit(memory_limit_bytes):
     emit(False, "resource_limit_unavailable")
@@ -2033,6 +2071,9 @@ try:
 except Exception:
     emit(False, "exec_error")
     raise SystemExit(0)
+if darwin_memory_limit_exceeded(memory_limit_bytes):
+    emit(False, "resource_limit_exceeded")
+    raise SystemExit(0)
 
 solve = namespace.get("solve")
 if not callable(solve):
@@ -2047,6 +2088,9 @@ for item in tests:
         actual = solve(*args)
     except Exception:
         emit(False, "unit_test_exception", passed)
+        raise SystemExit(0)
+    if darwin_memory_limit_exceeded(memory_limit_bytes):
+        emit(False, "resource_limit_exceeded", passed)
         raise SystemExit(0)
     if actual != expected:
         emit(False, "unit_test_failed", passed)

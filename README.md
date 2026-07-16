@@ -21,7 +21,13 @@ The core package has **no runtime dependencies**.
 
 ## Current Status
 
-This is a research scaffold, not a production trainer.
+**Archived research prototype (2026-07-12).** This project explored whether asynchronous agent
+training and semantically larger action units could improve model quality or reduce inference cost.
+Controlled experiments found that action compression reduced policy decisions but did not improve
+task correctness or production inference efficiency. The repository is preserved as a tested
+systems-learning artifact and reproducible negative result.
+
+This is not a production trainer and is no longer an active product direction.
 
 What works today:
 
@@ -36,7 +42,7 @@ What works today:
 
 What is intentionally out of scope for the core package:
 
-- training real LLM weights
+- implementing LLM optimizer or loss internals; real updates are delegated to ART
 - implementing GRPO/CISPO losses
 - managing CUDA/vLLM serving
 - implementing PufferLib internals
@@ -55,7 +61,7 @@ Optional extras:
 ```powershell
 py -m pip install -e ".[dev]"      # pytest only
 py -m pip install -e ".[calm]"     # torch-backed chunk encoder smoke
-py -m pip install -e ".[art]"      # real ART structural smoke
+py -m pip install -e ".[art]"      # ART contract and serverless proof
 py -m pip install -e ".[foundry]"  # Azure Foundry live codegen benchmark
 ```
 
@@ -103,7 +109,12 @@ AZURE_OPENAI_API_VERSION=...
 | Three-condition local codegen showcase | `python examples\python_codegen_showcase.py --json` |
 | Scheduler state-size and timing profile | `python examples\scalability_profile.py` |
 | Torch learned chunk smoke | `python examples\chunk_encoder_smoke.py --json` |
+| Offline code-domain chunk proof | `python examples\code_domain_chunk_codec.py --json` |
+| State-conditioned ART chunk-loss proof | `python examples\state_conditioned_chunk_policy.py --json` |
 | Real ART object compatibility smoke | `python examples\live_art_bridge_smoke.py --backend structural --json` |
+| Real ART weight-update preflight | `python examples\real_art_weight_update.py --preflight --json` |
+| Controlled live ART ablation preflight | `python examples\controlled_art_ablation.py --preflight --json` |
+| Experiment telemetry report | `python examples\telemetry_report.py artifacts\run.telemetry.jsonl --json` |
 | Live Azure Foundry train-step ablation | `python examples\azure_foundry_codegen_ablation.py --json --env-path .env --deployment your-deployment-name` |
 | Live Azure Foundry fixed-budget race | `python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name` |
 | Foundry harness candidate run | `python examples\foundry_harness_run.py --candidate full_trinity --output-dir .codex\foundry-runs\trial --json` |
@@ -187,8 +198,8 @@ cost-effective semantic bandwidth.
 
 ## ART Integration
 
-The package does not import ART at top level. Install `.[art]` only when you want
-the real structural smoke:
+The package does not import ART at top level. Install `.[art]` for the current
+ART contract smoke or serverless weight-update proof:
 
 ```powershell
 py -m pip install -e ".[art]"
@@ -199,6 +210,31 @@ python examples\live_art_bridge_smoke.py --backend structural --json
 The bridge preserves raw ART group and trajectory objects in metadata, so the
 control plane can use local scheduler telemetry while a real backend can still
 receive ART-shaped objects.
+
+The binding serverless experiment is documented in
+[`docs/real_art_weight_update.md`](docs/real_art_weight_update.md). Its preflight
+is offline and does not require credentials:
+
+```powershell
+python examples\real_art_weight_update.py --preflight --json
+```
+
+The first verified step-1 artifact and its flat held-out result are recorded in
+[`docs/real_art_weight_update_result.md`](docs/real_art_weight_update_result.md).
+
+The three-seed, fixed-budget comparison of no training, direct ART, and ART
+through the adaptive scheduler is recorded in
+[`docs/controlled_art_ablation_result.md`](docs/controlled_art_ablation_result.md).
+Its live command is:
+
+```powershell
+python examples\controlled_art_ablation.py --env-path .env --json
+```
+
+The harness writes append-only experiment telemetry and embeds coverage,
+cost-performance, Pareto, and monitoring-alert summaries in its report. The
+schema, pricing semantics, and offline repricing workflow are documented in
+[`docs/telemetry.md`](docs/telemetry.md).
 
 Manual real-backend modes are available:
 
@@ -213,7 +249,10 @@ availability.
 ## Azure Foundry Workload
 
 The live Foundry benchmark repairs embedded Python functions and verifies the
-generated code in a separate timeout-bounded subprocess. It compares:
+generated code in a separate timeout-bounded subprocess with a sanitized
+environment that does not inherit Azure credentials. Linux and Windows use
+hard process memory limits; macOS fails candidates that exceed the verifier's
+measured peak resident-memory budget. It compares:
 
 - `static_art`: fixed token-level round-robin baseline
 - `scheduler_only`: objective scheduler with token actions
@@ -463,6 +502,8 @@ Optional checks:
 
 ```powershell
 python examples\chunk_encoder_smoke.py --json
+python examples\code_domain_chunk_codec.py --json
+python examples\state_conditioned_chunk_policy.py --json
 python examples\live_art_bridge_smoke.py --backend structural --json
 python examples\azure_foundry_codegen_ablation.py --json --budget-race --budget-dollar-seconds 160 --env-path .env --deployment your-deployment-name
 ```
@@ -486,6 +527,8 @@ cloud/GPU resources depending on the mode.
 - `docs/architecture.md`: higher-level runtime architecture.
 - `docs/art_puffer_calm_synthesis.md`: original ART/Puffer/CALM synthesis.
 - `docs/readiness_gap_analysis.md`: gaps before a serious external integration.
+- `docs/calm_domain_codec_result.md`: offline code-domain checkpoint and reconstruction result.
+- `docs/calm_policy_adapter_result.md`: state-conditioned policy and ART loss result.
 
 ## References
 

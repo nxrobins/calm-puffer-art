@@ -442,6 +442,10 @@ class VersionedTrajectoryBatch:
         return max(0, policy_step - self.min_policy_step)
 
 
+class TrajectoryRingBufferClosedError(RuntimeError):
+    """Raised when work is submitted to or requested from a closed train ring."""
+
+
 class TrajectoryRingBuffer:
     """Bounded train-batch queue with Puffer-style backpressure and staleness."""
 
@@ -461,16 +465,21 @@ class TrajectoryRingBuffer:
         self.consumed_priority_total = 0.0
         self._batches: deque[VersionedTrajectoryBatch] = deque()
         self._condition = asyncio.Condition()
+        self._closed = False
 
     async def put(self, batch: VersionedTrajectoryBatch) -> float:
         wait_started: float | None = None
         wait_s = 0.0
         async with self._condition:
             while len(self._batches) >= self.capacity:
+                if self._closed:
+                    raise TrajectoryRingBufferClosedError("train ring is closed")
                 if wait_started is None:
                     wait_started = time.perf_counter()
                 self.backpressure_events += 1
                 await self._condition.wait()
+            if self._closed:
+                raise TrajectoryRingBufferClosedError("train ring is closed")
             if wait_started is not None:
                 wait_s = max(0.0, time.perf_counter() - wait_started)
                 if isinstance(batch.metadata, dict):
@@ -493,6 +502,8 @@ class TrajectoryRingBuffer:
             self.current_policy_step = current_policy_step
             while True:
                 while not self._batches:
+                    if self._closed:
+                        raise TrajectoryRingBufferClosedError("train ring is closed")
                     await self._condition.wait()
 
                 stale_count = self._discard_stale_locked(current_policy_step)
@@ -510,6 +521,16 @@ class TrajectoryRingBuffer:
                 self.consumed_priority_total += priority
                 self._condition.notify_all()
                 return batch
+
+    async def close(self) -> tuple[VersionedTrajectoryBatch, ...]:
+        """Close the ring, release waiters, and return work not yet consumed."""
+
+        async with self._condition:
+            self._closed = True
+            pending = tuple(self._batches)
+            self._batches.clear()
+            self._condition.notify_all()
+            return pending
 
     @property
     def pending_batches(self) -> int:
@@ -537,6 +558,7 @@ class TrajectoryRingBuffer:
             "priority_consumptions": float(self.priority_consumptions),
             "consumed_priority_total": self.consumed_priority_total,
             "max_pending_priority": max_pending_priority,
+            "closed": 1.0 if self._closed else 0.0,
         }
 
     def _discard_stale_locked(self, current_policy_step: int) -> int:

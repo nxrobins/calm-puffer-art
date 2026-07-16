@@ -10,6 +10,7 @@ from calm_puffer_art import (
     AdaptiveActionSpace,
     ArtBackendTrainer,
     AsyncArtBackend,
+    AsyncArtBackendClosedError,
     AsyncArtBackendConfig,
     ChunkActionCodec,
     ObjectiveScheduler,
@@ -76,9 +77,13 @@ class FakeArtBackend:
     def __init__(self) -> None:
         self.calls = []
         self.registered = []
+        self.prepared = []
+        self.deleted_checkpoint_steps = []
+        self.sft_calls = []
         self.closed = False
         self.step = 0
         self.block_event: asyncio.Event | None = None
+        self.train_started_event: asyncio.Event | None = None
 
     async def register(self, model):
         self.registered.append(model)
@@ -86,7 +91,34 @@ class FakeArtBackend:
     async def _get_step(self, model):
         return self.step
 
+    def _model_inference_name(self, model, step=None):
+        name = str(getattr(model, "name", model))
+        return name if step is None else f"{name}@{step}"
+
+    async def _prepare_backend_for_training(self, model, config):
+        self.prepared.append((model, config))
+        return "https://inference.example/v1", "test-key"
+
+    async def _delete_checkpoint_files(self, model, steps_to_keep):
+        self.deleted_checkpoint_steps.append((model, tuple(steps_to_keep)))
+
+    async def _train_sft(
+        self,
+        model,
+        trajectories,
+        config,
+        dev_config,
+        verbose=False,
+    ):
+        self.sft_calls.append(
+            (model, trajectories, config, dev_config, verbose)
+        )
+        yield {"step": 1}
+        yield {"step": 2}
+
     async def train(self, model, trajectory_groups, **kwargs):
+        if self.train_started_event is not None:
+            self.train_started_event.set()
         if self.block_event is not None:
             await self.block_event.wait()
         self.step += 1
@@ -294,6 +326,7 @@ class ArtAdapterTests(unittest.TestCase):
             ],
             0.75,
         )
+
         state_decisions = update.metadata[ART_BACKEND_STATE_KEY][
             "publication_decision_stats"
         ]
@@ -390,6 +423,57 @@ class ArtAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(credited_lag_updates, [1.0])
         self.assertTrue(backend.closed)
+
+    def test_async_art_backend_delegates_current_art_lifecycle_hooks(self):
+        async def run():
+            backend = FakeArtBackend()
+            async_backend = AsyncArtBackend(backend=backend)
+            prepared = await async_backend._prepare_backend_for_training(
+                "art-model",
+                "register-config",
+            )
+            inference_name = async_backend._model_inference_name(
+                "art-model",
+                step=3,
+            )
+            await async_backend._delete_checkpoint_files("art-model", [1, 3])
+            updates = [
+                update
+                async for update in async_backend._train_sft(
+                    "art-model",
+                    ["trajectory"],
+                    "train-config",
+                    "dev-config",
+                    verbose=True,
+                )
+            ]
+            await async_backend.close()
+            return backend, prepared, inference_name, updates
+
+        backend, prepared, inference_name, updates = asyncio.run(run())
+
+        self.assertEqual(
+            prepared,
+            ("https://inference.example/v1", "test-key"),
+        )
+        self.assertEqual(inference_name, "art-model@3")
+        self.assertEqual(
+            backend.deleted_checkpoint_steps,
+            [("art-model", (1, 3))],
+        )
+        self.assertEqual(
+            backend.sft_calls,
+            [
+                (
+                    "art-model",
+                    ["trajectory"],
+                    "train-config",
+                    "dev-config",
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(updates, [{"step": 1}, {"step": 2}])
 
     def test_async_art_backend_reports_semantic_bandwidth_without_scheduler(self):
         async def run():
@@ -2052,6 +2136,67 @@ class ArtAdapterTests(unittest.TestCase):
         self.assertEqual(after["art_backend/pending_groups"], 0.0)
         self.assertEqual(after["art_backend/completed_batches"], 1.0)
         self.assertEqual(len(backend.calls[0][1]), 1)
+
+    def test_async_art_backend_close_fails_partial_group_future(self):
+        async def run():
+            backend = FakeArtBackend()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(train_batch_groups=2),
+            )
+            group = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.2)]
+            )
+
+            future = await async_backend.submit_group("art-model", group)
+            await async_backend.close()
+            with self.assertRaises(AsyncArtBackendClosedError):
+                await future
+            return backend, async_backend
+
+        backend, async_backend = asyncio.run(run())
+
+        self.assertTrue(backend.closed)
+        self.assertEqual(async_backend.stats()["art_backend/pending_groups"], 0.0)
+
+    def test_async_art_backend_close_fails_all_accepted_futures(self):
+        async def run():
+            backend = FakeArtBackend()
+            backend.block_event = asyncio.Event()
+            backend.train_started_event = asyncio.Event()
+            async_backend = AsyncArtBackend(
+                backend=backend,
+                config=AsyncArtBackendConfig(train_queue_capacity=1),
+            )
+            first = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.2)]
+            )
+            second = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.4)]
+            )
+            third = FakeArtGroup(
+                trajectories=[FakeArtTrajectory(messages_and_choices=[], reward=0.6)]
+            )
+
+            first_future = await async_backend.submit_train("art-model", [first])
+            await asyncio.wait_for(backend.train_started_event.wait(), timeout=1.0)
+            second_future = await async_backend.submit_train("art-model", [second])
+            blocked_submit = asyncio.create_task(
+                async_backend.submit_train("art-model", [third])
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(blocked_submit.done())
+            await async_backend.close()
+            third_future = await asyncio.wait_for(blocked_submit, timeout=1.0)
+            for future in (first_future, second_future, third_future):
+                with self.assertRaises(AsyncArtBackendClosedError):
+                    await future
+            return backend, async_backend
+
+        backend, async_backend = asyncio.run(run())
+
+        self.assertTrue(backend.closed)
+        self.assertEqual(async_backend.stats()["pending_batches"], 0.0)
 
     def test_async_art_backend_forced_flush_records_timing_response_payoff(self):
         async def run():

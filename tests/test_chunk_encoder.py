@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -43,9 +45,13 @@ class ChunkEncoderDependencyTests(unittest.TestCase):
         self.assertEqual(json.loads(completed.stdout), [])
 
     def test_calm_optional_extra_is_declared(self):
-        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        pyproject = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        dependencies = pyproject["project"]["optional-dependencies"]["calm"]
 
-        self.assertIn('calm = ["torch>=2"]', pyproject)
+        self.assertIn("numpy>=1.26", dependencies)
+        self.assertIn("torch>=2", dependencies)
 
     def test_chunk_encoder_does_not_import_art_or_vllm(self):
         source = ROOT / "src" / "calm_puffer_art" / "chunk_encoder.py"
@@ -182,6 +188,32 @@ class LearnedChunkEncoderTests(unittest.TestCase):
             "chunk_encoder_input_limit_exceeded",
         ):
             LearnedChunkEncoderConfig(reconstruction_threshold=0.99).validate()
+
+    def test_checkpoint_roundtrip_preserves_identity_and_actions(self):
+        from calm_puffer_art.chunk_encoder import (
+            LearnedChunkActionCodec,
+            load_chunk_encoder_checkpoint,
+            save_chunk_encoder_checkpoint,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codec.pt"
+            manifest = save_chunk_encoder_checkpoint(self.bundle, path)
+            restored = load_chunk_encoder_checkpoint(path)
+
+        restored_codec = LearnedChunkActionCodec(restored)
+        original_report = self.codec.encode_with_report("alpha beta gamma delta")
+        restored_report = restored_codec.encode_with_report(
+            "alpha beta gamma delta"
+        )
+
+        self.assertEqual(manifest, restored.checkpoint_manifest())
+        self.assertEqual(self.codec.identity, restored_codec.identity)
+        self.assertEqual(original_report.decoded_text, restored_report.decoded_text)
+        self.assertEqual(
+            [action.payload for action in original_report.actions],
+            [action.payload for action in restored_report.actions],
+        )
 
     def test_chunk_encoder_smoke_example_json_contract(self):
         command = [

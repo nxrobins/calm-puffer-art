@@ -20,6 +20,7 @@ from .actions import (
 )
 from .runtime import (
     TrajectoryRingBuffer,
+    TrajectoryRingBufferClosedError,
     VersionedTrajectoryBatch,
     WeightBroadcastChannel,
     restore_control_state as restore_runtime_control_state,
@@ -53,6 +54,10 @@ ART_BACKEND_STATE_KEY = "art_backend/state"
 
 class StaleArtBatchError(RuntimeError):
     """Raised when an enqueued ART train batch exceeds max policy lag."""
+
+
+class AsyncArtBackendClosedError(RuntimeError):
+    """Raised for accepted ART work that cannot finish during shutdown."""
 
 
 @dataclass(frozen=True)
@@ -357,6 +362,58 @@ class AsyncArtBackend:
             return delegate(model, step)
         name = str(getattr(model, "name", "model"))
         return name if step is None else f"{name}@{step}"
+
+    async def _prepare_backend_for_training(
+        self,
+        model: Any,
+        config: Any,
+    ) -> tuple[str, str]:
+        """Delegate ART's inference endpoint preparation lifecycle hook."""
+
+        delegate = getattr(self.backend, "_prepare_backend_for_training", None)
+        if delegate is None:
+            raise AttributeError(
+                "wrapped ART backend has no _prepare_backend_for_training"
+            )
+        result = await _maybe_await(delegate(model, config))
+        return result
+
+    async def _delete_checkpoint_files(
+        self,
+        model: Any,
+        steps_to_keep: Sequence[int],
+    ) -> None:
+        """Delegate ART checkpoint cleanup without importing ART internals."""
+
+        delegate = getattr(self.backend, "_delete_checkpoint_files", None)
+        if delegate is None:
+            raise AttributeError("wrapped ART backend has no _delete_checkpoint_files")
+        await _maybe_await(delegate(model, steps_to_keep))
+
+    async def _train_sft(
+        self,
+        model: Any,
+        trajectories: Sequence[Any],
+        config: Any,
+        dev_config: Any,
+        verbose: bool = False,
+    ):
+        """Stream ART SFT updates from the wrapped backend when requested."""
+
+        delegate = getattr(self.backend, "_train_sft", None)
+        if delegate is None:
+            raise AttributeError("wrapped ART backend has no _train_sft")
+        updates = delegate(
+            model,
+            trajectories,
+            config,
+            dev_config,
+            verbose=verbose,
+        )
+        if inspect.isawaitable(updates):
+            updates = await updates
+        async for update in updates:
+            yield update
 
     async def register(self, model: Any) -> None:
         self._model = model
@@ -1131,12 +1188,22 @@ class AsyncArtBackend:
         return await future
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
+        queued_batches = await self.ring.close()
+        for batch in queued_batches:
+            self._fail_closed_futures(self._batch_futures(batch))
         if self._worker is not None:
             self._worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker
+            await asyncio.gather(self._worker, return_exceptions=True)
             self._worker = None
+        async with self._pending_lock:
+            pending_groups = tuple(self._pending_groups)
+            self._pending_groups.clear()
+        self._fail_closed_futures(
+            tuple(pending.future for pending in pending_groups)
+        )
         delegate = getattr(self.backend, "close", None)
         if delegate is not None:
             await _maybe_await(delegate())
@@ -1356,10 +1423,13 @@ class AsyncArtBackend:
         while not self._closed:
             self.ring.max_policy_lag = self._max_policy_lag()
             train_wait_started = time.perf_counter()
-            batch = await self.ring.get(
-                current_policy_step=self._current_step,
-                priority_scorer=self._batch_priority_scorer(),
-            )
+            try:
+                batch = await self.ring.get(
+                    current_policy_step=self._current_step,
+                    priority_scorer=self._batch_priority_scorer(),
+                )
+            except TrajectoryRingBufferClosedError:
+                return
             train_wait_s = time.perf_counter() - train_wait_started
             train_wait_dollar_seconds = (
                 train_wait_s * self.config.cost_per_second_usd
@@ -1450,6 +1520,10 @@ class AsyncArtBackend:
                 for future in futures:
                     if not future.done():
                         future.set_result(raw_result)
+            except asyncio.CancelledError:
+                self._failed_batches += 1
+                self._fail_closed_futures(futures)
+                raise
             except BaseException as exc:
                 self._failed_batches += 1
                 for future in futures:
@@ -1722,7 +1796,12 @@ class AsyncArtBackend:
         )
         self._submitted_batches += 1
         self._submitted_train_groups += len(groups)
-        train_ring_admission_wait_s = await self.ring.put(batch)
+        try:
+            train_ring_admission_wait_s = await self.ring.put(batch)
+        except TrajectoryRingBufferClosedError:
+            self._failed_batches += 1
+            self._fail_closed_futures(tuple(futures))
+            return
         train_ring_admission_wait_dollar_seconds = (
             train_ring_admission_wait_s * self.config.cost_per_second_usd
         )
@@ -1932,6 +2011,16 @@ class AsyncArtBackend:
         if isinstance(future, asyncio.Future):
             return (future,)
         return ()
+
+    @staticmethod
+    def _fail_closed_futures(futures: Sequence[asyncio.Future[Any]]) -> None:
+        for future in futures:
+            if not future.done():
+                future.set_exception(
+                    AsyncArtBackendClosedError(
+                        "AsyncArtBackend closed before submitted training completed"
+                    )
+                )
 
     def _discard_submitted_batch(self, batch: VersionedTrajectoryBatch) -> None:
         self._stale_batches += 1

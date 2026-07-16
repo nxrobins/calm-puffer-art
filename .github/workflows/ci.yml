@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest
+      - run: python -m compileall -q src tests examples
+
+  verifier-macos:
+    name: Verifier / macOS
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: >-
+          python -m pytest
+          tests/test_foundry_codegen.py
+          -k "verify_python_solution"
+
+  optional-integrations:
+    name: Optional / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Torch CALM smoke
+            extra: calm
+            tests: tests/test_chunk_encoder.py tests/test_calm_domain.py tests/test_real_workload_ablation.py
+          - name: CALM ART loss compatibility
+            extra: calm,art
+            tests: tests/test_calm_policy.py
+          - name: OpenPipe ART structural smoke
+            extra: art
+            tests: tests/test_live_art_bridge_smoke.py tests/test_real_art_weight_update.py tests/test_controlled_art_ablation.py
+          - name: Azure Foundry SDK offline
+            extra: foundry
+            tests: tests/test_foundry_codegen.py
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,${{ matrix.extra }}]"
+      - run: python -m pytest ${{ matrix.tests }}
+
+  package:
+    name: Package build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install build
+      - run: python -m build

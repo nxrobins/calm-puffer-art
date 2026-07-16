@@ -167,7 +167,7 @@ The versioned batch metadata stays in the control plane. A future ART backend ca
 - It preserves the original ART group and trajectory objects in metadata under `art/raw_group` and `art/raw_trajectory`.
 - It assigns untagged converted ART trajectories a scenario-scoped default scheduler arm like `scenario_id|art`, while preserving explicit `scheduler/arm_id` metadata from user workflows.
 - `ArtBackendTrainer` unwraps those preserved groups and delegates to a supplied ART-like backend with `train(model, trajectory_groups, **kwargs)`.
-- `AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `restore_control_state()`, `admit_rollout()`, `admit_and_select_rollout()`, `select_rollout()`, `submit_train()`, `submit_group()`, `flush_pending_groups()`, `_get_step()`, `_model_inference_name()`, and `close()` methods around the same fixed-capacity stale-aware train ring.
+- `AsyncArtBackend` exposes backend-shaped `register()`, `train()`, `restore_control_state()`, `admit_rollout()`, `admit_and_select_rollout()`, `select_rollout()`, `submit_train()`, `submit_group()`, `flush_pending_groups()`, `_get_step()`, `_model_inference_name()`, and `close()` methods around the same fixed-capacity stale-aware train ring. Closing the backend drains queued work, releases blocked producers, and completes every unfinished submission future with `AsyncArtBackendClosedError`.
 - `art_rollout_metadata()` turns a `SchedulerDecision` from `select_rollout()` into plain ART trajectory metadata, including the chosen scheduler arm, scenario, action codec, train-batch cadence, policy-lag limit, actor id, policy step, action-space signature when present, coverage signals, the coverage-control key when a coverage override fired, timing-response keys for cadence and lag when present, and rollout cost-estimate audit fields.
 
 This means the async runtime can reason about ART data without taking a hard dependency on ART or reimplementing ART's GRPO/CISPO losses. The full drop-in `art.Backend` remains deferred; this adapter is the tested object-preservation seam it should use.
@@ -221,7 +221,7 @@ The runtime treats action granularity as a codec choice:
 
 The codec interface deliberately preserves decoded text for compatibility with existing ART-like message trajectories while exposing `action_units`, `token_count`, and `semantic_bandwidth` for metrics.
 
-The torch-backed CALM autoencoder sketch is intentionally not imported into the default package. It should land behind an optional integration layer after the runtime contract is stable; the default package now exposes the old/new/reference action-logprob contract that such a learned latent layer must satisfy before feeding chunk-level ratios into GRPO.
+The torch-backed CALM layer remains outside the default package. It can train against explicit train/holdout corpora, atomically save a schema-versioned checkpoint, reload state with strict identity verification, and reject candidates that miss exact reconstruction. The code-domain proof admits chunk size 2 and rejects chunk size 4. `StateConditionedChunkPolicy` adds a Gaussian latent action head with frozen behavior and reference snapshots; `build_art_chunk_loss_batch()` aligns chunk actions with ART's shifted tensor contract, and `execute_art_chunk_loss()` backpropagates ART 0.5.18's real PPO/CISPO loss through the current head. The local proof uses deterministic context features. These are genuine state-conditioned policy distributions but not serving-LLM distributions, and ART serverless still has no public custom latent-action input.
 
 For CALM-like codecs, verifier and reconstruction feedback should be written into trajectory metadata:
 
@@ -277,6 +277,22 @@ The runtime also reports attributed cost telemetry:
 
 `costs/runtime_dollar_seconds` remains the wall-clock infrastructure denominator for compatibility. The accounted denominator is useful when tuning actor count, train cadence, model/API spend, promotion gates, or backpressure because it exposes where the local scaffold is spending work. Scheduler train objective receives trainer wait and admitted train-ring producer wait as part of the candidate dollar-second denominator, so large batch cadence can be penalized when it keeps the trainer idle or backs up the train ring. If queued work becomes stale first, the same producer-wait spend is debited through stale feedback as `scheduler/costs/stale_additional_dollar_seconds`; if stale feedback is the first scheduler observation for those samples, their sample spend is debited once as `scheduler/costs/stale_unobserved_sample_dollar_seconds`. When an attached scheduler reports a larger `scheduler/costs/total_dollar_seconds` than runtime telemetry's local attribution, the run summary reconciles top-level `costs/accounted_dollar_seconds` and the accounted north-star metrics to that scheduler denominator. Scheduler arm metrics also expose `sample_dollar_share`, `mean_rollout_dollar_seconds`, `queue_wait_dollar_seconds`, `mean_queue_wait_dollar_seconds`, `admission_dollar_seconds`, `mean_admission_dollar_seconds`, `mean_sample_dollar_seconds`, `failure_rate`, failure-mode counters, `semantic_bandwidth_tokens_per_decision`, `source_tokens_per_dollar_second`, `confidence_penalty`, `objective_stddev`, and `total_improvement_per_dollar_second` for auditing whether a scenario/action-codec arm is actually worth its observed rollout, bandwidth, queue-wait, admission, uncertainty, and failure cost. Action-space decision metrics expose the same comparison at the control-action level as `action_space/decision/*/estimated_objective_payoff`, `post_decision_observations`, `realized_objective_payoff`, `mean_realized_objective_payoff_per_decision`, and `mean_realized_objective_payoff_per_post_decision_observation`. Promotion-decision metrics expose the publication gate comparison as `promotion/decision/*/realized_reward_improving_experience`, `total_dollar_seconds`, `mean_realized_reward_improving_experience_per_decision`, and `realized_reward_improving_experience_per_dollar_second`.
 
+## Experiment Observability
+
+Runtime and scheduler metrics describe the controller's internal state. The
+experiment telemetry ledger is a separate evidence boundary that records raw
+condition, seed, phase, task, cost, performance, latency, reliability, trainer,
+and scheduler events. It keeps unavailable monetary cost distinct from zero,
+labels token and dollar-second proxies, and flushes lifecycle events so crashed
+runs remain diagnosable.
+
+Summaries derive efficiency and point-estimate Pareto views from the ledger but
+do not replace the raw observations. Failed or unfinished conditions are
+excluded from comparisons, pricing and request coverage remain visible, and
+offline repricing can apply later authoritative rates without mutating the
+original JSONL. See [`telemetry.md`](telemetry.md) for the schema and monitoring
+contract.
+
 ## Implementation Boundary
 
 Implemented now:
@@ -298,6 +314,8 @@ Implemented now:
 - Explicit train dollar-second overrides for trainer/API/GPU cost accounting.
 - Pressure-aware train cadence that widens low-ROI batches under trainer saturation.
 - Rollout, trainer, queue-wait, wall-clock, accounted cost, throughput, and utilization telemetry.
+- Versioned experiment JSONL with cost provenance, coverage gates, alerts,
+  offline repricing, and cost-performance frontier summaries.
 - Actor queue-wait cost attribution into scheduler rollout objective denominators.
 - Stale train-batch discard feedback into scheduler arm, cadence, and policy-lag objective memory.
 - Opt-in stale feedback demotion refresh for adaptive action-space codecs.
@@ -317,4 +335,6 @@ Deferred:
 - Production packaging as a drop-in `art.Backend` against live ART versions.
 - Real GRPO/CISPO loss calls against ART internals.
 - vLLM LoRA hot-reload wiring.
-- Torch/CALM autoencoder training, checkpoint loading, and chunk-level policy heads.
+- Production CALM corpora and tokenizer integration.
+- Serving-model hidden-state extraction and a local open-weight model adapter.
+- Custom ART backend wiring for latent action tensors and checkpoint publication.
