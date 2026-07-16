@@ -210,3 +210,73 @@ This repeat closes the missing learning-curve and cost-to-target evidence gap.
 The next rigor gap is larger: use more seeds, nonzero exact accuracy, multiple
 training budgets, authoritative prices, and an actual CALM treatment that
 changes inference or optimizer behavior.
+
+## Clean Replication
+
+A second fully instrumented campaign repeated the same model, manifest, seeds,
+task counts, three-update budget, learning rate, and checkpoint evaluations.
+Run `20260711-202521` completed all `9` condition-seed cells, `1,788` inference
+requests, and `18` managed weight updates in one campaign. There were no
+inference retries, failed training attempts, recovery cells, unfinished events,
+or telemetry sequence issues. Performance, token, latency, task identity,
+scheduler-decision, and training-update coverage were all `100%`.
+
+| Condition | Mean reward delta | Descriptive 95% CI | Exact delta | Parse-rate delta |
+| --- | ---: | ---: | ---: | ---: |
+| No training | `-0.0038` | `[-0.0243, +0.0168]` | `0.0` | `-0.7 pp` |
+| Direct ART | `+0.1195` | `[+0.0485, +0.1905]` | `+0.7 pp` | `+26.0 pp` |
+| Async scheduler | `+0.0886` | `[-0.0871, +0.2643]` | `0.0` | `+16.7 pp` |
+
+Direct ART minus no-training drift was `+0.1233`, with a descriptive paired
+interval of `[+0.0599, +0.1866]`. Scheduler minus direct ART was `-0.0309`,
+with a wide interval of `[-0.2514, +0.1896]`. Direct ART produced one final
+exact answer across `150` held-out requests; the other final exact scores were
+zero. The replication therefore strengthens the evidence that ART changes
+behavior, but it still does not demonstrate task mastery or a scheduler
+performance advantage.
+
+### Replication Learning Curve
+
+| Checkpoint | Direct mean reward | Direct learning tokens | Scheduler mean reward | Scheduler learning tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Before training | `0.1540` | `0` | `0.1564` | `0` |
+| Step 1 | `0.2237` | `2,612` | `0.2751` | `2,612` |
+| Step 2 | `0.2829` | `5,100` | `0.2692` | `4,767` |
+| Step 3 | `0.2735` | `7,220` | `0.2450` | `6,976` |
+
+The best aggregate checkpoint was step 2 for direct ART and step 1 for the
+scheduler. Both conditions then regressed, and individual seeds moved sharply
+in different directions. Final-checkpoint-only evaluation would miss both the
+best model and the instability. The scheduler reached all three preregistered
+mean-reward targets after `2,612` learning tokens; direct ART reached `0.20`
+after `2,612` and reached `0.225` and `0.25` after `5,100`.
+
+### Replication Cost And Reliability
+
+| Measurement | Direct ART | Async scheduler | Scheduler difference |
+| --- | ---: | ---: | ---: |
+| Requests | `744` | `744` | `0.0%` |
+| Total experiment tokens | `111,063` | `110,087` | `-0.9%` |
+| Learning-inference tokens | `21,660` | `20,927` | `-3.4%` |
+| Completion tokens | `17,475` | `16,163` | `-7.5%` |
+| Condition wall time | `259.4 s` | `250.7 s` | `-3.3%` |
+| Failed training attempts | `0` | `0` | no difference |
+
+Across both instrumented campaigns, scheduler token use is lower in the same
+direction, but the magnitude is not stable: total-token savings moved from
+`3.3%` to `0.9%`, and learning-token savings moved from `9.6%` to `3.4%`.
+Performance ordering also reversed: the scheduler led direct ART by `0.0176`
+in the prior campaign and trailed by `0.0309` here. That combination supports a
+small, repeatable token-efficiency signal, not a scheduler quality claim.
+
+The clean campaign used `271,985` tokens in total. The prior instrumented
+campaign used `325,147` when failed work and recoveries were included, so
+backend reliability remains a larger practical cost variable than the observed
+scheduler savings. No authoritative inference or trainer rates were published
+for this managed run; dollar cost remains unknown rather than zero.
+
+The raw local report is
+`artifacts/controlled_art_ablation_20260711-202521.json`, with the append-only
+ledger at
+`artifacts/controlled_art_ablation_20260711-202521.telemetry.jsonl`. Both are
+ignored runtime artifacts. CALM remained excluded from this replication.
