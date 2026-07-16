@@ -21,7 +21,13 @@ The core package has **no runtime dependencies**.
 
 ## Current Status
 
-This is a research scaffold, not a production trainer.
+**Archived research prototype (2026-07-12).** This project explored whether asynchronous agent
+training and semantically larger action units could improve model quality or reduce inference cost.
+Controlled experiments found that action compression reduced policy decisions but did not improve
+task correctness or production inference efficiency. The repository is preserved as a tested
+systems-learning artifact and reproducible negative result.
+
+This is not a production trainer and is no longer an active product direction.
 
 What works today:
 
