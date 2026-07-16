@@ -4,8 +4,11 @@ import copy
 import hashlib
 import json
 import math
+import os
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 try:
@@ -28,6 +31,8 @@ from .types import ActionUnit
 
 
 SMOKE_PROOF_SCOPE = "smoke_only"
+DOMAIN_PROOF_SCOPE = "offline_domain_reconstruction_only"
+CHUNK_CHECKPOINT_SCHEMA_VERSION = 1
 SMOKE_SEED = 1337
 MAX_SMOKE_EXAMPLES = 128
 MAX_TRAIN_STEPS = 1000
@@ -89,7 +94,7 @@ class LearnedChunkEncoderConfig:
             raise ValueError("chunk_encoder_input_limit_exceeded")
         if self.reconstruction_threshold != 1.0:
             raise ValueError("chunk_encoder_input_limit_exceeded")
-        if self.proof_scope != SMOKE_PROOF_SCOPE:
+        if self.proof_scope not in {SMOKE_PROOF_SCOPE, DOMAIN_PROOF_SCOPE}:
             raise ValueError("chunk_encoder_input_limit_exceeded")
         if (
             self.streaming
@@ -385,6 +390,7 @@ class LearnedChunkActionCodec:
                 failure_mode="reconstruction_drift",
                 decoded_text=decoded_text,
                 token_count=len(token_ids),
+                reconstruction_accuracy=accuracy,
             )
         actions = self._actions_for_chunks(
             chunks=chunks,
@@ -489,19 +495,29 @@ class LearnedChunkActionCodec:
         return actions
 
 
-def train_smoke_chunk_encoder(
-    config: LearnedChunkEncoderConfig | None = None,
-    corpus: Sequence[str] = SMOKE_CORPUS,
+def train_chunk_encoder(
+    *,
+    config: LearnedChunkEncoderConfig,
+    train_corpus: Sequence[str],
+    holdout_corpus: Sequence[str],
+    vocabulary_corpus: Sequence[str] | None = None,
 ) -> LearnedChunkEncoderBundle:
-    config = config or LearnedChunkEncoderConfig()
     config.validate()
-    if len(corpus) > MAX_SMOKE_EXAMPLES:
+    train_texts = tuple(train_corpus)
+    holdout_texts = tuple(holdout_corpus)
+    if (
+        not train_texts
+        or not holdout_texts
+        or len(train_texts) + len(holdout_texts) > MAX_SMOKE_EXAMPLES
+    ):
+        raise ValueError("chunk_encoder_input_limit_exceeded")
+    vocabulary_texts = tuple(vocabulary_corpus or (*train_texts, *holdout_texts))
+    if not vocabulary_texts or len(vocabulary_texts) > MAX_SMOKE_EXAMPLES:
         raise ValueError("chunk_encoder_input_limit_exceeded")
     start = time.monotonic()
     _seed_torch(config.seed)
     torch.set_num_threads(1)
-    train_texts, holdout_texts = _split_corpus(corpus)
-    vocabulary = WhitespaceVocabulary.build(corpus)
+    vocabulary = WhitespaceVocabulary.build(vocabulary_texts)
     train_chunks, _ = _texts_to_chunks(train_texts, vocabulary, config)
     holdout_chunks, _ = _texts_to_chunks(holdout_texts, vocabulary, config)
     autoencoder = TinyChunkAutoencoder(
@@ -528,8 +544,6 @@ def train_smoke_chunk_encoder(
                 break
     train_accuracy = _autoencoder_accuracy(autoencoder, train_tensor)
     holdout_accuracy = _autoencoder_accuracy(autoencoder, holdout_tensor)
-    if train_accuracy != 1.0 or holdout_accuracy != 1.0:
-        raise AssertionError("missing_holdout_reconstruction_report")
     for parameter in autoencoder.parameters():
         parameter.requires_grad = False
     autoencoder.eval()
@@ -599,6 +613,159 @@ def train_smoke_chunk_encoder(
     return bundle
 
 
+def train_smoke_chunk_encoder(
+    config: LearnedChunkEncoderConfig | None = None,
+    corpus: Sequence[str] = SMOKE_CORPUS,
+) -> LearnedChunkEncoderBundle:
+    config = config or LearnedChunkEncoderConfig()
+    train_texts, holdout_texts = _split_corpus(corpus)
+    bundle = train_chunk_encoder(
+        config=config,
+        train_corpus=train_texts,
+        holdout_corpus=holdout_texts,
+        vocabulary_corpus=corpus,
+    )
+    if (
+        bundle.training_report.train_reconstruction_accuracy != 1.0
+        or bundle.training_report.holdout_reconstruction_accuracy != 1.0
+    ):
+        raise AssertionError("missing_holdout_reconstruction_report")
+    return bundle
+
+
+def save_chunk_encoder_checkpoint(
+    bundle: LearnedChunkEncoderBundle,
+    path: Path,
+) -> dict[str, Any]:
+    manifest = bundle.checkpoint_manifest()
+    validate_checkpoint_manifest(manifest)
+    payload = {
+        "schema_version": CHUNK_CHECKPOINT_SCHEMA_VERSION,
+        "manifest": manifest,
+        "config": asdict(bundle.config),
+        "training_report": asdict(bundle.training_report),
+        "state_dicts": {
+            "autoencoder": bundle.autoencoder.state_dict(),
+            "reference_scorer": bundle.reference_scorer.state_dict(),
+            "old_scorer": bundle.old_scorer.state_dict(),
+            "new_scorer": bundle.new_scorer.state_dict(),
+        },
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return manifest
+
+
+def load_chunk_encoder_checkpoint(path: Path) -> LearnedChunkEncoderBundle:
+    payload = torch.load(
+        Path(path),
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version",
+        "manifest",
+        "config",
+        "training_report",
+        "state_dicts",
+    }:
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    if payload.get("schema_version") != CHUNK_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("learned_chunk_checkpoint_schema_unsupported")
+    manifest = payload.get("manifest")
+    config_payload = payload.get("config")
+    report_payload = payload.get("training_report")
+    state_dicts = payload.get("state_dicts")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (manifest, config_payload, report_payload, state_dicts)
+    ):
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    assert isinstance(manifest, Mapping)
+    assert isinstance(config_payload, Mapping)
+    assert isinstance(report_payload, Mapping)
+    assert isinstance(state_dicts, Mapping)
+    validate_checkpoint_manifest(manifest)
+    if set(state_dicts) != {
+        "autoencoder",
+        "reference_scorer",
+        "old_scorer",
+        "new_scorer",
+    }:
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    try:
+        config = LearnedChunkEncoderConfig(**dict(config_payload))
+        training_report = SmokeTrainingReport(**dict(report_payload))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("learned_chunk_checkpoint_invalid") from exc
+    config.validate()
+    vocab_payload = manifest["vocab"]
+    assert isinstance(vocab_payload, Mapping)
+    token_to_id = vocab_payload["token_to_id"]
+    assert isinstance(token_to_id, Mapping)
+    vocabulary = WhitespaceVocabulary(
+        token_to_id={str(token): int(index) for token, index in token_to_id.items()}
+    )
+    if vocabulary.hash != vocab_payload.get("hash"):
+        raise ValueError("learned_chunk_checkpoint_identity_mismatch")
+    autoencoder = TinyChunkAutoencoder(
+        vocab_size=len(vocabulary.token_to_id),
+        chunk_size=config.chunk_size,
+        latent_dim=config.latent_dim,
+    )
+    scorers = [
+        LatentChunkScorer(
+            vocab_size=len(vocabulary.token_to_id),
+            chunk_size=config.chunk_size,
+            latent_dim=config.latent_dim,
+        )
+        for _ in range(3)
+    ]
+    modules = {
+        "autoencoder": autoencoder,
+        "reference_scorer": scorers[0],
+        "old_scorer": scorers[1],
+        "new_scorer": scorers[2],
+    }
+    try:
+        for name, module in modules.items():
+            module.load_state_dict(state_dicts[name], strict=True)
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+            module.eval()
+    except (KeyError, RuntimeError, TypeError) as exc:
+        raise ValueError("learned_chunk_checkpoint_invalid") from exc
+    bundle = LearnedChunkEncoderBundle(
+        config=config,
+        vocabulary=vocabulary,
+        autoencoder=autoencoder,
+        reference_scorer=scorers[0],
+        old_scorer=scorers[1],
+        new_scorer=scorers[2],
+        training_report=training_report,
+        reference_scorer_state_id=_state_id(scorers[0]),
+        old_scorer_state_id=_state_id(scorers[1]),
+        new_scorer_state_id=_state_id(scorers[2]),
+        autoencoder_state_id=_state_id(autoencoder),
+    )
+    if bundle.checkpoint_manifest() != dict(manifest):
+        raise ValueError("learned_chunk_checkpoint_identity_mismatch")
+    return bundle
+
+
 def validate_learned_chunk_actions(
     actions: Sequence[ActionUnit],
 ) -> ActionLogprobStats:
@@ -630,6 +797,35 @@ def validate_checkpoint_manifest(manifest: Mapping[str, Any]) -> None:
     }
     if set(manifest) != required or any(manifest.get(key) is None for key in required):
         raise NotImplementedError("learned_chunk_checkpoint_incomplete")
+    if any(
+        not isinstance(manifest[key], str) or not manifest[key]
+        for key in (
+            "encoder",
+            "decoder",
+            "reference_scorer",
+            "old_scorer",
+            "new_scorer",
+        )
+    ):
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    vocabulary = manifest["vocab"]
+    config = manifest["config"]
+    if not isinstance(vocabulary, Mapping) or set(vocabulary) != {
+        "hash",
+        "token_to_id",
+    }:
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    if not isinstance(vocabulary["hash"], str) or not isinstance(
+        vocabulary["token_to_id"], Mapping
+    ):
+        raise ValueError("learned_chunk_checkpoint_invalid")
+    if not isinstance(config, Mapping) or set(config) != {
+        "chunk_size",
+        "latent_dim",
+        "reconstruction_threshold",
+        "proof_scope",
+    }:
+        raise ValueError("learned_chunk_checkpoint_invalid")
 
 
 def compute_reconstruction_accuracy(
@@ -661,6 +857,7 @@ def _fallback_report(
     failure_mode: str,
     decoded_text: str,
     token_count: int,
+    reconstruction_accuracy: float = 0.0,
 ) -> ChunkEncodeReport:
     token_actions = [
         ActionUnit(
@@ -679,14 +876,14 @@ def _fallback_report(
     ]
     metadata = {
         "action/fallback": True,
-        "reconstruction/accuracy": 0.0,
+        "reconstruction/accuracy": reconstruction_accuracy,
         "reconstruction/safe": False,
         "failure/mode": failure_mode,
     }
     return ChunkEncodeReport(
         actions=token_actions,
         decoded_text=decoded_text,
-        reconstruction_accuracy=0.0,
+        reconstruction_accuracy=reconstruction_accuracy,
         passed_reconstruction_threshold=False,
         fallback=True,
         metrics={

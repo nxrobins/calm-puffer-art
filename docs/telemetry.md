@@ -65,6 +65,10 @@ cost before deriving:
 - inference latency, condition wall time, retries, and failed trainer attempts;
 - reward and exact delta per million tokens;
 - reward delta per USD when full monetary coverage exists;
+- per-seed and aggregate learning curves at each training checkpoint;
+- cumulative learning cost, which excludes held-out measurement overhead;
+- cumulative experiment cost, which includes that measurement overhead;
+- minimum learning cost to each pre-registered reward target;
 - scheduler allocation and concentration; and
 - point-estimate cost-performance points, pairwise comparisons, and a Pareto
   frontier.
@@ -73,8 +77,10 @@ The frontier is explicitly labeled as point-estimate-only. Confidence
 intervals and seed-paired inference remain in the controlled ablation report;
 they must be considered before claiming one condition dominates another.
 
-Cost-to-target requires intermediate held-out evaluations. If a run only
-evaluates before and after training, the monitor emits
+The controlled harness evaluates the held-out manifest after each non-final
+training update by default and pre-registers reward targets before inference.
+This makes cost-to-target observable without choosing thresholds after seeing
+the result. If checkpoint evaluation is disabled, the monitor emits
 `cost_to_target_unobservable` instead of fabricating a learning curve.
 
 ## Coverage And Alerts
@@ -115,6 +121,12 @@ Summarize a completed or in-progress ledger:
 
 ```powershell
 python examples\telemetry_report.py artifacts\run.jsonl --json
+```
+
+Recompute cost-to-target with explicit thresholds:
+
+```powershell
+python examples\telemetry_report.py artifacts\run.jsonl --json --performance-target 0.20 --performance-target 0.25
 ```
 
 Apply prices learned after the run and fail automation on monitoring errors:

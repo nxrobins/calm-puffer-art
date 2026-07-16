@@ -78,7 +78,7 @@ potential efficiency result, not yet a monetary-cost result. Input, output, and
 trainer rates were not supplied, so dollars are unknown rather than zero.
 
 These figures were reconstructed from the raw experiment report after the run.
-Future runs emit the versioned JSONL evidence ledger described in
+The instrumented repeat below emits the versioned JSONL evidence ledger described in
 [`telemetry.md`](telemetry.md), including cost provenance, coverage, lifecycle
 failures, efficiency views, and point-estimate Pareto analysis.
 
@@ -131,3 +131,82 @@ advance.
 CALM was excluded. The current learned chunk codec is reconstruction-smoke-only
 and does not alter ART inference actions, policy logprobs, or optimizer loss.
 Calling this an ART-plus-CALM ablation would overstate what the code runs today.
+
+## Fully Instrumented Repeat
+
+A follow-up on the same date repeated the protocol with held-out evaluation at
+every checkpoint and pre-registered mean-reward targets of `0.20`, `0.225`, and
+`0.25`. The primary run was `20260711-055038`. Direct ART seed `202` and async
+scheduler seed `303` each exhausted two five-minute managed-training attempts.
+Targeted, predeclared recovery runs `20260711-062014` and `20260711-062201`
+repeated only those failed condition-seed cells. Both recoveries completed
+without a retry.
+
+The consolidated efficacy view uses completed cells from the primary run and
+the corresponding recovery cell where the primary cell failed. It does not
+silently erase failed work: the reliability cost is reported separately below.
+
+| Condition | Mean reward delta | Descriptive 95% CI | Final mean reward | Parse-rate delta |
+| --- | ---: | ---: | ---: | ---: |
+| No training | `+0.0025` | `[-0.0076, +0.0127]` | `0.1610` | `+2.0 pp` |
+| Direct ART | `+0.0748` | `[+0.0330, +0.1166]` | `0.2310` | `+16.0 pp` |
+| Async scheduler | `+0.0925` | `[+0.0422, +0.1427]` | `0.2478` | `+18.7 pp` |
+
+Scheduler minus direct ART was `+0.0176`, with a descriptive paired interval
+of `[-0.0722, +0.1074]`. The trained arms again improved shaped reward while
+exact accuracy remained zero. This remains evidence of behavioral movement,
+not task mastery or a statistically established scheduler advantage.
+
+### Learning Curve
+
+| Checkpoint | Direct mean reward | Direct learning tokens | Scheduler mean reward | Scheduler learning tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Before training | `0.1562` | `0` | `0.1554` | `0` |
+| Step 1 | `0.2254` | `2,612` | `0.2226` | `2,612` |
+| Step 2 | `0.2084` | `5,101` | `0.2475` | `4,767` |
+| Step 3 | `0.2310` | `7,713` | `0.2478` | `6,975` |
+
+The curve changes the interpretation. Most of the initial gain arrived after
+one update. Direct ART then regressed at step 2 and partially recovered, while
+the scheduler improved materially at step 2 and was flat at step 3. More
+training was not monotonically better in either condition.
+
+At the aggregate-mean level, both arms reached `0.20` after `2,612` learning
+tokens. Direct ART reached `0.225` at that point; the scheduler reached it after
+`4,767` learning tokens. Neither aggregate mean reached `0.25`.
+
+The per-seed attainment view is less brittle than an aggregate threshold:
+
+| Target | Direct ART | Async scheduler |
+| --- | ---: | ---: |
+| `0.20` | `3/3` seeds | `3/3` seeds |
+| `0.225` | `2/3` seeds | `3/3` seeds |
+| `0.25` | `1/3` seeds | `2/3` seeds |
+
+### Cost And Reliability
+
+| Clean completed-cell measurement | Direct ART | Async scheduler | Scheduler difference |
+| --- | ---: | ---: | ---: |
+| Requests | `744` | `744` | `0.0%` |
+| Total experiment tokens | `118,074` | `114,140` | `-3.3%` |
+| Learning-inference tokens | `23,139` | `20,925` | `-9.6%` |
+| Successful-cell wall time | `258.5 s` | `260.7 s` | `+0.8%` |
+
+The scheduler again used fewer tokens, especially in the learning phase, at
+similar successful-run wall time. This is the most consistent positive result
+across the two experiments. It is still a token-efficiency result rather than
+a dollar-cost result because authoritative inference and trainer rates were
+not supplied.
+
+The complete campaign consumed `2,052` inference requests and `325,147` tokens,
+including failed work. The two abandoned cells account for `264` requests,
+`41,856` tokens, four failed training attempts, and `1,200.3 s` of managed-call
+time before recovery. One failure occurred in each trained condition, so this
+run does not establish a reliability difference between them. It does show
+that backend completion variance can outweigh the observed token savings and
+must remain part of any product-level cost objective.
+
+This repeat closes the missing learning-curve and cost-to-target evidence gap.
+The next rigor gap is larger: use more seeds, nonzero exact accuracy, multiple
+training budgets, authoritative prices, and an actual CALM treatment that
+changes inference or optimizer behavior.

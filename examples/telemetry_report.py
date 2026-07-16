@@ -25,6 +25,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-usd-per-million-tokens", type=float)
     parser.add_argument("--output-usd-per-million-tokens", type=float)
     parser.add_argument("--trainer-usd-per-hour", type=float)
+    parser.add_argument(
+        "--performance-target",
+        type=float,
+        action="append",
+        default=[],
+        help="held-out mean reward target; repeat for multiple targets",
+    )
     parser.add_argument("--stale-after-seconds", type=float, default=600.0)
     parser.add_argument("--fail-on-error", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -64,6 +71,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         ),
         path=args.path,
         expected_inference_requests=args.expected_inference_requests,
+        performance_targets=args.performance_target,
         stale_after_s=args.stale_after_seconds,
     )
     return {"run_id": run_id, **summary}

@@ -221,7 +221,7 @@ The runtime treats action granularity as a codec choice:
 
 The codec interface deliberately preserves decoded text for compatibility with existing ART-like message trajectories while exposing `action_units`, `token_count`, and `semantic_bandwidth` for metrics.
 
-The torch-backed CALM autoencoder sketch is intentionally not imported into the default package. It should land behind an optional integration layer after the runtime contract is stable; the default package now exposes the old/new/reference action-logprob contract that such a learned latent layer must satisfy before feeding chunk-level ratios into GRPO.
+The torch-backed CALM layer remains outside the default package. It can train against explicit train/holdout corpora, atomically save a schema-versioned checkpoint, reload state with strict identity verification, and reject candidates that miss exact reconstruction. The code-domain proof admits chunk size 2 and rejects chunk size 4. `StateConditionedChunkPolicy` adds a Gaussian latent action head with frozen behavior and reference snapshots; `build_art_chunk_loss_batch()` aligns chunk actions with ART's shifted tensor contract, and `execute_art_chunk_loss()` backpropagates ART 0.5.18's real PPO/CISPO loss through the current head. The local proof uses deterministic context features. These are genuine state-conditioned policy distributions but not serving-LLM distributions, and ART serverless still has no public custom latent-action input.
 
 For CALM-like codecs, verifier and reconstruction feedback should be written into trajectory metadata:
 
@@ -335,4 +335,6 @@ Deferred:
 - Production packaging as a drop-in `art.Backend` against live ART versions.
 - Real GRPO/CISPO loss calls against ART internals.
 - vLLM LoRA hot-reload wiring.
-- Torch/CALM autoencoder training, checkpoint loading, and chunk-level policy heads.
+- Production CALM corpora and tokenizer integration.
+- Serving-model hidden-state extraction and a local open-weight model adapter.
+- Custom ART backend wiring for latent action tensors and checkpoint publication.
